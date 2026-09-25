@@ -300,3 +300,127 @@ test("area/config and sync_data respond successfully", async t => {
     assert.equal(sync.statusCode, 200)
     assert.equal(sync.json().code, 0)
 })
+
+// ── P10-B：iOS 公告通道（把绑定验证码送到 SDK 原生弹窗）─────────────────────────
+// 依据：P10-A 交付片段（交付片段/p10a/ios-notice.fragment.ts）。字段名静态无法确定 ⇒
+// 第一版是「多别名霰弹」；provideCode 缺省恒 null ⇒ 兜底文案且**不得抛错**。
+
+const NOTICE_PATHS = [
+    "/sdk_v3/get_notice.do",
+    "/login/sdk_v3/get_notice.do",
+    "/api/sdk_v3/get_notice.do",
+]
+
+test("notice endpoints answer on all candidate prefixes with a shotgun payload", async t => {
+    const app = await createApp()
+    t.after(() => app.close())
+
+    for (const url of NOTICE_PATHS) {
+        const response = await app.inject({ method: "POST", url, payload: { uid: "90000001" } })
+        assert.equal(response.statusCode, 200, url)
+        const body = response.json()
+        assert.equal(body.code, 0, url)
+        assert.equal(body.noticeId, "sp-cn-bind-code", url)
+        // 霰弹：同一段话术必须出现在所有候选字段名上，SDK 读哪个都能显示
+        const text = body.NOTICECONTENT
+        assert.equal(typeof text, "string")
+        assert.ok(text.length > 0, url)
+        for (const key of ["noticeContent", "content", "urgentNoticeContent", "announceMsg", "msg"]) {
+            assert.equal(body[key], text, `${url} ${key}`)
+        }
+        assert.equal(body.data.noticeContent, text, url)
+        assert.equal(body.data.NOTICECONTENT, text, url)
+        // 没有 provideCode ⇒ 兜底文案，且必须仍然 200
+        assert.ok(text.includes("/bind"), url)
+    }
+})
+
+test("provideCode is injected with uid/deviceId and its failure never breaks the request", async t => {
+    const seen = []
+    const app = await createApp({
+        notice: {
+            provideCode: ids => {
+                seen.push(ids)
+                return "135790"
+            },
+        },
+    })
+    t.after(() => app.close())
+
+    const ok = await app.inject({
+        method: "POST",
+        url: "/sdk_v3/get_notice.do",
+        payload: { uid: 90000042, deviceId: "device-abc" },
+    })
+    assert.equal(ok.statusCode, 200)
+    assert.ok(ok.json().NOTICECONTENT.includes("135790"))
+    assert.deepEqual(seen[0], { uid: "90000042", deviceId: "device-abc", udid: "device-abc" })
+
+    // 字符串 body（生产环境 urlencoded 解析器的产物形态之一）：走正则兜底提取
+    const textBody = await app.inject({
+        method: "POST",
+        url: "/sdk_v3/get_notice.do",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify("uid=90000043&deviceId=device-def"),
+    })
+    assert.equal(textBody.statusCode, 200)
+    assert.ok(textBody.json().NOTICECONTENT.includes("135790"))
+    assert.deepEqual(seen[1], { uid: "90000043", deviceId: "device-def", udid: "device-def" })
+
+    const boom = await createApp({
+        notice: {
+            provideCode: () => {
+                throw new Error("code store offline")
+            },
+        },
+    })
+    t.after(() => boom.close())
+    const failed = await boom.inject({ method: "POST", url: "/sdk_v3/get_notice.do", payload: {} })
+    assert.equal(failed.statusCode, 200)
+    assert.ok(failed.json().NOTICECONTENT.includes("/bind"))
+})
+
+test("shotgun:false narrows the payload to the confirmed field names", async t => {
+    const app = await createApp({ notice: { shotgun: false, provideCode: () => "246810" } })
+    t.after(() => app.close())
+
+    const response = await app.inject({ method: "POST", url: "/sdk_v3/get_notice.do", payload: {} })
+    assert.equal(response.statusCode, 200)
+    assert.deepEqual(Object.keys(response.json()).sort(), ["NOTICECONTENT", "code", "noticeId"])
+    assert.ok(response.json().NOTICECONTENT.includes("246810"))
+})
+
+test("the notice probe stays off unless asked, and writes exactly one line per hit", async t => {
+    const offLines = []
+    const off = await createApp({ notice: { probe: false, probeWriteLine: line => offLines.push(line) } })
+    t.after(() => off.close())
+    await off.inject({ method: "POST", url: "/sdk_v3/get_notice.do", payload: {} })
+    assert.equal(offLines.length, 0)
+
+    const lines = []
+    const app = await createApp({
+        notice: { probe: true, probeWriteLine: line => lines.push(line) },
+    })
+    t.after(() => app.close())
+
+    await app.inject({
+        method: "POST",
+        url: "/sdk/v3-3/check_login.do",
+        headers: { "content-type": "application/json", cookie: "session=must-not-be-logged", udid: "9abcdef" },
+        payload: { device_id: "device-xyz" },
+    })
+    assert.equal(lines.length, 1)
+    const record = JSON.parse(lines[0])
+    assert.equal(record.method, "POST")
+    assert.equal(record.url, "/sdk/v3-3/check_login.do")
+    assert.equal(record.status, 200)
+    assert.equal(record.udid, "9abcdef")
+    assert.deepEqual(record.body_keys, ["device_id"])
+    assert.ok(record.response.includes("data"))
+    assert.ok(!lines[0].includes("must-not-be-logged"), "probe must not copy cookies into the log")
+
+    // 不在过滤范围内的请求（游戏资源面）不产生任何行
+    await app.inject({ method: "POST", url: "/sync_data", payload: {} })
+    assert.equal(lines.length, 1)
+})
+

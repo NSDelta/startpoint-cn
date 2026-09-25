@@ -1,5 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac } from "node:crypto"
-import { FastifyInstance, FastifyRequest } from "fastify"
+import fs from "node:fs"
+import path from "node:path"
+import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
 
 // --- iOS Leiting SDK 登录 mock ---
 // 移植自 dennis96292/startpoint-cn-launcher：
@@ -92,6 +94,8 @@ export interface IosLeitingPluginOptions {
     }
     /** 按设备派生身份的材料；缺省从 env 读。 */
     readonly sdkIdentity?: IosSdkIdentityOptions
+    /** iOS 公告通道（= 验证码展示）+ 探针；见 IOS_NOTICE_PATHS 上方注释。 */
+    readonly notice?: IosNoticeOptions
     /** 注入环境变量（测试用）；缺省 process.env。 */
     readonly env?: NodeJS.ProcessEnv
 }
@@ -374,6 +378,303 @@ export function resolveDeviceKey(
     return { deviceKey: key, source: "fallback", fingerprint: fingerprintOf(key) }
 }
 
+// ── iOS 公告通道（= 把绑定验证码送到玩家眼前）─────────────────────────────────
+// 来源：P10-A 交付片段 `交付片段/p10a/ios-notice.fragment.ts`（由本文件 owner 落笔）。
+// 依据（P10-A 报告 §2C 主二进制实测）：LeitingSDK 是**静态链进主二进制**的（IPA 里 0 个
+// .framework/.dylib），公告流程全在 SDK 内部：`getNotice:` → `v2PostDataWithUrl:params:
+// completion:`（POST）→ URL 格式串 `%@sdk_v3/get_notice.do` → 响应装进 `NoticeBean` →
+// `initWithType:bean:` **原生弹窗**（cancelBtn/helpBtn/sureBtn）。且游戏侧 AS3 没有公告实现
+// （iOS/安卓 SWF 的 ABC 已被 AOT 剥离，showNoticeTip/NoticeBean 0 命中）⇒ **展示完全由 SDK
+// 完成，客户端零改动、也不需要越狱**。服务端在这个端点上返回什么，玩家就在原生弹窗里看到什么。
+//
+// 两段，默认状态不同：
+//   ① 探针 installIosNoticeProbe —— **默认关**（IOS_NOTICE_PROBE=1 开）。只记不改，用途是
+//      真机跑一次确定 SDK 的**真实请求行**：带不带 `/login` 前缀、基址带不带尾斜杠、
+//      请求体字段名是什么。不落原始 cookie（避免把会话凭据写进日志）。
+//   ② 公告端点 —— **默认开**。三种前缀一起接（基址形态静态无法确定），回「多别名霰弹」
+//      payload（SDK 到底读 noticeContent / NOTICECONTENT / urgentNoticeContent 哪一个，静态
+//      确定不了），探针确认字段名之后由调用方把 `shotgun` 收窄成 false。
+//
+// 已知边界：本插件是 Fastify **封闭上下文**，所以探针钩子只作用于本文件注册的路由
+// （SDK 的身份/公告面基本都在这里：/sdk_v3*、/sdk/v3-3/*、/mobile!*、/wf/210009_config*、
+// /protocols/leiting/*、/sync_data）；`/api/policy/report` 等不属于本插件的路径不会被记录，
+// 要全覆盖得由集成者在 cn-server.ts 里装等价钩子（见报告 §5/§6）。
+export const IOS_NOTICE_PROBE_ENV = "IOS_NOTICE_PROBE"
+export const IOS_NOTICE_PROBE_LOG_DIR_ENV = "IOS_NOTICE_PROBE_LOG_DIR"
+
+/** 公告端点：SDK 用 `%@sdk_v3/get_notice.do` 运行时拼基址 ⇒ 三种可能形态一起接。 */
+export const IOS_NOTICE_PATHS = [
+    "/sdk_v3/get_notice.do",
+    "/login/sdk_v3/get_notice.do",
+    "/api/sdk_v3/get_notice.do",
+] as const
+
+const IOS_NOTICE_ID = "sp-cn-bind-code"
+const IOS_NOTICE_TITLE = "服务器绑定验证码"
+/** 探针只记「可能属于 SDK 身份/公告面」的请求，避免被游戏资源请求刷爆。 */
+const IOS_NOTICE_PROBE_URL_FILTER = /notice|config|sdk|login|auth|leiting|version/i
+const IOS_NOTICE_PROBE_MAX_BODY = 4096
+const IOS_NOTICE_UID_KEYS = ["uid", "userId", "userid", "leitingNo", "ltNo"] as const
+const IOS_NOTICE_DEVICE_KEYS = ["deviceId", "device_id", "udid", "myDeviceId", "targetDeviceId"] as const
+
+export interface IosNoticeIdentity {
+    readonly uid?: string | undefined
+    readonly deviceId?: string | undefined
+    readonly udid?: string | undefined
+}
+
+/**
+ * 由 uid/设备号换绑定码。返回 null = 查不到 ⇒ **回兜底文案**（契约要求：未接 provider 时不得抛错）。
+ * P3 的 `/sp-auth/*`（`src/lib/signup-code.ts`）就绪后，由集成者在注册处注入同源实现：
+ * 同一个码只能被 bot 消费一次，失败码沿用 C4（CODE_INVALID/CODE_EXPIRED/CODE_USED/CODE_LOCKED/ALREADY_BOUND）。
+ */
+export type IosNoticeCodeProvider = (ids: IosNoticeIdentity) => Promise<string | null> | string | null
+
+export interface IosNoticeOptions {
+    /** 探针开关；缺省读 IOS_NOTICE_PROBE=1（缺省关 ⇒ 测试与日常运行不产生任何文件）。 */
+    readonly probe?: boolean | undefined
+    /** 探针日志目录；缺省读 IOS_NOTICE_PROBE_LOG_DIR，再缺省 `<cwd>/out/ios-probe`。 */
+    readonly probeLogDir?: string | undefined
+    /** 探针每行出口（测试注入）；缺省追加写 `<probeLogDir>/ios-probe-<时间>.log`，写不了就退到 stdout。 */
+    readonly probeWriteLine?: ((line: string) => void) | undefined
+    /** 绑定码提供者；缺省恒 null ⇒ 兜底文案。 */
+    readonly provideCode?: IosNoticeCodeProvider | undefined
+    /** true = 多别名霰弹响应（默认）；探针确认 SDK 读哪个字段后收窄为 false。 */
+    readonly shotgun?: boolean | undefined
+    /** 文案里承诺的有效期（分钟），默认 30。 */
+    readonly ttlMinutes?: number | undefined
+    /** 可注入时钟（测试用）。 */
+    readonly now?: (() => Date) | undefined
+}
+
+export interface IosNoticeProbeOptions extends IosNoticeOptions {
+    readonly enabled?: boolean | undefined
+    readonly logDir?: string | undefined
+}
+
+function noticeHeaderValue(value: string | string[] | undefined): string | null {
+    if (Array.isArray(value)) {
+        for (const entry of value) {
+            if (typeof entry === "string" && entry.trim().length > 0) return entry.trim()
+        }
+        return null
+    }
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null
+}
+
+/** 请求体转文本：Fastify 已把 json / form-urlencoded 解析成对象，msgpack 之类到不了这里。 */
+function bodyTextOf(body: unknown): string {
+    if (typeof body === "string") return body
+    if (Buffer.isBuffer(body)) return body.toString("utf8")
+    if (body === null || body === undefined) return ""
+    try {
+        return JSON.stringify(body)
+    } catch {
+        return ""
+    }
+}
+
+function recordBodyOf(body: unknown): Record<string, unknown> | undefined {
+    if (typeof body !== "object" || body === null || Buffer.isBuffer(body) || Array.isArray(body)) return undefined
+    return body as Record<string, unknown>
+}
+
+function bodyKeysOf(body: unknown): string[] | null {
+    const record = recordBodyOf(body)
+    return record ? Object.keys(record).sort() : null
+}
+
+function firstString(record: Record<string, unknown> | undefined, keys: readonly string[]): string | null {
+    if (!record) return null
+    for (const key of keys) {
+        const value = record[key]
+        if (typeof value === "string" && value.trim().length > 0) return value.trim()
+        if (typeof value === "number" && Number.isFinite(value)) return String(value)
+    }
+    return null
+}
+
+function matchGroup(text: string, pattern: RegExp): string | null {
+    const match = pattern.exec(text)
+    return match?.[1] ?? null
+}
+
+/** 从 query/body（对象优先，字符串再正则兜底）解析 uid 与设备标识。 */
+export function resolveIosNoticeIdentity(request: FastifyRequest): IosNoticeIdentity {
+    const query = recordBodyOf(request.query)
+    const body = recordBodyOf(request.body)
+    const text = bodyTextOf(request.body)
+    const uid = firstString(body, IOS_NOTICE_UID_KEYS)
+        ?? firstString(query, IOS_NOTICE_UID_KEYS)
+        ?? matchGroup(text, /"?(?:uid|userId|userid)"?\s*[=:]\s*"?(\d{4,})/)
+    const deviceId = firstString(body, IOS_NOTICE_DEVICE_KEYS)
+        ?? firstString(query, IOS_NOTICE_DEVICE_KEYS)
+        ?? matchGroup(text, /"?(?:deviceId|device_id|udid)"?\s*[=:]\s*"?([A-Za-z0-9._:\-]{4,128})/)
+    return {
+        uid: uid ?? undefined,
+        deviceId: deviceId ?? undefined,
+        udid: deviceId ?? undefined,
+    }
+}
+
+/** 有话术自写：不复用任何他人字符串（B 线红线）。 */
+function buildIosNoticeContent(code: string | null, ttlMinutes: number): string {
+    if (code) {
+        return `服务器绑定验证码：${code}\n${ttlMinutes} 分钟内有效。\n把它发给 QQ 群里的 bot（/bind ${code}）即完成绑定；\n过期就在游戏里重新打开本公告即可刷新。`
+    }
+    return "请先在 QQ 群里向 bot 发送 /bind 获取绑定流程，或联系服主人工绑定。"
+}
+
+/**
+ * 「霰弹」payload：把主二进制字符串表里出现过的字段名一次全给上（noticeId/NOTICECID/
+ * NOTICECONTENT/noticeContent/urgentNotice…/announce… 等）。SDK 实际读哪个只能靠真机探针，
+ * 确认后把 shotgun 关掉只留那一个即可。
+ */
+function buildIosNoticePayload(content: string, shotgun: boolean): Record<string, unknown> {
+    if (!shotgun) {
+        return { code: 0, noticeId: IOS_NOTICE_ID, NOTICECONTENT: content }
+    }
+    return {
+        code: 0,
+        resultCode: 0,
+        success: true,
+        msg: content,
+        noticeId: IOS_NOTICE_ID,
+        NOTICECID: IOS_NOTICE_ID,
+        NOTICECONTENT: content,
+        noticeContent: content,
+        content,
+        title: IOS_NOTICE_TITLE,
+        noticeTitle: IOS_NOTICE_TITLE,
+        urgentNoticeTitle: IOS_NOTICE_TITLE,
+        urgentNoticeContent: content,
+        announceMsg: content,
+        announceClickFlag: "0",
+        announceTopFlag: "1",
+        announceMsgFlag: "1",
+        announceClickUrl: "",
+        showNoticeTip: "1",
+        data: {
+            noticeId: IOS_NOTICE_ID,
+            NOTICECONTENT: content,
+            noticeContent: content,
+            content,
+            title: IOS_NOTICE_TITLE,
+            urgentNoticeTitle: IOS_NOTICE_TITLE,
+            urgentNoticeContent: content,
+            announceMsg: content,
+        },
+    }
+}
+
+/** 公告端点处理器：永远 200 + JSON；provideCode 抛错只降级成兜底文案，绝不让请求失败。 */
+export function createIosNoticeHandler(options: IosNoticeOptions = {}) {
+    const provideCode = options.provideCode
+    const ttlMinutes = options.ttlMinutes ?? 30
+    const shotgun = options.shotgun ?? true
+
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const ids = resolveIosNoticeIdentity(request)
+        let code: string | null = null
+        if (provideCode) {
+            try {
+                code = await provideCode(ids)
+            } catch (error) {
+                console.warn(`[iOS-NOTICE] provideCode 失败：${(error as Error).message}`)
+            }
+        }
+        const content = buildIosNoticeContent(code, ttlMinutes)
+        console.log(`[iOS-NOTICE] ${request.method} ${request.originalUrl ?? request.url} uid=${ids.uid ?? "-"} deviceId=${ids.deviceId ?? "-"} code=${code ?? "(兜底文案)"}`)
+        return reply.type("application/json").send(buildIosNoticePayload(content, shotgun))
+    }
+}
+
+/**
+ * 探针一行 JSON。**只观察不改行为**：不碰 reply、不改 request.body/headers、不注册路由。
+ * 不落 cookie / authorization（日志不该成为凭据副本）；body 截断到 4096 字节。
+ */
+export function buildIosNoticeProbeRecord(
+    request: FastifyRequest,
+    extra: { readonly response?: string | null; readonly status?: number | null } = {},
+    now: Date = new Date(),
+): string {
+    const headers = request.headers
+    return JSON.stringify({
+        ts: now.toISOString(),
+        method: request.method,
+        url: request.originalUrl ?? request.url,
+        ip: request.ip ?? null,
+        status: extra.status ?? null,
+        user_agent: noticeHeaderValue(headers["user-agent"]),
+        host: noticeHeaderValue(headers.host),
+        content_type: noticeHeaderValue(headers["content-type"]),
+        content_length: noticeHeaderValue(headers["content-length"]),
+        udid: noticeHeaderValue(headers.udid),
+        short_udid: noticeHeaderValue(headers["short-udid"]) ?? noticeHeaderValue(headers["short_udid"]),
+        body_keys: bodyKeysOf(request.body),
+        body: bodyTextOf(request.body).slice(0, IOS_NOTICE_PROBE_MAX_BODY),
+        response: extra.response === undefined ? null : extra.response,
+    })
+}
+
+/**
+ * 装探针（默认关）。返回是否真的装了，调用方用它打一行启动横幅。
+ * 每请求**恰好**一行：onSend（响应体已知）写正常请求；被 body 解析阶段拒掉（415/400）的
+ * 请求到不了 onSend，由 onResponse 兜底 —— 真机取证最怕「零证据」。
+ */
+export function installIosNoticeProbe(fastify: FastifyInstance, options: IosNoticeProbeOptions = {}): boolean {
+    if (options.enabled !== true) return false
+
+    const now = options.now ?? (() => new Date())
+    let writeLine = options.probeWriteLine
+    if (!writeLine) {
+        const logDir = options.probeLogDir ?? options.logDir
+        if (logDir) {
+            try {
+                fs.mkdirSync(logDir, { recursive: true })
+                const logPath = path.join(logDir, `ios-probe-${now().toISOString().replace(/[:.]/g, "-")}.log`)
+                writeLine = (line: string) => {
+                    try {
+                        fs.appendFileSync(logPath, `${line}\n`)
+                    } catch {
+                        // 磁盘问题不该影响请求
+                    }
+                }
+                console.log(`[iOS-NOTICE-PROBE] append -> ${logPath}`)
+            } catch {
+                writeLine = undefined
+            }
+        }
+    }
+    const emit = writeLine ?? ((line: string) => { console.log(`[iOS-NOTICE-PROBE] ${line}`) })
+
+    const pending = new WeakSet<FastifyRequest>()
+    const interesting = (request: FastifyRequest): boolean =>
+        IOS_NOTICE_PROBE_URL_FILTER.test(request.originalUrl ?? request.url ?? "")
+
+    fastify.addHook("onRequest", async request => {
+        if (interesting(request)) pending.add(request)
+    })
+
+    fastify.addHook("onSend", async (request, reply, payload) => {
+        if (!pending.has(request)) return payload
+        pending.delete(request)
+        const text = typeof payload === "string" ? payload : bodyTextOf(payload)
+        emit(buildIosNoticeProbeRecord(request, {
+            status: reply.statusCode,
+            response: text.slice(0, IOS_NOTICE_PROBE_MAX_BODY),
+        }, now()))
+        return payload
+    })
+
+    fastify.addHook("onResponse", async (request, reply) => {
+        if (!pending.has(request)) return
+        pending.delete(request)
+        emit(buildIosNoticeProbeRecord(request, { status: reply.statusCode, response: "[[body-not-parsed]]" }, now()))
+    })
+    return true
+}
+
 function loginFailure(message: string): Record<string, string> {
     return { ...iosLoginOKShape, status: "1", message, data: "" }
 }
@@ -391,6 +692,24 @@ export default async function iosLeitingRoutes(
     }
     const config = identityConfig.ok ? identityConfig.config : null
     let unconfiguredReplies = 0
+
+    // iOS 公告通道：探针（默认关）+ 公告端点（默认开）。探针装在最前面，保证它覆盖本插件全部路由。
+    const env = options.env ?? process.env
+    const noticeOptions = options.notice ?? {}
+    const envProbeLogDir = (env[IOS_NOTICE_PROBE_LOG_DIR_ENV] ?? "").trim()
+    const noticeProbeEnabled = noticeOptions.probe ?? flagEnabled(env[IOS_NOTICE_PROBE_ENV])
+    const noticeProbeLogDir = noticeOptions.probeLogDir
+        ?? (envProbeLogDir.length > 0 ? envProbeLogDir : path.join(process.cwd(), "out", "ios-probe"))
+    const noticeProbeInstalled = installIosNoticeProbe(fastify, {
+        ...noticeOptions,
+        enabled: noticeProbeEnabled,
+        logDir: noticeProbeLogDir,
+    })
+    if (noticeProbeInstalled) {
+        console.log(`[iOS-NOTICE-PROBE] active (dir=${noticeProbeLogDir}); one line per request on /notice|config|sdk|login|auth|leiting|version/i`)
+    } else {
+        console.log(`[iOS-NOTICE-PROBE] inactive; set ${IOS_NOTICE_PROBE_ENV}=1 to capture the SDK's real request lines`)
+    }
 
     // 区服/CDN 配置
     fastify.get("/area/config.json", async (_request, reply) => {
@@ -476,4 +795,12 @@ export default async function iosLeitingRoutes(
     for (const p of iosStubPaths) {
         fastify.all(p, (_req, reply) => { console.log("[iOS-SDK-STUB] " + p); reply.send(iosStatusOK); });
     }
+
+    // iOS 公告端点：SDK 的 getNotice 弹窗通道（= 玩家能看到绑定验证码的地方）。
+    // 默认开通、默认霰弹字段；真机探针确认 SDK 实际读哪个字段后，把 notice.shotgun 设成 false 收窄。
+    const noticeHandler = createIosNoticeHandler(noticeOptions)
+    for (const p of IOS_NOTICE_PATHS) {
+        fastify.post(p, noticeHandler)
+    }
+    console.log(`[iOS-NOTICE] notice endpoints ready (${IOS_NOTICE_PATHS.length} paths, shotgun=${noticeOptions.shotgun ?? true}, provideCode=${noticeOptions.provideCode ? "injected" : "fallback-text"})`)
 }
