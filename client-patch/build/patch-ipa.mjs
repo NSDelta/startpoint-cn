@@ -5,8 +5,9 @@
 //   也是 A1b 重基线后**唯一入口**：后续所有 iOS 补丁工具都**基于本文件增改**，不要另起炉灶
 //   重写：里面的功能补丁地址（实名提示 / 全新安装登录弹窗 / 欢迎横幅 / 使用许可协议+隐私政策门 /
 //   Bundle ID 资源校验 / sohu 外发屏蔽）与 guard 处理都是**真机验证过**的，重写会丢掉这些能力。
-//   B0 期间临时写的 `patch-ios-ipa.mjs` 已在 A1b 重基线时**并入本文件**，那个文件现在只剩一个
-//   "已废弃"墓碑（零补丁逻辑），不再是第二条入口。合并清单见分工文档 §4-P10-A1b。
+//   B0 期间临时写的那个 iOS 派生脚本已在 A1b 重基线时**并入本文件**，并且**已从仓库删除**
+//   （`tools/ios_ipa_patch.test.cjs` 的 CLI 用例现在指向本文件）⇒ 本文件是唯一入口。
+//   合并清单见分工文档 §4-P10-A1b，验收数字见 D:\wfcnmod\报告-P10-A-iOS.md。
 //
 // ★ A1b 并入的三项能力（原先只在 B0 派生件里）：
 //   ① lib/ios-abc.mjs 的 **ABC 常量池等长改写**。功能性必需：AS3 的 `DevConfig_gf_ios.apiServer`
@@ -17,9 +18,13 @@
 //      成对字节数守恒（33 B）。
 //   ② **回读断言 + `<out>.build-report.json`**：断言硬失败（退出码 2），绝不允许"带伤出包"。
 //      B0 派生件的教训：它静默丢了上面六项功能补丁，产物看上去一切正常，装机却卡在 SDK 弹窗。
-//   ③ lib/zip-ipa.mjs **替代 `jar uf0`**：`jar` 会把整包重写成 STORED + madeBy=0x000a(FAT) +
-//      externalAttr=0，等于丢掉主二进制的 Unix 可执行位（0o100755 → 0o0）⇒ AltStore/AltServer
-//      的严格 IPA 解析直接拒绝："The app is in an invalid format."（Sideloadly 尚能容忍）
+//   ③ lib/zip-ipa.mjs 取代 `jar uf0`：**不再依赖外部 `jar`/JDK**，整个回写在 Node 进程内完成，
+//      并且能逐条回读校验（CRC 交叉校验 + 未改动 entry 逐字节比对 + entry 属性比对）。
+//      ⚠️ 实测勘误（P10-A，2026-09）：任务书里「`jar uf0` 会把整包写成 STORED / 丢 0o100755 /
+//      madeBy=0x000a ⇒ AltStore 报 invalid format」这一条，在 B0 的 `jar` 产物上**不复现** ——
+//      B0 产物与官方件逐条比对 3568 个 entry，method/versionMadeBy/externalAttr/mtime 差异为 **0**。
+//      所以换掉 jar 的真实理由是上面的三条工程收益，**不是**修好了 AltStore；
+//      没有任何证据表明 AltStore 拒绝由 jar 造成（B0 产物的真实缺陷是漏了六项功能补丁，见 ②）。
 //
 // iOS 是 AOT 编译：AS3（DevConfig.sdkDummy / DevConfig_gf_ios.apiServer / FileReader）
 // 被编译进原生 Mach-O，无法用 FFDec -replace 修改。因此通过二进制补丁直接改写
@@ -31,6 +36,9 @@
 // 游戏 API 地址不直接改写 —— 它从已改写的 update.leiting.com → version.dis（本地提供）→
 // 本地 apiPath 获取。登录走本地服务器 leiting 模拟。资源缺失（FileReader）崩溃由启动器
 // 提供完整 CDN 避免，不依赖代码补丁。
+//   ★ A1b 修正：上面这段是 B0 期的理解。实测（见 ①）运行期的 API 基址来自 ABC 池里
+//     `Custom("https","shijtswygamegf.leiting.com")` 那一对条目 ⇒ 只改 `__cstring` 站点不够，
+//     所以现在两条路都改（cstring 站点 + ABC 常量池对），并各自带长度守恒断言。
 //
 // 补丁后 Mach-O 签名失效 —— IPA 必须重签（Sideloadly 用你的 Apple ID 安装时自动完成，
 // 对补丁后的二进制重新哈希）。cryptid=0（解密 dump）确认可重签。
@@ -594,7 +602,7 @@ if (args.bin) {
     A.check('回读：entry 数与逐条属性保持不变（method/versionMadeBy/externalAttr/mtime/mdate）', attrBad.length === 0,
       attrBad.length ? attrBad.slice(0, 3).join(', ') : `${outEntries.length} 条全部保留`);
     A.check(`回读：未改动 entry 逐字节相同 ${inSnapshot.length - 1}/${inSnapshot.length}`, rawBad.length === 0,
-      rawBad.length ? `${rawBad.length} 条不同：${rawBad.slice(0, 3).join(', ')}` : '除主二进制外全部原样搬运（jar uf0 会重写整包，这就是它的坑）');
+      rawBad.length ? `${rawBad.length} 条不同：${rawBad.slice(0, 3).join(', ')}` : '除主二进制外全部原样搬运（纯 Node 回写 + 逐条比对，不依赖 jar）');
     A.check('回读：主二进制 entry 属性 = method 8 / madeBy 0x1300 / externalAttr 0x81ed0000 / mode 0o100755',
       outMain.method === OFFICIAL.mainEntryAttrs.method && outMain.versionMadeBy === OFFICIAL.mainEntryAttrs.versionMadeBy &&
       outMain.externalAttr === OFFICIAL.mainEntryAttrs.externalAttr && unixMode(outMain) === OFFICIAL.mainEntryAttrs.unixMode,

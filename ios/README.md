@@ -3,9 +3,15 @@
 把**官方 iOS 包**原地指向本机私服（`http://<LAN_IP>:8001`），装到真机上跑一次首启，
 用服务端探针把客户端实际发出的身份头（`UDID` / `SHORT_UDID`）原样抓下来。
 
-配套工具：[`client-patch/build/patch-ios-ipa.mjs`](../client-patch/build/patch-ios-ipa.mjs)（出包）、
+配套工具：[`client-patch/build/patch-ipa.mjs`](../client-patch/build/patch-ipa.mjs)（**唯一出包入口**）、
 [`src/lib/udid-probe.ts`](../src/lib/udid-probe.ts)（探针）。
 Android 侧的等价改动见 [`client-patch/README.md`](../client-patch/README.md)。
+
+> ⚠️ B0 期间临时派生的那个 iOS 出包脚本**已删除**（A1b 重基线时并入本入口）。
+> 它的能力（ABC 常量池改写 + 回读断言 + `<out>.build-report.json` + 纯 Node zip 回写，不再需要 `jar`）
+> 已并入 `patch-ipa.mjs`，并**补回了它漏掉的六项功能补丁**：sohu 屏蔽、首登提示、
+> 登录弹窗、欢迎横幅、协议门、bundleId 校验。用旧脚本出的包在真机上**会卡在 SDK 弹窗与首登流程**。
+> 合并后 `patch-ipa.mjs` 一个入口同时支持 `--ipa`（出包）与 `--bin`（只改主二进制、只算不打包）。
 
 > **本文件不写任何真实 IP**：所有地址一律用占位符 `<LAN_IP>`。真实地址只出现在你本机的命令行里。
 
@@ -29,16 +35,17 @@ Android 侧的等价改动见 [`client-patch/README.md`](../client-patch/README.
 ## 1. 出包
 
 ```bash
-node client-patch/build/patch-ios-ipa.mjs \
-  --ipa <官方包路径>.ipa \
+node client-patch/build/patch-ipa.mjs \
+  --ipa apkipa/iOS-1.8.4.ipa \
   --host <LAN_IP> --port 8001 \
   --guard-mode launch \
-  --out out/sp-cn-ios-lan.ipa
+  --out ios/patched/sp-cn-ios-lan.ipa
 ```
 
-只算不断言（先看数字，不写盘）：加 `--dry-run`。
+`--host=<LAN_IP>` 与空格形式都可以。只算不断言（先看数字，不写盘）：加 `--dry-run`。
+零外部依赖：只用 Node 内置 `zlib`（**不需要 JDK / `jar`**），整个流程在进程内完成并逐条校验。
 
-工具会打印并落盘 `out/sp-cn-ios-lan.ipa.build-report.json`，其中 **4 条断言必须全 PASS**：
+工具会打印并落盘 `<out>.build-report.json`，其中 **36 条断言必须全 PASS**（下表是四组关键断言）：
 
 | # | 断言 | 参考值 |
 | --- | --- | --- |
@@ -47,16 +54,29 @@ node client-patch/build/patch-ios-ipa.mjs \
 | ③ | 补丁后回读：旧站点 `0` 处、新端点 `138` 处 | `0` / `138`（URL 站点 `137` + ABC 常量池 `1`） |
 | ④ | `--guard-mode launch` 的 NOP 命中数 | `1`（仅 `0xb00c`） |
 
+回读还会逐条校验 `3568` 个 entry 的 CRC（`3568/3568`）、**未改动 entry 逐字节相同**（`3567/3568`）、
+主二进制的 zip 属性原样保留（`method=8` / `madeBy=0x1300` / `externalAttr=0x81ed0000` / `mode=0o100755`）
+—— 断言失败时**不写出产物**并以非 0 退出。
+
 另外报告里的 `premise` 段会复核任务书里那个「官方包含 `8.133.209.122:7001` 共 137 处」的前置事实——
 **官方包实测为 `0` 处**，该字面量只存在于被第三方改过的包，禁止拿它当输入。
 
-改动落点（两处，全部等长覆盖）：
+改动落点（三组，全部等长覆盖）：
 
 1. **137 个域名站点**（`__TEXT,__cstring` 里的 `https?://…leiting.com|roguelike.com|cl2009.com`）→
    `http://<填充>@<LAN_IP>:8001`（不足处用 userinfo 补 `0`，长度严格守恒）；
 2. **游戏 API 基址**（`ABC` 常量池里相邻的一对条目 `"https"` + `"shijtswygamegf.leiting.com"`）→
    `"http"` + `"00000000@<LAN_IP>:8001"`（成对长度守恒：`5+26` 字节 ↔ `4+27` 字节，
-   条目数与后续所有条目偏移逐字节不变）。运行期拼出 `http://00000000@<LAN_IP>:8001/api/index.php`。
+   条目数与后续所有条目偏移逐字节不变）。运行期拼出 `http://00000000@<LAN_IP>:8001/api/index.php`；
+3. **六项功能补丁**（基线原有，等长改写指令/字符串，随 `--agreement` / `--privacy` / `--guard-mode` 开关）：
+   sohu IP 查询屏蔽（1）、首登提示谓词打桩（1）、登录弹窗分支（3）、欢迎横幅（3）、协议门（3）、
+   bundleId 校验打桩（1）、启动 guard NOP（`0xb00c`，`--guard-mode launch` 时 1 处）。
+
+> 实测勘误（P10-A 报告 §2B）：官方件的 zip 元数据在 B0 的 `jar uf0` 产物上**并没有**被破坏
+> （3568 条 entry 的 `method`/`madeBy`/`externalAttr`/时间戳与官方件逐条比对差异为 **0**）。
+> 改用纯 Node 回写的真实理由是：**零外部依赖**（构建机不需要 JDK）、进程内可断言、
+> 逐条 CRC 交叉校验、断言失败时不产出。**不要**再声称「换掉 jar 修好了 AltStore invalid format」
+> —— 没有证据。
 
 ---
 
@@ -164,5 +184,42 @@ node out/cn-server.js
 
 ## 6. 产物去向
 
-- 产出包、探针日志、构建报告一律落在 `out/`（已被 `.gitignore` 忽略）。
-- 报告正文（含原始证据）写在仓库外：`D:\wfcnmod\报告-B0-iOS身份分支.md`。
+- 产出包、探针日志、构建报告一律落在 `out/` 或 `ios/patched/`（均被 `.gitignore` 忽略）。
+- 报告正文（含原始证据）写在仓库外：`D:\wfcnmod\报告-B0-iOS身份分支.md`（身份分支）、
+  `D:\wfcnmod\报告-P10-A-iOS.md`（重基线 + 出包 + A3 验证码结论）。
+
+---
+
+## 7. A3：绑定验证码怎么显示在 iOS 上（零 Mach-O 代码改动）
+
+**结论：走 LeitingSDK 自己的原生公告弹窗（候选①），客户端一个字节都不用再改，非越狱机也能用。**
+
+证据（主二进制字符串，实测偏移，详见报告 §2C）：`getNotice:` → `v2PostDataWithUrl:params:completion:`
+（POST）→ URL 格式串 `%@sdk_v3/get_notice.do` → 响应装进 `NoticeBean` → `initWithType:bean:` 原生弹窗
+（同段有 `cancelBtn`/`helpBtn`/`sureBtn`）；`urgentNoticeTitle`/`urgentNoticeContent`/`announceMsg`/
+`announceClickUrl` 都是可配字符串。
+
+**为什么不是候选②③**：游戏侧 AS3 的 ABC 已被 AOT 剥离（iOS `worldflipper_ios_release.swf` 与安卓
+`worldflipper_android_release.swf` 里 `DoABC` 都是 **0 次**），`NoticeBean`/`showNoticeTip`/
+`announceClickUrl` 在 SWF 里 **0 命中** ⇒ 游戏侧没有可改的公告承载点；基线那三处补丁是**布尔谓词/分支
+打桩**（`shouldShowFirstLoginTip` → `mov w0,#0;ret` 等），不是文案位；主二进制里 `验证码`/`verifyCode`
+命中 **0 次**。候选④（退 dylib 线）因此**不需要**。
+
+### 服主要做的三步
+
+1. **服务端挂片段**：`D:\wfcnmod\交付片段\p10a\ios-notice.fragment.ts` → 交给 P10-B 挂进
+   `src/routes/cn/ios-leiting.ts`（探针 `app.use` 挂最前；公告接 `/sdk_v3/get_notice.do` 三个前缀）。
+2. **真机跑一次（探针阶段）**：见第 2 步的启动命令 → 手机启动游戏 → 走到登录界面 → 看
+   `data/ios-probe/ios-probe-*.log`，里面是 SDK 的真实请求行与请求体字段名。
+3. **切到真实公告**：字段名确认后接上绑定码（`shotgun:false`，码只留一个字段）。之后每次打开公告
+   都能拿到新码；`[未验证-需真机]` —— 字段名与弹窗形态必须真机确认，本机无法验证。
+
+### 非越狱玩家怎么办（重要）
+
+- **不需要越狱也能看到验证码**：公告是 SDK 原生功能，A1 补丁已让 SDK 打到我们服务器；
+  非越狱机只要**重签 + 侧载**（§3 路线 B：Sideloadly + Apple ID，7 天续签）即可。
+  `Info.plist` 里 `NSAllowsArbitraryLoads=true`，明文 `http://` 不会被 ATS 拦。`[未验证-需真机]`
+- **重签包不能直接发给别人**（Apple ID 签名与设备绑定）⇒ 分发给非越狱玩家有两条路：
+  ①每人自己在电脑上重签（Sideloadly，7 天续一次）；②**人工绑定兜底（R3）**：把 UID/设备号发到群里，
+  由 bot/服主在后台人工绑定 —— 这条通道不依赖任何客户端改动，也是 A3 万一失败时的最终兜底。
+- 越狱机（Dopamine）走 §3 路线 A，可以永久签名，最省事。
