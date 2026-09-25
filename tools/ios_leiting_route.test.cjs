@@ -2,11 +2,30 @@
 
 const assert = require("node:assert/strict")
 const test = require("node:test")
+const crypto = require("node:crypto")
 
 require("ts-node/register/transpile-only")
 
 const Fastify = require("fastify")
 const iosLeitingRoutes = require("../src/routes/cn/ios-leiting").default
+
+// P10-B（卡 A12）：SDK 登录 mock 的身份派生材料不再写死在源码里，改由运维经环境变量提供
+// （见 src/routes/cn/ios-leiting.ts 顶部「β 修复」注释）。此处注入测试用值；测试用 aes key/iv
+// 是官方二进制里的公开协议常量，不是本项目的机密。secret 仅测试用。
+const BEAN_KEY = "#LeitingAESKey#!"
+const BEAN_IV = "LeitingAESIVKEY!"
+const BEAN_SECRET = "ios-leiting-route-test-secret"
+
+process.env.IOS_SDK_BEAN_KEY = BEAN_KEY
+process.env.IOS_SDK_BEAN_IV = BEAN_IV
+process.env.IOS_SDK_IDENTITY_SECRET = BEAN_SECRET
+
+/** 解密响应里的 AES-128-CBC 游客 UserBean，用于断言「身份是按设备派生的」。 */
+function decryptBean(data) {
+    const decipher = crypto.createDecipheriv("aes-128-cbc", Buffer.from(BEAN_KEY, "utf8"), Buffer.from(BEAN_IV, "utf8"))
+    const plain = Buffer.concat([decipher.update(Buffer.from(data, "base64")), decipher.final()])
+    return JSON.parse(plain.toString("utf8"))
+}
 
 const LOGIN_PATHS = [
     "/mobile!mobileLoginPubV2.action",
@@ -84,6 +103,118 @@ test("SDK login mock responds on both methods with the expected structure", asyn
             assert.ok(body.data.length > 0, "AES guest UserBean blob must be present")
         }
     }
+})
+
+// ── P10-B β 修复回归：身份必须按设备派生，且不得退化成共享身份 ──────────────
+
+test("two devices get different identities while one device stays byte-stable", async t => {
+    const app = await createApp()
+    t.after(() => app.close())
+
+    const inject = udid => app.inject({ method: "POST", url: "/sdk/v3-3/check_login.do", headers: { udid } })
+    const firstA = await inject("p10b-device-a")
+    const secondA = await inject("p10b-device-a")
+    const firstB = await inject("p10b-device-b")
+
+    for (const response of [firstA, secondA, firstB]) {
+        assert.equal(response.statusCode, 200)
+        assert.equal(response.json().status, "0")
+        assert.equal(response.json().type, "0")
+        assert.equal(response.json().message, "")
+    }
+
+    const beanA = decryptBean(firstA.json().data)
+    const beanB = decryptBean(firstB.json().data)
+
+    assert.match(beanA.userId, /^9\d{7}$/)
+    assert.equal(beanA.uid, Number(beanA.userId))
+    assert.equal(beanA.userName, `g_${beanA.userId}`)
+    assert.notEqual(beanA.userId, "10000001", "the shared beta identity must be gone")
+    assert.notEqual(beanB.userId, "10000001")
+    assert.notEqual(beanA.userId, beanB.userId, "two devices must not share one identity")
+    assert.notEqual(firstA.json().data, firstB.json().data)
+    assert.equal(firstA.json().data, secondA.json().data, "the same device must be stable across logins")
+})
+
+test("every one of the 16 login paths derives the identity the same way", async t => {
+    const app = await createApp()
+    t.after(() => app.close())
+
+    for (const url of LOGIN_PATHS) {
+        const a = await app.inject({ method: "POST", url, headers: { udid: "p10b-device-a" } })
+        const b = await app.inject({ method: "POST", url, headers: { udid: "p10b-device-b" } })
+        assert.equal(a.json().status, "0", url)
+        assert.equal(b.json().status, "0", url)
+        assert.notEqual(decryptBean(a.json().data).userId, decryptBean(b.json().data).userId, url)
+    }
+})
+
+test("device identifier precedence follows udid header > body device_id", async t => {
+    const app = await createApp()
+    t.after(() => app.close())
+
+    const headerOnly = await app.inject({
+        method: "POST",
+        url: "/sdk/v3-3/check_login.do",
+        headers: { udid: "p10b-device-a" },
+    })
+    const both = await app.inject({
+        method: "POST",
+        url: "/sdk/v3-3/check_login.do",
+        headers: { udid: "p10b-device-a", "content-type": "application/json" },
+        payload: { device_id: "p10b-device-b" },
+    })
+    const bodyOnly = await app.inject({
+        method: "POST",
+        url: "/sdk/v3-3/check_login.do",
+        headers: { "content-type": "application/json" },
+        payload: { device_id: "p10b-device-a" },
+    })
+
+    // udid 头优先：body 里的另一个 device_id 不改变结果
+    assert.equal(both.json().data, headerOnly.json().data)
+    // 没有 udid 头时，body.device_id 顶上来，且与同标识的头部来源得到同一身份
+    assert.equal(bodyOnly.json().data, headerOnly.json().data)
+})
+
+test("missing identity config fails closed instead of issuing a shared identity", async t => {
+    const app = await createApp({ env: {} })
+    t.after(() => app.close())
+
+    const login = await app.inject({ method: "POST", url: "/sdk/v3-3/check_login.do", headers: { udid: "p10b-device-a" } })
+    assert.equal(login.statusCode, 200)
+    assert.equal(login.json().status, "1")
+    assert.equal(login.json().type, "0")
+    assert.equal(login.json().message, "ios-sdk-login-unconfigured")
+    assert.equal(login.json().data, "", "must not hand out any identity when unconfigured")
+
+    // 验证码 stub 路径不受身份配置影响
+    for (const url of STUB_PATHS) {
+        const stub = await app.inject({ method: "POST", url })
+        assert.equal(stub.statusCode, 200, url)
+        assert.equal(stub.json().status, "0", url)
+        assert.equal(stub.json().data, "", url)
+    }
+})
+
+test("explicit sdkIdentity options take precedence over the environment", async t => {
+    const envSecretApp = await createApp()
+    t.after(() => envSecretApp.close())
+    const optionSecretApp = await createApp({
+        sdkIdentity: { aesKey: BEAN_KEY, aesIv: BEAN_IV, identitySecret: "another-test-secret" },
+    })
+    t.after(() => optionSecretApp.close())
+
+    const inject = app => app.inject({ method: "POST", url: "/sdk/v3-3/check_login.do", headers: { udid: "p10b-device-a" } })
+    const fromEnv = await inject(envSecretApp)
+    const fromOptions = await inject(optionSecretApp)
+
+    assert.equal(fromEnv.json().status, "0")
+    assert.equal(fromOptions.json().status, "0")
+    const beanEnv = decryptBean(fromEnv.json().data)
+    const beanOptions = decryptBean(fromOptions.json().data)
+    assert.match(beanOptions.userId, /^9\d{7}$/)
+    assert.notEqual(beanOptions.userId, beanEnv.userId, "a different secret must derive a different identity")
 })
 
 test("SDK stub paths respond with the empty-data structure", async t => {

@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SpLogin 原型 · 账号绑定（离线）</title>
+<!--
+  P10-B / 卡 A12 第二步交付物：类游戏登录 UI 的 **HTML 原型**（定稿后再评估 UIKit 实现）。
+
+  设计依据（唯一）：
+    D:\wfcnmod\ios-ui-kit\style-tokens.json   —— 从官方 .ui 预制件抽出的配色 / 九宫格素材名 / 圆角 / 发光 / 阴影
+    D:\wfcnmod\ios-ui-kit\README.md           —— 九宫格命名规范 color<RRGGBB>_round<圆角>_glow<发光>_shadow<阴影>
+  同源要求：P6（Android AS3 登录页）必须与本原型使用同一份 token —— 两边只认下表的变量。
+
+  红线自查（分工文档 §4-P10 B 线）：
+    · 文案、配色全部自写，**没有**复用他人 PlayerLogin.as 的任何字符串或颜色常量；
+    · 不含任何官方贴图 / 字体 / 图集字节，背景是 canvas 程序化绘制；
+    · **不含任何服务器地址**（原型纯离线模拟，不发起网络请求）；
+    · 不引用任何外部资源（无 CDN / 无外链字体 / 无图片文件）⇒ 断网、file:// 直接可开。
+
+  原型脚手架（页面左侧的状态开关、右下的 token 对照表）**不是要交付的游戏 UI**：
+  它们只为评审能一次看全 5 个状态；真机 dylib 里不存在这些控件。
+-->
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   1. 设计 token —— 逐条对应 ios-ui-kit/style-tokens.json 抽出的官方数值
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  /* 配色：取自官方预制件（见 style-tokens.json 各文件 colors 字段） */
+  --c-2ec4b6: #2EC4B6;   /* take_over.ui / general_button.ui：主色（青绿） */
+  --c-ea3553: #EA3553;   /* take_over.ui / general_button.ui：危险 / 次色（红） */
+  --c-ff9f1c: #FF9F1C;   /* general_button.ui / tab_active_bar.ui：强调（橙） */
+  --c-55acee: #55ACEE;   /* general_button.ui：信息（蓝） */
+  --c-fafafa: #FAFAFA;   /* panel.ui / general_button.ui：面板底 */
+  --c-ffffff: #FFFFFF;
+  --c-444444: #444444;   /* dialog_template.ui / panel.ui：正文 */
+  --c-414141: #414141;   /* take_over.ui：正文 */
+  --c-515151: #515151;   /* general_menu.ui：次级文字 */
+  --c-c9c9c9: #C9C9C9;   /* general_button.ui：中性 / 禁用 */
+  --c-cfcfcf: #CFCFCF;   /* dialog_template.ui：边框 / 分隔线 */
+  --c-dddddd: #DDDDDD;
+  --c-e8e8e8: #E8E8E8;
+  --c-eaeaea: #EAEAEA;
+  --c-222222: #222222;   /* loading.ui：深色底 */
+  --c-a673a7: #A673A7;   /* panel.ui：点缀（紫） */
+  --c-fb8890: #FB8890;   /* panel.ui：点缀（粉） */
+
+  /* 圆角：九宫格素材名里的 round<R>（18 / 24 / 32；radius64 = 全圆/胶囊） */
+  --round18: 18px;
+  --round24: 24px;
+  --round32: 32px;
+  --radius64: 64px;
+
+  /* 发光与阴影：素材名里的 glow<G> / shadow<S> */
+  --glow6-primary: 0 0 6px rgba(46, 196, 182, 0.65);
+  --glow6-negative: 0 0 6px rgba(234, 53, 83, 0.55);
+  --shadow4: 0 2px 4px rgba(0, 0, 0, 0.16);
+  --shadow8: 0 3px 8px rgba(0, 0, 0, 0.20);
+  --shadow20: 0 6px 20px rgba(0, 0, 0, 0.24);
+
+  /* 字体：包内无 TTF/OTF（README「字体」节）⇒ 阶 1 用系统字体近似 */
+  --font-ui: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+             "Heiti SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --font-num: ui-monospace, "SF Mono", Menlo, Consolas, "Courier New", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: #101418;
+  color: #E8E8E8;
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   2. 页面外壳（原型脚手架，非交付 UI）
+   ───────────────────────────────────────────────────────────────────────── */
+.page { display: flex; gap: 28px; align-items: flex-start; justify-content: center; padding: 28px 20px 48px; flex-wrap: wrap; }
+.controls {
+  width: 260px; flex: 0 0 auto; padding: 18px;
+  background: #171C21; border: 1px solid #23292F; border-radius: var(--round18);
+}
+.controls h2 { margin: 0 0 4px; font-size: 14px; letter-spacing: .04em; }
+.controls p.hint { margin: 0 0 14px; font-size: 11px; line-height: 1.6; color: #7C878F; }
+.controls .btn-row { display: flex; flex-direction: column; gap: 8px; }
+.controls button {
+  font: inherit; font-size: 13px; text-align: left; padding: 9px 12px; cursor: pointer;
+  color: #E8E8E8; background: #1F262C; border: 1px solid #2C343B; border-radius: 10px;
+}
+.controls button:hover { background: #263038; }
+.controls button[aria-pressed="true"] { border-color: var(--c-2ec4b6); color: var(--c-2ec4b6); }
+.controls label.check { display: flex; gap: 8px; align-items: center; margin-top: 12px; font-size: 12px; color: #9AA5AD; }
+.controls hr { border: 0; border-top: 1px solid #23292F; margin: 14px 0; }
+.controls .legend { font-size: 11px; color: #7C878F; line-height: 1.7; }
+.controls .legend b { color: #B9C4CC; font-weight: 600; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   3. 设备画面 414×736（iPhone 7 Plus 逻辑分辨率；真机目标 iOS 15.8.3）
+   ───────────────────────────────────────────────────────────────────────── */
+.stage-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.stage {
+  position: relative; width: 414px; height: 736px; flex: 0 0 auto;
+  border-radius: 44px; padding: 6px;
+  background: linear-gradient(180deg, #2A3138, #14181C);
+  box-shadow: var(--shadow20);
+}
+.stage.bare { border-radius: 0; padding: 0; background: none; box-shadow: none; width: 414px; height: 736px; }
+.screen {
+  position: relative; width: 100%; height: 100%; overflow: hidden;
+  border-radius: 38px; background: var(--c-222222);
+}
+.stage.bare .screen { border-radius: 0; }
+
+/* 状态栏（程序化绘制，非官方素材） */
+.statusbar {
+  position: absolute; inset: 0 0 auto 0; height: 20px; z-index: 6;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 10px; font-size: 11px; font-weight: 600; color: var(--c-ffffff);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .5);
+}
+.statusbar .right { display: flex; align-items: center; gap: 5px; }
+.bars { display: flex; align-items: flex-end; gap: 1.5px; height: 9px; }
+.bars i { width: 3px; background: currentColor; border-radius: 1px; }
+.bars i:nth-child(1) { height: 3px; } .bars i:nth-child(2) { height: 5px; }
+.bars i:nth-child(3) { height: 7px; } .bars i:nth-child(4) { height: 9px; }
+.batt { width: 22px; height: 10px; border: 1px solid currentColor; border-radius: 2.5px; padding: 1px; }
+.batt i { display: block; height: 100%; width: 72%; background: currentColor; border-radius: 1px; }
+
+/* 游戏场景：canvas 程序化绘制的星空（零素材、零再分发） */
+#backdrop { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+/* 全屏遮罩：loading.ui 的深色底 0x222222 + 顶层菜单用的 40% 黑（tophalfround40_000000） */
+.overlay {
+  position: absolute; inset: 0; z-index: 2;
+  background:
+    radial-gradient(120% 70% at 50% 8%, rgba(34, 34, 34, 0.10), rgba(34, 34, 34, 0.62) 70%),
+    linear-gradient(180deg, rgba(0, 0, 0, 0.40), rgba(0, 0, 0, 0.55));
+  backdrop-filter: blur(1.5px);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   4. 面板：panel.ui 的 colorfafafa_round32_shadow8（外） + colorfafafa_round24_shadow4（内）
+   ───────────────────────────────────────────────────────────────────────── */
+.panel-slot { position: absolute; inset: 0; z-index: 3; display: flex; align-items: center; justify-content: center; padding: 0 22px; }
+.panel {
+  position: relative; width: 100%; max-width: 360px;
+  background: var(--c-fafafa); color: var(--c-444444);
+  border-radius: var(--round32); box-shadow: var(--shadow8), 0 18px 48px rgba(0, 0, 0, .38);
+  padding: 22px 20px 18px;
+  animation: panel-in .28s cubic-bezier(.2, .8, .3, 1) both;
+}
+@keyframes panel-in { from { opacity: 0; transform: translateY(14px) scale(.97); } to { opacity: 1; transform: none; } }
+
+/* 装饰条：panel.ui 的 decoration-assets/bottom_decoration_part_a|b|c（此处用纯色块近似） */
+.panel::after {
+  content: ""; position: absolute; left: 50%; bottom: 6px; width: 64px; height: 3px;
+  transform: translateX(-50%); border-radius: 999px;
+  background: linear-gradient(90deg, var(--c-2ec4b6), var(--c-a673a7));
+  opacity: .75;
+}
+
+.panel-head { text-align: center; margin-bottom: 16px; }
+.panel-head h1 { margin: 0 0 6px; font-size: 19px; font-weight: 700; color: var(--c-414141); letter-spacing: .02em; }
+.panel-head .sub { margin: 0; font-size: 12px; line-height: 1.7; color: var(--c-515151); }
+
+/* ── 验证码区：超大 6 位码 + 有效期倒计时 ───────────────────────────── */
+.code-card {
+  background: var(--c-ffffff); border: 1px solid var(--c-eaeaea);
+  border-radius: var(--round24); box-shadow: var(--shadow4);
+  padding: 14px 14px 11px; margin-bottom: 16px; text-align: center;
+}
+.code-label { font-size: 11px; letter-spacing: .18em; color: var(--c-515151); margin-bottom: 6px; }
+.code {
+  font-family: var(--font-num); font-size: 46px; line-height: 1.1; font-weight: 700;
+  letter-spacing: .10em; color: var(--c-2ec4b6);
+  text-shadow: var(--glow6-primary);
+  font-variant-numeric: tabular-nums;
+}
+.code.pending { color: var(--c-c9c9c9); text-shadow: none; letter-spacing: .16em; }
+.code-meta { margin-top: 7px; font-size: 12px; color: var(--c-515151); display: flex; align-items: center; justify-content: center; gap: 8px; }
+.code-meta .t { font-family: var(--font-num); color: var(--c-ff9f1c); font-weight: 700; }
+.code-meta.expired .t { color: var(--c-ea3553); }
+
+/* ── 表单 ─────────────────────────────────────────────────────────── */
+.field { margin-bottom: 12px; }
+.field > label { display: block; font-size: 12px; font-weight: 600; color: var(--c-515151); margin-bottom: 6px; }
+.field input {
+  width: 100%; font: inherit; font-size: 16px; color: var(--c-444444);
+  background: var(--c-ffffff); border: 1.5px solid var(--c-cfcfcf);
+  border-radius: var(--round18); padding: 11px 13px; outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.field input::placeholder { color: #B9B9B9; }
+.field input:focus { border-color: var(--c-2ec4b6); box-shadow: var(--glow6-primary); }
+.field input:disabled { background: var(--c-eaeaea); color: var(--c-c9c9c9); border-color: var(--c-e8e8e8); }
+.field.invalid input { border-color: var(--c-ea3553); box-shadow: 0 0 6px rgba(234, 53, 83, .35); }
+.field .err { display: none; margin-top: 5px; font-size: 11.5px; color: var(--c-ea3553); }
+.field.invalid .err { display: block; }
+
+/* ── 按钮：bg-assets/color2ec4b6_round24_glow6_shadow20 与 colorea3553_round24_glow6_shadow20 ── */
+.actions { display: flex; flex-direction: column; gap: 9px; margin-top: 16px; }
+.btn {
+  font: inherit; font-size: 16px; font-weight: 700; letter-spacing: .04em;
+  border: 0; border-radius: var(--round24); padding: 13px 16px; cursor: pointer;
+  color: var(--c-ffffff); transition: transform .08s, filter .15s, box-shadow .15s;
+}
+.btn:active { transform: translateY(1px) scale(.995); }        /* effect-assets/button_r24_down_flat_effect */
+.btn-primary { background: var(--c-2ec4b6); box-shadow: var(--glow6-primary), var(--shadow20); }
+.btn-primary:active { filter: brightness(.88); box-shadow: inset 0 3px 8px rgba(0, 0, 0, .22); }
+.btn-secondary { background: var(--c-ea3553); box-shadow: var(--glow6-negative), var(--shadow20); }
+.btn-secondary:active { filter: brightness(.88); box-shadow: inset 0 3px 8px rgba(0, 0, 0, .22); }
+.btn-ghost {
+  background: var(--c-ffffff); color: var(--c-515151);
+  border: 1.5px solid var(--c-cfcfcf); box-shadow: var(--shadow4); font-weight: 600; font-size: 14px;
+}
+.btn:disabled { background: var(--c-c9c9c9); color: var(--c-fafafa); box-shadow: none; cursor: not-allowed; transform: none; filter: none; }
+.btn .spin {
+  display: inline-block; width: 13px; height: 13px; margin-right: 7px; vertical-align: -1px;
+  border: 2px solid rgba(255, 255, 255, .45); border-top-color: var(--c-ffffff); border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── 绑定状态行（轮询 POST /sp-auth/bind-status） ─────────────────── */
+.status {
+  display: flex; align-items: center; gap: 8px; margin-top: 14px;
+  padding: 10px 12px; border-radius: var(--round18);
+  background: var(--c-eaeaea); font-size: 12.5px; color: var(--c-515151); line-height: 1.5;
+}
+.status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c-c9c9c9); flex: 0 0 auto; }
+.status[data-tone="wait"] .dot { background: var(--c-ff9f1c); animation: pulse 1.1s ease-in-out infinite; }
+.status[data-tone="ok"] .dot { background: var(--c-2ec4b6); }
+.status[data-tone="bad"] { background: #FDEBEE; color: var(--c-ea3553); }
+.status[data-tone="bad"] .dot { background: var(--c-ea3553); }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+.dots::after { content: ""; animation: dots 1.2s steps(4, end) infinite; }
+@keyframes dots { 0% { content: ""; } 25% { content: "·"; } 50% { content: "··"; } 75% { content: "···"; } }
+
+/* ── 错误重试块 ───────────────────────────────────────────────────── */
+.alert {
+  display: none; margin-top: 12px; padding: 11px 13px;
+  background: #FDEBEE; border: 1.5px solid var(--c-ea3553);
+  border-radius: var(--round18); color: var(--c-ea3553); font-size: 12.5px; line-height: 1.6;
+}
+.alert.show { display: block; }
+.alert b { display: block; font-size: 13px; margin-bottom: 3px; }
+
+/* ── 成功态 ───────────────────────────────────────────────────────── */
+.success { text-align: center; padding: 6px 4px 2px; }
+.success .mark {
+  width: 68px; height: 68px; margin: 2px auto 14px; border-radius: 50%;
+  background: var(--c-2ec4b6); box-shadow: var(--glow6-primary), var(--shadow8);
+  display: flex; align-items: center; justify-content: center;
+}
+.success .mark svg { width: 34px; height: 34px; }
+.success h1 { margin: 0 0 8px; font-size: 20px; color: var(--c-414141); }
+.success p { margin: 0 0 6px; font-size: 13px; line-height: 1.8; color: var(--c-515151); }
+.success .big { font-size: 15px; font-weight: 700; color: var(--c-2ec4b6); }
+.success .qq { font-family: var(--font-num); font-size: 16px; font-weight: 700; color: var(--c-ff9f1c); }
+.success .btn { margin-top: 16px; }
+
+/* 底部提示（真机回游戏路径） */
+.footnote { margin-top: 12px; text-align: center; font-size: 11.5px; line-height: 1.7; color: var(--c-515151); }
+.footnote .kbd {
+  display: inline-block; padding: 1px 6px; border-radius: 6px;
+  background: var(--c-eaeaea); color: var(--c-444444); font-weight: 600;
+}
+
+/* ── token 对照表（脚手架） ───────────────────────────────────────── */
+.token-map { width: 414px; max-width: 100%; font-size: 12px; color: #9AA5AD; }
+.token-map summary { cursor: pointer; padding: 8px 0; color: #B9C4CC; }
+.token-map table { width: 100%; border-collapse: collapse; }
+.token-map th, .token-map td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #23292F; vertical-align: top; }
+.token-map th { color: #7C878F; font-weight: 600; }
+.token-map code { font-family: var(--font-num); font-size: 11px; color: var(--c-2ec4b6); word-break: break-all; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ═══ 原型脚手架：状态开关（真机 dylib 里没有这些控件） ═══ -->
+  <aside class="controls">
+    <h2>原型状态开关</h2>
+    <p class="hint">只为一次看全 5 个 UI 状态；真机里这些控件不存在。自动流程：等待验证码 → 显示 6 位码 → 已绑定等待 → 成功进入。</p>
+    <div class="btn-row" id="stateButtons">
+      <button type="button" data-force="waiting-code">① 等待验证码</button>
+      <button type="button" data-force="code-shown">② 显示 6 位码</button>
+      <button type="button" data-force="binding">③ 已绑定等待</button>
+      <button type="button" data-force="error">④ 错误重试</button>
+      <button type="button" data-force="success">⑤ 成功进入</button>
+    </div>
+    <hr>
+    <label class="check"><input type="checkbox" id="failNext"> 下一次绑定失败（演练错误态）</label>
+    <label class="check"><input type="checkbox" id="bareMode"> 去掉机身，只留 414×736 画面</label>
+    <hr>
+    <p class="legend">
+      <b>当前状态：</b><span id="stateName">—</span><br>
+      <b>演示账号：</b><span id="demoQq">—</span><br>
+      <b>配色 / 圆角 / 发光：</b>全部取自 <code>ios-ui-kit/style-tokens.json</code>
+    </p>
+  </aside>
+
+  <!-- ═══ 交付物本体 ═══ -->
+  <main class="stage-wrap">
+    <div class="stage" id="stage">
+      <div class="screen">
+        <canvas id="backdrop" width="828" height="1472" aria-hidden="true"></canvas>
+
+        <div class="statusbar">
+          <span class="left" id="clock">09:41</span>
+          <span class="right">
+            <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span aria-hidden="true">WiFi</span>
+            <span class="batt" aria-hidden="true"><i></i></span>
+          </span>
+        </div>
+
+        <div class="overlay" aria-hidden="true"></div>
+
+        <div class="panel-slot">
+          <!-- ── 主面板 ── -->
+          <section class="panel" id="panel" role="dialog" aria-modal="true" aria-labelledby="panelTitle">
+            <div id="formView">
+              <header class="panel-head">
+                <h1 id="panelTitle">账号验证</h1>
+                <p class="sub">把下方验证码填进游戏，或在这里直接绑定账号</p>
+              </header>
+
+              <div class="code-card">
+                <div class="code-label">验 证 码</div>
+                <div class="code pending" id="codeValue" aria-live="polite">－ － － － － －</div>
+                <div class="code-meta" id="codeMeta">
+                  <span>等待服务器下发…</span>
+                </div>
+              </div>
+
+              <form id="bindForm" novalidate>
+                <div class="field" id="fieldQq">
+                  <label for="inputQq">QQ 号</label>
+                  <input id="inputQq" name="qq" type="text" inputmode="numeric" autocomplete="off"
+                         placeholder="请输入 5–11 位 QQ 号" disabled>
+                  <p class="err">QQ 号格式不正确（应为 5–11 位数字）</p>
+                </div>
+                <div class="field" id="fieldPwd">
+                  <label for="inputPwd">密码</label>
+                  <input id="inputPwd" name="pwd" type="password" autocomplete="new-password"
+                         placeholder="请设置 6–20 位密码" disabled>
+                  <p class="err">密码长度需为 6–20 位</p>
+                </div>
+                <div class="field" id="fieldPwd2">
+                  <label for="inputPwd2">确认密码</label>
+                  <input id="inputPwd2" name="pwd2" type="password" autocomplete="new-password"
+                         placeholder="请再次输入密码" disabled>
+                  <p class="err">两次输入的密码不一致</p>
+                </div>
+
+                <div class="actions">
+                  <button type="submit" class="btn btn-primary" id="btnPrimary" disabled>创建账号并绑定</button>
+                  <button type="button" class="btn btn-secondary" id="btnSecondary" disabled>我已有账号</button>
+                </div>
+              </form>
+            </div>
+
+            <!-- ── 成功态（同一面板内切换） ── -->
+            <div id="successView" hidden>
+              <div class="success">
+                <div class="mark" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="3.2"
+                       stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>
+                </div>
+                <h1>已绑定成功</h1>
+                <p>账号 <span class="qq" id="boundQq">—</span> 已绑定到本设备</p>
+                <p class="big">回游戏点「点击开始」即可进入</p>
+                <button type="button" class="btn btn-ghost" id="btnRestart">重新演示一遍</button>
+              </div>
+            </div>
+
+            <div class="status" id="statusRow" data-tone="idle" role="status" aria-live="polite">
+              <span class="dot" aria-hidden="true"></span>
+              <span id="statusText">等待服务器下发验证码<span class="dots"></span></span>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <p class="footnote">
+      目标机型 iPhone 7 Plus / iOS 15.8.3 / Dopamine（rootless）· 本页纯离线，不含任何服务器地址与官方素材<br>
+      绑定成功后按 <span class="kbd">点击开始</span> 进入游戏；验证码有效期 5 分钟，过期可重新获取
+    </p>
+  </main>
+</div>
+
+<!-- ═══ token 对照表（脚手架，用于验收「配色/圆角/发光与 token 一致」） ═══ -->
+<details class="token-map">
+  <summary>▸ 本原型用到的官方 token 对照表（九宫格素材名 → CSS）</summary>
+  <table>
+    <thead><tr><th>UI 元素</th><th>官方素材名（scene/general/sprite_sheet/ 下）</th><th>本原型</th></tr></thead>
+    <tbody>
+      <tr><td>主按钮（创建账号并绑定）</td><td><code>bg-assets/color2ec4b6_round24_glow6_shadow20</code></td><td><code>.btn-primary</code>：#2EC4B6 / 圆角 24 / glow 6 / shadow 20</td></tr>
+      <tr><td>次按钮（我已有账号）</td><td><code>bg-assets/colorea3553_round24_glow6_shadow20</code></td><td><code>.btn-secondary</code>：#EA3553 / 圆角 24 / glow 6 / shadow 20</td></tr>
+      <tr><td>按钮按压态</td><td><code>effect-assets/button_r24_down_flat_effect</code></td><td><code>.btn:active</code>：下移 1px + brightness(.88) + 内阴影</td></tr>
+      <tr><td>禁用态按钮</td><td><code>bg-assets/colorc9c9c9_round24_glow6_shadow20</code></td><td><code>.btn:disabled</code>：#C9C9C9 / 无发光</td></tr>
+      <tr><td>中性面板</td><td><code>bg-assets/colorfafafa_round32_shadow8</code> + <code>colorfafafa_round24_shadow4</code></td><td><code>.panel</code> 圆角 32 / shadow 8；<code>.code-card</code> 圆角 24 / shadow 4</td></tr>
+      <tr><td>输入框</td><td><code>dialog_template.ui</code> 的 <code>0xCFCFCF</code> 边框 + <code>0x444444</code> 文字</td><td><code>.field input</code>：1.5px #CFCFCF / 圆角 18 / 聚焦 glow 6</td></tr>
+      <tr><td>强调数字（倒计时）</td><td><code>bg-assets/colorff9f1c_round18_glow6_shadow20</code>（橙）</td><td><code>.code-meta .t</code>：#FF9F1C</td></tr>
+      <tr><td>验证码大字</td><td><code>take_over.ui</code> 的 <code>0x2EC4B6</code>（官方引继页主色）</td><td><code>.code</code>：#2EC4B6 + glow 6</td></tr>
+      <tr><td>全屏遮罩 / 深色底</td><td><code>bg-assets/color222222_round4_shadow8</code>、<code>tophalfround40_000000</code></td><td><code>.overlay</code>：#222222 + 40% 黑</td></tr>
+      <tr><td>装饰条</td><td><code>decoration-assets/bottom_decoration_part_a|b|c</code></td><td><code>.panel::after</code>：青绿→紫渐变短条</td></tr>
+      <tr><td>点缀色（紫 / 粉）</td><td><code>panel.ui</code> 的 <code>0xA673A7</code> / <code>0xFB8890</code></td><td>仅用于装饰条与状态点</td></tr>
+    </tbody>
+  </table>
+</details>
+
+<script>
+"use strict";
+/* =========================================================================
+   P10-B 原型交互（纯本地模拟，零网络请求）
+   状态机与卡 A12 / 分工文档 §4-P10 B2 对齐：
+     waiting-code  等待验证码
+     code-shown    显示 6 位码（含有效期倒计时）
+     binding       已绑定等待（轮询 POST /sp-auth/bind-status）
+     error         错误重试
+     success       成功进入
+   ========================================================================= */
+
+/* ---- 官方背景色的 JS 副本（canvas 用，值与上面的 CSS 变量一致） ---- */
+const TOKEN = {
+  c222222: "#222222", c2ec4b6: "#2EC4B6", cea3553: "#EA3553",
+  cff9f1c: "#FF9F1C", cfafafa: "#FAFAFA", c444444: "#444444",
+  c515151: "#515151", ca673a7: "#A673A7", cfb8890: "#FB8890", c55acee: "#55ACEE"
+};
+
+/* ---- 演示数据：确定性（利于截图取证），非随机数 ---- */
+const DEMO_CODES = ["736251", "204918", "885330"];
+let codeIndex = 0;
+const CODE_TTL_SECONDS = 5 * 60;
+
+const el = id => document.getElementById(id);
+const ui = {
+  stage: el("stage"), bare: el("bareMode"), failNext: el("failNext"),
+  stateName: el("stateName"), demoQq: el("demoQq"),
+  panel: el("panel"), formView: el("formView"), successView: el("successView"),
+  codeValue: el("codeValue"), codeMeta: el("codeMeta"),
+  qq: el("inputQq"), pwd: el("inputPwd"), pwd2: el("inputPwd2"),
+  fieldQq: el("fieldQq"), fieldPwd: el("fieldPwd"), fieldPwd2: el("fieldPwd2"),
+  btnPrimary: el("btnPrimary"), btnSecondary: el("btnSecondary"),
+  statusRow: el("statusRow"), statusText: el("statusText"),
+  boundQq: el("boundQq"), btnRestart: el("btnRestart"),
+  clock: el("clock"), stateButtons: el("stateButtons")
+};
+
+let state = "waiting-code";
+let countdownTimer = null;
+let pollTimer = null;
+let mode = "create";          // create = 创建账号并绑定；existing = 我已有账号
+let pendingSeconds = 0;
+
+/* ───────────────────────── 背景：程序化星空（零素材） ───────────────────────── */
+function paintBackdrop() {
+  const canvas = el("backdrop");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // 底色：深色底 + 顶部偏蓝的夜幕
+  const sky = ctx.createLinearGradient(0, 0, 0, h);
+  sky.addColorStop(0, "#16222E");
+  sky.addColorStop(0.45, "#141A22");
+  sky.addColorStop(1, TOKEN.c222222);
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, w, h);
+
+  // 远处星云光斑（青绿 / 紫 / 粉，都用 token 配色）
+  const orbs = [
+    { x: 0.18, y: 0.20, r: 0.42, c: TOKEN.c2ec4b6, a: 0.20 },
+    { x: 0.86, y: 0.32, r: 0.38, c: TOKEN.ca673a7, a: 0.22 },
+    { x: 0.60, y: 0.82, r: 0.46, c: TOKEN.cfb8890, a: 0.14 },
+    { x: 0.30, y: 0.62, r: 0.30, c: TOKEN.c55acee, a: 0.12 }
+  ];
+  for (const o of orbs) {
+    const g = ctx.createRadialGradient(w * o.x, h * o.y, 0, w * o.x, h * o.y, Math.max(w, h) * o.r);
+    g.addColorStop(0, hexA(o.c, o.a));
+    g.addColorStop(1, hexA(o.c, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  // 星点：确定性伪随机（同一颗星每次都在同一位置 ⇒ 截图可复现）
+  let seed = 20260924;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i = 0; i < 220; i++) {
+    const x = rnd() * w, y = rnd() * h, r = rnd() * 2.1 + 0.4;
+    ctx.globalAlpha = 0.25 + rnd() * 0.65;
+    ctx.fillStyle = rnd() > 0.86 ? TOKEN.cff9f1c : "#FFFFFF";
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 行星弧线（程序化，非任何官方贴图）
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(w * 0.8, h * 0.16, w * 0.52, 0, Math.PI * 2);
+  const pg = ctx.createRadialGradient(w * 0.8, h * 0.16, w * 0.30, w * 0.8, h * 0.16, w * 0.56);
+  pg.addColorStop(0, hexA(TOKEN.c55acee, 0.00));
+  pg.addColorStop(0.82, hexA(TOKEN.c55acee, 0.12));
+  pg.addColorStop(1, hexA(TOKEN.c2ec4b6, 0.26));
+  ctx.fillStyle = pg;
+  ctx.fill();
+  ctx.restore();
+}
+function hexA(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+/* ───────────────────────── 状态渲染 ───────────────────────── */
+function setState(next, options = {}) {
+  state = next;
+  ui.stateName.textContent = next;
+  for (const b of ui.stateButtons.querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.force === next));
+  }
+  stopTimers();
+
+  if (next === "waiting-code") {
+    showForm();
+    ui.codeValue.textContent = "－ － － － － －";
+    ui.codeValue.classList.add("pending");
+    ui.codeMeta.classList.remove("expired");
+    ui.codeMeta.innerHTML = "<span>等待服务器下发<span class='dots'></span></span>";
+    setInputsEnabled(false);
+    setStatus("等待服务器下发验证码", "wait", true);
+    return;
+  }
+
+  if (next === "code-shown") {
+    showForm();
+    ui.codeValue.textContent = DEMO_CODES[codeIndex % DEMO_CODES.length];
+    ui.codeValue.classList.remove("pending");
+    setInputsEnabled(true);
+    setStatus("请在本页完成绑定，或把验证码填进游戏", "idle", true);
+    startCountdown(options.seconds || CODE_TTL_SECONDS);
+    return;
+  }
+
+  if (next === "binding") {
+    showForm();
+    setInputsEnabled(false);
+    ui.btnPrimary.disabled = false;
+    ui.btnPrimary.innerHTML = '<span class="spin" aria-hidden="true"></span>正在绑定';
+    ui.btnSecondary.disabled = true;
+    setStatus("正在等待绑定结果", "wait", true);
+    startPolling();
+    return;
+  }
+
+  if (next === "error") {
+    showForm();
+    setInputsEnabled(true);
+    ui.btnPrimary.disabled = false;
+    ui.btnPrimary.textContent = "重试绑定";
+    ui.btnSecondary.disabled = false;
+    showAlert(options.message || "绑定失败，请回到游戏重新获取验证码后重试。");
+    setStatus("绑定未完成", "bad", false);
+    return;
+  }
+
+  if (next === "success") {
+    ui.boundQq.textContent = ui.qq.value.trim() || "—";
+    ui.formView.hidden = true;
+    ui.successView.hidden = false;
+    ui.panel.style.animation = "none";
+    void ui.panel.offsetWidth;
+    ui.panel.style.animation = "";
+    setStatus("绑定完成，可以回游戏了", "ok", false);
+    return;
+  }
+}
+
+function showForm() {
+  ui.formView.hidden = false;
+  ui.successView.hidden = true;
+  hideAlert();
+  ui.btnPrimary.textContent = mode === "create" ? "创建账号并绑定" : "登录并绑定";
+  ui.btnSecondary.textContent = mode === "create" ? "我已有账号" : "返回创建账号";
+  clearFieldErrors();
+}
+
+function setInputsEnabled(enabled) {
+  ui.qq.disabled = !enabled;
+  ui.pwd.disabled = !enabled;
+  ui.pwd2.disabled = !enabled || mode === "existing";
+  ui.fieldPwd2.style.display = mode === "existing" ? "none" : "";
+  ui.btnPrimary.disabled = !enabled;
+  ui.btnSecondary.disabled = !enabled;
+}
+
+function setStatus(text, tone, animated) {
+  ui.statusRow.dataset.tone = tone;
+  ui.statusText.innerHTML = "";
+  ui.statusText.append(document.createTextNode(text));
+  if (animated) {
+    const s = document.createElement("span");
+    s.className = "dots";
+    ui.statusText.append(s);
+  }
+}
+
+function showAlert(message) {
+  let box = ui.panel.querySelector(".alert");
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "alert";
+    box.setAttribute("role", "alert");
+    ui.statusRow.parentNode.insertBefore(box, ui.statusRow);
+  }
+  box.innerHTML = "";
+  const b = document.createElement("b");
+  b.textContent = "绑定未成功";
+  box.append(b, document.createTextNode(message));
+  box.classList.add("show");
+}
+function hideAlert() {
+  const box = ui.panel.querySelector(".alert");
+  if (box) box.classList.remove("show");
+}
+function clearFieldErrors() {
+  ui.fieldQq.classList.remove("invalid");
+  ui.fieldPwd.classList.remove("invalid");
+  ui.fieldPwd2.classList.remove("invalid");
+}
+
+/* ───────────────────────── 有效期倒计时 ───────────────────────── */
+function startCountdown(seconds) {
+  pendingSeconds = seconds;
+  // DOM 只搭一次，之后只改时间节点 —— 避免每秒重建「重新获取」按钮导致点击被打断
+  ui.codeMeta.textContent = "";
+  const label = document.createTextNode("有效期 ");
+  const time = document.createElement("span");
+  time.className = "t";
+  const resend = document.createElement("button");
+  resend.type = "button";
+  resend.id = "resend";
+  resend.textContent = "重新获取";
+  resend.style.cssText = "font:inherit;font-size:12px;color:#2EC4B6;background:none;border:0;cursor:pointer;text-decoration:underline;padding:0 0 0 6px";
+  resend.addEventListener("click", () => { codeIndex++; setState("code-shown"); });
+  ui.codeMeta.append(label, time, resend);
+
+  const render = () => {
+    const m = String(Math.floor(pendingSeconds / 60)).padStart(2, "0");
+    const s = String(pendingSeconds % 60).padStart(2, "0");
+    time.textContent = `${m}:${s}`;
+    ui.codeMeta.classList.toggle("expired", pendingSeconds <= 0);
+  };
+  render();
+  countdownTimer = setInterval(() => {
+    pendingSeconds -= 1;
+    if (pendingSeconds <= 0) {
+      pendingSeconds = 0;
+      render();
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+      onCodeExpired();
+      return;
+    }
+    render();
+  }, 1000);
+}
+function onCodeExpired() {
+  setInputsEnabled(false);
+  showAlert("验证码已过期，点「重新获取」拿一个新的。");
+  setStatus("验证码已过期", "bad", false);
+}
+
+/* ───────────────────────── 轮询绑定结果（模拟 POST /sp-auth/bind-status） ───────────────────────── */
+function startPolling() {
+  let ticks = 0;
+  const shouldFail = ui.failNext && ui.failNext.checked;
+  pollTimer = setInterval(() => {
+    ticks += 1;
+    if (ticks < 3) {
+      setStatus(`正在等待绑定结果（第 ${ticks} 次查询）`, "wait", true);
+      return;
+    }
+    clearInterval(pollTimer);
+    pollTimer = null;
+    if (shouldFail) {
+      ui.failNext.checked = false;
+      setState("error", { message: "服务端返回绑定失败（演示）：验证码已失效，请重新获取后再试。" });
+    } else {
+      setState("success");
+    }
+  }, 900);
+}
+
+function stopTimers() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  ui.btnPrimary.innerHTML = ui.btnPrimary.textContent;   // 去掉 spinner
+}
+
+/* ───────────────────────── 表单校验与提交 ───────────────────────── */
+function validate() {
+  clearFieldErrors();
+  const qq = ui.qq.value.trim();
+  const pwd = ui.pwd.value;
+  const pwd2 = ui.pwd2.value;
+  let ok = true;
+  if (!/^\d{5,11}$/.test(qq)) { ui.fieldQq.classList.add("invalid"); ok = false; }
+  if (pwd.length < 6 || pwd.length > 20) { ui.fieldPwd.classList.add("invalid"); ok = false; }
+  if (mode === "create" && pwd2 !== pwd) { ui.fieldPwd2.classList.add("invalid"); ok = false; }
+  return ok;
+}
+
+el("bindForm").addEventListener("submit", event => {
+  event.preventDefault();
+  if (!validate()) {
+    setStatus("请先修正表单里的问题", "bad", false);
+    return;
+  }
+  setState("binding");
+});
+
+ui.btnSecondary.addEventListener("click", () => {
+  mode = mode === "create" ? "existing" : "create";
+  ui.pwd2.value = "";
+  showForm();
+  setInputsEnabled(state === "code-shown");
+  setStatus(mode === "create" ? "创建新账号并绑定到本设备" : "用已有账号绑定到本设备", "idle", false);
+});
+
+ui.btnRestart.addEventListener("click", () => {
+  mode = "create";
+  codeIndex++;
+  ui.qq.value = ""; ui.pwd.value = ""; ui.pwd2.value = "";
+  setState("waiting-code");
+});
+
+/* ───────────────────────── 脚手架控件 ───────────────────────── */
+ui.stateButtons.addEventListener("click", event => {
+  const btn = event.target.closest("button[data-force]");
+  if (!btn) return;
+  const target = btn.dataset.force;
+  if (target === "error") { setState("error"); return; }
+  if (target === "code-shown") { codeIndex = 0; }
+  setState(target);
+});
+ui.bare.addEventListener("change", () => ui.stage.classList.toggle("bare", ui.bare.checked));
+
+/* 状态栏时钟（纯装饰，固定演示时刻，便于截图对照） */
+ui.clock.textContent = "09:41";
+
+/* 预填一个演示账号，方便一次看全流程 */
+ui.qq.value = "100200300";
+ui.pwd.value = "";
+ui.pwd2.value = "";
+ui.demoQq.textContent = ui.qq.value;
+
+/* ───────── 深链：index.html#state=<状态> 直达某个状态（评审/截图用） ─────────
+   可选参数：#solo 隐藏脚手架与机身，只留 414×736 画面。
+   带上 #state= 时进入「冻结」模式：不跑倒计时、不跑轮询，画面停在指定状态。 */
+const HASH = new URLSearchParams(location.hash.replace(/^#/, ""));
+const FORCED_STATE = HASH.get("state");
+const KNOWN_STATES = ["waiting-code", "code-shown", "binding", "error", "success"];
+const FREEZE = KNOWN_STATES.includes(FORCED_STATE || "");
+let freeze = FREEZE;
+
+if (HASH.has("solo")) {
+  document.querySelector(".controls").hidden = true;
+  document.querySelector(".token-map").hidden = true;
+  document.querySelector(".footnote").hidden = true;
+  ui.stage.classList.add("bare");
+  document.body.style.background = "#000";
+  document.querySelector(".page").style.padding = "0";
+}
+
+/* 冻结模式下把带定时器的两个状态改成静态渲染 */
+const startCountdownUnfrozen = startCountdown;
+startCountdown = function (seconds) {
+  if (!freeze) return startCountdownUnfrozen(seconds);
+  ui.codeMeta.textContent = "";
+  const time = document.createElement("span");
+  time.className = "t";
+  time.textContent = "05:00";
+  ui.codeMeta.append(document.createTextNode("有效期 "), time);
+};
+let startPollingUnfrozen = startPolling;
+startPolling = function () {
+  if (!freeze) return startPollingUnfrozen();
+  setStatus("正在等待绑定结果", "wait", true);
+};
+
+/* 启动：画背景 → 直达指定状态，或走默认的「等待验证码 → 显示 6 位码」流程 */
+paintBackdrop();
+if (FREEZE) {
+  setState(FORCED_STATE);
+} else {
+  setState("waiting-code");
+  setTimeout(() => { if (state === "waiting-code") setState("code-shown"); }, 1400);
+}
+
+/* 真机尺寸变化时重绘背景 */
+window.addEventListener("resize", paintBackdrop);
+</script>
+</body>
+</html>
