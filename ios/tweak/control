@@ -1,0 +1,8 @@
+Package: com.starpoint.splogin
+Name: SpLogin
+Version: 0.1.0
+Architecture: iphoneos-arm
+Depends: mobilesubstrate
+Maintainer: StarPoint CN <noreply@example.invalid>
+Section: Tweaks
+Description: 世界弹射物语 CN 私服登录 UI：显示服务端下发的注册验证码、轮询绑定状态、把 SDK 基址指向私服

@@ -1,0 +1,11 @@
+#!/bin/sh
+# 安装后提示：只打印，不改动任何系统文件（rootless 下 /etc/hosts 不可写，见 ios/deb/README.md）。
+# 需要可执行位：CI 里若被检出为 644，dpkg-deb 会拒绝打包 —— workflow 中已显式 chmod +x。
+
+echo "[SpLogin] 已安装到 /Library/MobileSubstrate/DynamicLibraries/SpLogin.dylib"
+echo "[SpLogin] rootless 越狱（Dopamine）实际路径为 /var/jb/Library/MobileSubstrate/DynamicLibraries/"
+echo "[SpLogin] 生效方式：完全退出「世界弹射物语」后重新启动（不是切后台）"
+echo "[SpLogin] 日志：idevicesyslog | grep SpLogin ，或 <越狱根>/var/mobile/Library/Logs/SpLogin.log"
+echo "[SpLogin] 若登录界面没出现，先确认服务器已导出 IOS_SDK_BEAN_KEY / IOS_SDK_BEAN_IV / IOS_SDK_IDENTITY_SECRET"
+
+exit 0

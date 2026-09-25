@@ -14,6 +14,13 @@ const iosLeitingRoutes = require("../src/routes/cn/ios-leiting").default
 const assetPlugin = require("../src/routes/cn/asset").default
 const cdnFilesPlugin = require("../src/routes/cn/cdnFiles").default
 
+// P10-B（卡 A12）：iOS SDK 登录的身份派生材料改由环境变量提供（见
+// src/routes/cn/ios-leiting.ts 顶部「β 修复」注释）；未配置时该路由 fail closed。
+// 这里注入测试用值（aes key/iv 是官方二进制里的公开协议常量）。
+process.env.IOS_SDK_BEAN_KEY = "#LeitingAESKey#!"
+process.env.IOS_SDK_BEAN_IV = "LeitingAESIVKEY!"
+process.env.IOS_SDK_IDENTITY_SECRET = "combined-startup-test-secret"
+
 const SHA = "a".repeat(64)
 
 function archive(relativePath, compressedBytes, order = 1) {
