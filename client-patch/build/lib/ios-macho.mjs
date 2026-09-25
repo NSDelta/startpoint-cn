@@ -115,7 +115,7 @@ export const OFFICIAL_IOS_184 = {
     abcPairOffset: 0x5a0e14b,
     abcPairBytes: 33,
     mainEntryAttrs: { method: 8, versionMadeBy: 0x1300, externalAttr: 0x81ed0000, unixMode: 0o100755 },
-    // B0 派生件（patch-ios-ipa.mjs）的产物主二进制 sha256 —— 只作对照，不是验收目标：
+    // B0 派生物（当时的 iOS 派生脚本，现已删除）的主二进制 sha256 —— 只作对照，不是验收目标：
     // 那个派生件丢了基线六项功能补丁（见 D:\wfcnmod\报告-P10-A-iOS.md §2）
     b0BinSha256After: "f5ce251752a123559a5d26b95eb3cea39b4fd4f8a9cbfec4a02e7306240cdbec",
 }
