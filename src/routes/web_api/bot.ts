@@ -197,8 +197,11 @@ function resolveUnbindAccount(platform: BindingPlatform, uid: string, code: stri
     if (row === null || row.status === "revoked") return { ok: false, code: "CODE_INVALID" }
     if (row.status === "expired") return { ok: false, code: "CODE_EXPIRED" }
     if (row.status === "bound") {
-        // The code that originally bound this identity is the strongest proof.
-        if (row.platformUid !== uid) return { ok: false, code: "CODE_INVALID" }
+        // The code that originally bound this identity is the strongest proof,
+        // but only for the platform identity it actually bound.
+        if (row.platformUid !== uid || row.platform !== platform) {
+            return { ok: false, code: "CODE_INVALID" }
+        }
         return { ok: true, accountId: row.accountId, pendingCode: false }
     }
     if (row.attempts >= SIGNUP_CODE_MAX_ATTEMPTS) return { ok: false, code: "CODE_LOCKED" }
@@ -208,6 +211,10 @@ function resolveUnbindAccount(platform: BindingPlatform, uid: string, code: stri
         return { ok: false, code: "ACCOUNT_DISABLED" }
     }
     return { ok: true, accountId: row.accountId, pendingCode: true }
+}
+
+function isDatabaseReady(): boolean {
+    return getDatabaseStatus().ready
 }
 
 function sendBotError(request: FastifyRequest, reply: FastifyReply, error: unknown) {
