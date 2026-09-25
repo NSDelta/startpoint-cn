@@ -924,3 +924,124 @@ export interface PlayerActiveQuest {
     rescueFragmentEligible: boolean
     continueCount: number
 }
+
+// Account binding (contract C2)
+
+/** Platform a login name can be bound to. */
+export type BindingPlatform = "qq" | "kook"
+
+/** Lifecycle of a signup code. */
+export type SignupCodeStatus = "pending" | "bound" | "expired" | "revoked"
+
+/** Lifecycle of an account inside the binding gate. */
+export type BindState = "pending" | "active" | "disabled"
+
+/** Who created an account binding. */
+export type BindingCreatedBy = "bot" | "admin" | "migration"
+
+/** Audited binding actions. */
+export type BindAuditAction =
+    | "issue_code"
+    | "bind"
+    | "unbind"
+    | "promote"
+    | "revoke_code"
+    | "login"
+    | "register"
+    | "gate_reject"
+
+export interface RawSignupCode {
+    id: number
+    code: string
+    account_id: number
+    status: string
+    platform: string | null
+    platform_uid: string | null
+    attempts: number
+    expires_at: string
+    created_at: string
+    updated_at: string
+    revision: number
+}
+
+export interface SignupCode {
+    id: number
+    code: string
+    accountId: number
+    status: SignupCodeStatus
+    platform: BindingPlatform | null
+    platformUid: string | null
+    attempts: number
+    expiresAt: Date
+    createdAt: Date
+    updatedAt: Date
+    revision: number
+}
+
+export interface RawAccountBinding {
+    id: number
+    account_id: number
+    platform: string
+    platform_uid: string
+    display_name: string | null
+    is_primary: number
+    created_by: string
+    note: string | null
+    created_at: string
+    updated_at: string
+    revision: number
+}
+
+export interface AccountBinding {
+    id: number
+    accountId: number
+    platform: BindingPlatform
+    platformUid: string
+    displayName: string | null
+    isPrimary: boolean
+    createdBy: BindingCreatedBy
+    note: string | null
+    createdAt: Date
+    updatedAt: Date
+    revision: number
+}
+
+export interface RawDeviceGrant {
+    device_id: number
+    account_id: number
+    token: string
+    expires_at: string
+    created_at: string
+    updated_at: string
+}
+
+export interface DeviceGrant {
+    deviceId: number
+    accountId: number
+    token: string
+    expiresAt: Date
+    createdAt: Date
+    updatedAt: Date
+}
+
+export interface RawBindAudit {
+    id: number
+    action: string
+    account_id: number | null
+    platform: string | null
+    platform_uid: string | null
+    detail: string | null
+    actor: string | null
+    created_at: string
+}
+
+export interface BindAudit {
+    id: number
+    action: BindAuditAction
+    accountId: number | null
+    platform: BindingPlatform | null
+    platformUid: string | null
+    detail: string | null
+    actor: string | null
+    createdAt: Date
+}
