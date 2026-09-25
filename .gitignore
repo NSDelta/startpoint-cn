@@ -9,6 +9,9 @@ scripts/in
 scripts/__pycache__
 dist
 build
+# client-patch/build 是客户端补丁脚本源码（非构建产物），必须入库
+!client-patch/build/
+!client-patch/build/**
 .coredns/coredns.exe
 .mitmproxy/mitmproxy.exe
 .mitmproxy/mitmweb.exe

@@ -89,6 +89,7 @@ import characterElectionApiPlugin from "./routes/api/characterElection";
 import giftApiPlugin from "./routes/api/gift";
 import bonusApiPlugin from "./routes/api/bonus";
 import { installTakeoverUdidGuard } from "./lib/takeover-access";
+import { installUdidProbeFromEnv } from "./lib/udid-probe";
 import { AccountCleanupService } from "./lib/account-cleanup";
 import {
     ReceiveHistoryRetentionService,
@@ -136,6 +137,8 @@ fastify.addHook("onRequest", async (request, reply) => {
 registerCnMsgpackOnSend(fastify);
 registerRuntimeHealthRoute(fastify, () => runtimeCoordinator.getHealthSnapshot());
 installTakeoverUdidGuard(fastify);
+// B0 身份取证探针（默认关，SP_PROBE_UDID=1 才注册）：只记日志，不改行为。
+installUdidProbeFromEnv(fastify);
 
 function jsonParser(_: FastifyRequest, body: string, done: ContentTypeParserDoneFunction) {
     try {
