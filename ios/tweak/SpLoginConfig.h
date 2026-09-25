@@ -20,6 +20,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL uiTakeover;
 /// 是否跳过官方隐私弹窗（plist: SPLoginSkipPrivacyDialogs，默认 NO）
 @property (nonatomic, readonly) BOOL skipPrivacyDialogs;
+/// 启动后是否主动弹出登录面板（plist: SPLoginAutoPresent，默认 NO）。
+/// 默认关：正常流程是被官方 SDK 的登录/欢迎界面触发；打开只用于真机单点验证面板本身。
+@property (nonatomic, readonly) BOOL autoPresent;
+/// 主动弹出的延迟秒数（plist: SPLoginAutoPresentDelay，默认 2.0）
+@property (nonatomic, readonly) NSTimeInterval autoPresentDelay;
 /// 越狱根：rootless = "/var/jb"，传统 = ""
 @property (nonatomic, readonly) NSString *jailbreakRoot;
 

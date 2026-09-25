@@ -1,29 +1,44 @@
-/* SpLogin —— MobileSubstrate 过滤器 + 运行时配置（同文件双用途）
- *
- * MobileSubstrate / ElleKit 只读 Filter 段，其余键被忽略；tweak 自己再把这份
- * plist 读一遍当配置用，这样「开关」与「生效范围」永远在一起，不会漂移。
- *
- * 红线：SPLoginHostOverrideEnabled 默认 false —— 地址以编译期常量
- * （Makefile 的 SP_LOGIN_HOST，构建时 -D 注入）为准，plist 只能"覆写"不能"取代"。
- */
-{
-    Filter = {
-        Bundles = (
-            "com.leiting.wf"
-        );
-    };
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SpLogin.plist —— MobileSubstrate(ElleKit) 过滤器 + 本 tweak 的运行时配置（同一份文件、双用途）。
+  MobileSubstrate 只读 Filter 段，其余键被它忽略；SpLoginConfig.m 再把整份读一遍当配置用，
+  这样「开关」与「生效范围」永远在一起，不会漂移。
 
-    /* 地址覆写：默认关。打开后 SPLoginHost 生效（用于临时换机联调，不必重编）。 */
-    SPLoginHostOverrideEnabled = false;
-    SPLoginHost = "192.168.1.10:8001";
-
-    /* 接管 SDK 登录界面：默认开。置 false 则完全不碰官方 UI（等价于只做网络改写）。 */
-    SPLoginUITakeover = true;
-
-    /* 把日志同时落盘（真机没有 Mac 时靠它取证）。默认开，写不进去就自动退回 NSLog。 */
-    SPLoginLogToFile = true;
-
-    /* 跳过官方隐私/协议弹窗（GDPRManage / ProtocolPrivacyPopView）。
-     * 默认 false：这是官方 SDK 的合规流程，未经服主确认不擅自改。 */
-    SPLoginSkipPrivacyDialogs = false;
-}
+  键的语义（本文件刻意不写注释 —— CFPropertyList 对注释的支持随版本而异，过滤器解析失败会
+  导致 tweak **静默不加载**，风险不值得）：
+    SPLoginHostOverrideEnabled  默认 false。地址以编译期常量（Makefile 的 SP_LOGIN_HOST）为准，
+                                这个开关只能「覆写」不能「取代」。
+    SPLoginHost                 覆写目标；只在上面为 true 时生效。
+    SPLoginUITakeover           默认 true。接管官方 SDK 登录界面。
+    SPLoginLogToFile            默认 true。日志同时落盘（真机没有 Mac 时靠它取证）。
+    SPLoginSkipPrivacyDialogs   默认 false。跳过官方隐私/协议弹窗 —— 属于官方合规流程，
+                                未经服主确认不擅自改。
+    SPLoginAutoPresent          默认 false。启动后主动弹面板（只用于真机单点验证）。
+    SPLoginAutoPresentDelay     默认 2.0 秒。
+-->
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.leiting.wf</string>
+		</array>
+	</dict>
+	<key>SPLoginHostOverrideEnabled</key>
+	<false/>
+	<key>SPLoginHost</key>
+	<string>192.168.1.10:8001</string>
+	<key>SPLoginUITakeover</key>
+	<true/>
+	<key>SPLoginLogToFile</key>
+	<true/>
+	<key>SPLoginSkipPrivacyDialogs</key>
+	<false/>
+	<key>SPLoginAutoPresent</key>
+	<false/>
+	<key>SPLoginAutoPresentDelay</key>
+	<real>2.0</real>
+</dict>
+</plist>

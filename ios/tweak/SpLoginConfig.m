@@ -24,6 +24,8 @@ static BOOL sSPLoginConfigIsLoading = NO;
 @property (nonatomic, assign) BOOL uiTakeover;
 @property (nonatomic, assign) BOOL skipPrivacyDialogs;
 @property (nonatomic, assign) BOOL logToFile;
+@property (nonatomic, assign) BOOL autoPresent;
+@property (nonatomic, assign) NSTimeInterval autoPresentDelay;
 @property (nonatomic, copy) NSString *jailbreakRoot;
 @property (nonatomic, copy, nullable) NSString *logFilePath;
 @end
@@ -51,6 +53,8 @@ static BOOL sSPLoginConfigIsLoading = NO;
     _uiTakeover = YES;
     _skipPrivacyDialogs = NO;
     _logToFile = YES;
+    _autoPresent = NO;
+    _autoPresentDelay = 2.0;
 
     // plist 覆写（与 MobileSubstrate 过滤器同文件，见 SpLogin.plist）
     NSString *plistPath = [NSString stringWithFormat:@"%@/Library/MobileSubstrate/DynamicLibraries/%@",
@@ -76,6 +80,12 @@ static BOOL sSPLoginConfigIsLoading = NO;
         if ([prefs[@"SPLoginLogToFile"] isKindOfClass:[NSNumber class]]) {
             _logToFile = [prefs[@"SPLoginLogToFile"] boolValue];
         }
+        if ([prefs[@"SPLoginAutoPresent"] isKindOfClass:[NSNumber class]]) {
+            _autoPresent = [prefs[@"SPLoginAutoPresent"] boolValue];
+        }
+        if ([prefs[@"SPLoginAutoPresentDelay"] isKindOfClass:[NSNumber class]]) {
+            _autoPresentDelay = [prefs[@"SPLoginAutoPresentDelay"] doubleValue];
+        }
     } else {
         SPLoginLog(@"[config] 未读到 %@（用编译期常量）", plistPath);
     }
@@ -95,12 +105,13 @@ static BOOL sSPLoginConfigIsLoading = NO;
     _apiBaseURLString = [[NSString stringWithFormat:@"http://%@", hostPort] copy];
 
     [self prepareLogFile];
-    SPLoginLog(@"[config] host=%@ (plist覆写=%@) root=\"%@\" uiTakeover=%@ skipPrivacy=%@",
+    SPLoginLog(@"[config] host=%@ (plist覆写=%@) root=\"%@\" uiTakeover=%@ skipPrivacy=%@ autoPresent=%@",
                _hostPort,
                hostOverrideEnabled ? @"开" : @"关",
                _jailbreakRoot,
                _uiTakeover ? @"YES" : @"NO",
-               _skipPrivacyDialogs ? @"YES" : @"NO");
+               _skipPrivacyDialogs ? @"YES" : @"NO",
+               _autoPresent ? @"YES" : @"NO");
     sSPLoginConfigIsLoading = NO;
 }
 
