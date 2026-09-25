@@ -8,6 +8,8 @@ import multiManagementApiPlugin from "./multi-management"
 import scheduledResourceApiPlugin from "./scheduled-resource"
 import newsApiPlugin from "./news"
 import giftApiPlugin from "./gift"
+import bindingApiPlugin from "./binding"
+import botApiPlugin from "./bot"
 import { ADMIN_UPLOAD_FILE_SIZE_LIMIT } from "./upload-limits"
 import type { ServerRoutesOptions } from "./server"
 import type { MultiManagementRoutesOptions } from "./multi-management"
@@ -16,6 +18,11 @@ export { ADMIN_UPLOAD_FILE_SIZE_LIMIT } from "./upload-limits"
 
 export interface WebApiRoutesOptions extends ServerRoutesOptions {
     readonly getMultiManagementService?: MultiManagementRoutesOptions["getMultiManagementService"]
+    /**
+     * Injected environment for the bot control plane (`BOT_API_TOKEN`),
+     * following the CC-4 injectable-env rule. Defaults to `process.env`.
+     */
+    readonly botApiEnv?: NodeJS.ProcessEnv
 }
 
 const routes = async (fastify: FastifyInstance, options: WebApiRoutesOptions) => {
@@ -42,6 +49,8 @@ const routes = async (fastify: FastifyInstance, options: WebApiRoutesOptions) =>
     fastify.register(mailApiPlugin, { prefix: "/mail" })
     fastify.register(newsApiPlugin, { prefix: "/news" })
     fastify.register(giftApiPlugin, { prefix: "/gifts" })
+    fastify.register(bindingApiPlugin, { prefix: "/bindings" })
+    fastify.register(botApiPlugin, { prefix: "/bot", env: options.botApiEnv })
     fastify.register(scheduledResourceApiPlugin, { prefix: "/scheduled-resource" })
     fastify.register(lookupApiPlugin, { prefix: "/lookup" })
     fastify.register(settingsApiPlugin, { prefix: "/server/settings" })
