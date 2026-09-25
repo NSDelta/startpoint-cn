@@ -2,6 +2,7 @@
 
 import { Database } from "better-sqlite3";
 import { migrateServerNewsSchema23Sync } from "../schema/server-news";
+import { migrateAccountBindingSchema29Sync } from "../schema/account-binding";
 import awakeRewards from "../../../assets/mission_char_awake_reward.json";
 
 function parseDecimalSafeInteger(value: unknown): number | null {
@@ -287,5 +288,9 @@ export function updateAfterInit(
 
     if (22 >= currentVersion) {
         migrateServerNewsSchema23Sync(database, currentVersion)
+    }
+
+    if (28 >= currentVersion) {
+        migrateAccountBindingSchema29Sync(database, currentVersion)
     }
 }
