@@ -516,3 +516,38 @@ test("绑定码只在其绑定的 uid 上可作所有权证明", async () => {
     const otherPlatform = await unbind({ platform: "kook", uid: "bot-uid-a", code: code.code })
     assert.deepEqual(otherPlatform.body, { ok: false, code: "CODE_INVALID" })
 })
+
+test("index 插件把 /api/bindings 与 /api/bot 挂在真实前缀下", async () => {
+    const indexRoutes = require("../src/routes/web_api/index").default
+    const instance = Fastify({ logger: { level: "error", stream: logStream } })
+    instance.register(indexRoutes, { prefix: "/api", botApiEnv: { BOT_API_TOKEN: BOT_TOKEN } })
+    await instance.ready()
+    try {
+        // The admin console needs no credentials (deployment-level boundary).
+        const listing = await instance.inject({ method: "GET", url: "/api/bindings" })
+        assert.equal(listing.statusCode, 200)
+        const page = JSON.parse(listing.payload)
+        assert.equal(typeof page.totalCount, "number")
+        assert.equal(Array.isArray(page.rows), true)
+
+        const authorized = await instance.inject({
+            method: "POST",
+            url: "/api/bot/status",
+            headers: { [BOT_TOKEN_HEADER]: BOT_TOKEN },
+            payload: { platform: "qq", uid: "bot-index-none" },
+        })
+        assert.equal(authorized.statusCode, 200)
+        assert.deepEqual(JSON.parse(authorized.payload), { ok: true, data: { bindings: [] } })
+
+        // The bot token never leaks onto the admin surface.
+        const botWithNoToken = await instance.inject({
+            method: "POST",
+            url: "/api/bot/status",
+            payload: { platform: "qq", uid: "bot-index-none" },
+        })
+        assert.equal(botWithNoToken.statusCode, 403)
+        assert.deepEqual(JSON.parse(botWithNoToken.payload), { ok: false, code: "FORBIDDEN" })
+    } finally {
+        await instance.close()
+    }
+})
