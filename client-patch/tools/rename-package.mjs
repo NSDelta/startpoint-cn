@@ -90,7 +90,11 @@ export const EQUAL_LENGTH_CANDIDATES = [
 export function protectedRe(from = OFFICIAL_PACKAGE) {
   const esc = from.replace(/\./g, '\\.');
   return new RegExp(
-    `air\\.${esc}\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|${esc}\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)`,
+    // AIR 主类 FQN 用**通配**而不是 `air.<from>.AppEntry`：
+    // 它是打包时写进 SWF 的类名，改名后必须原样保留，于是它再也匹配不上以新 from 构造的模式，
+    // 保护计数会从 8 悄悄掉到 7 —— 看起来像"保护串丢了"，其实是报告口径错了。
+    // 保护规则的本质是"任何 air.*.AppEntry 都不是安装身份"，与当前 from 无关。
+    `air\\.[A-Za-z0-9_$.]+\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|${esc}\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)`,
     'g',
   );
 }
@@ -2053,7 +2057,7 @@ function parseArgs(argv) {
 const HELP = `rename-package.mjs — StarPoint CN 客户端共存（改包名 / Bundle ID）
 
   ⚠ 默认关：不指定 --rename-package / --package / --bundle-id 时，本工具
-     **不改任何字节**，产物与输入逐字节一致（脚本内部断言，不一致即退出码 2）。
+     **不改任何字节**，产物与输入逐字节一致（脚本内部回读断言，不一致即退出码 1）。
 
   --in <path>               输入 APK / IPA（只读）
   --out <path>              输出路径（省略 = 只分析不写）

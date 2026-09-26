@@ -604,6 +604,16 @@ test("幂等：对已改名的产物再跑一次 ⇒ 全绿且不改动", async 
     assert.ok(fs.readFileSync(end).equals(fs.readFileSync(mid)), "幂等第二跑产物应与输入一致");
 });
 
+test("就地改名：--in 与 --out 同路径可用（P7 的 unsignedPath 是 const，靠这条省一次改文件）", async () => {
+    const p = fixturePath("inplace.apk");
+    fs.copyFileSync(writeApk("inplace.src.apk"), p);
+    const { report, error } = await runMain(["--in", p, "--out", p, "--rename-package", TARGET]);
+    assert.equal(error, null, `就地改名不应报错：${error?.message}`);
+    assert.equal(report.to, TARGET);
+    const ax = mod.parseAxml(readZipEntry(fs.readFileSync(p), "AndroidManifest.xml"));
+    assert.equal(ax.elements[0].attrs.find((a) => a.name === "package").value, TARGET, "就地改名后文件必须已是新包名");
+});
+
 // ---------------------------------------------------------------------------
 // 3. 非等长
 // ---------------------------------------------------------------------------
