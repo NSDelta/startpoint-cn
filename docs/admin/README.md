@@ -23,9 +23,13 @@
 - `/api/news`：普通公告列表、创建、编辑、启停和物理删除；
 - `/api/gifts`：公共礼包定义、状态机、物理删除和只读领取记录；
 - `/api/lookup`：角色、道具、装备和关卡查询；
-- `/api/seeds/status`：只读抽卡动画 catalog、本机 quarantine 全量计数与每 movie 20 个样本。
+- `/api/seeds/status`：只读抽卡动画 catalog、本机 quarantine 全量计数与每 movie 20 个样本；
+- `/api/bindings`：账号绑定控制面——分页查询绑定、补发与吊销注册验证码、手工新增绑定、迁移主绑定和解绑（`src/routes/web_api/binding.ts:312,356,382,404,418,459,480`，前缀注册在 `src/routes/web_api/index.ts:52`）；
+- `/api/bot`：机器人控制面，`bind` / `status` / `unbind` 三条**全部 POST**，凭请求头 `X-Bot-Token` 对服务端 `BOT_API_TOKEN`，**该变量缺失时整组 403**（fail-closed，`src/routes/web_api/bot.ts:234,236`；比较为常数时间 `:63-68`）。
 
 后台请求携带 `Accept: application/json`。新增后台功能应提供明确的 JSON 请求和响应，不在 React 页面中直接访问 SQLite。
+
+`/api/bindings` 与 `/api` 的其它路由一样**没有后台账号鉴权**，只在可信网络边界内暴露（`src/routes/web_api/binding.ts:31-32`）；数据库未就绪时每个路由先返回 503，主绑定冲突返回 409，绑定不存在返回 404（`src/routes/web_api/binding.ts:313`、`:447`、`:467`）。`/api/bot` 属于**机器人**的控制面，不是后台的接口：后台页面既不调用它也不携带 bot 令牌（`tests/admin-bindings-ui-source.test.js:52-54` 把这条写成了断言），两个控制面的失败码体系也不同——后台用 HTTP 状态码，bot 的业务失败走 200 + `code`。
 
 账号页同时展示账号的设备来源映射、账号备注和清理状态。账号总览使用一次轻量玩家摘要查询并在内存中按账号分组，不随账号或存档数量产生逐账号、逐存档查询。旧设备名称接口仍用于管理员识别设备，空名称表示清除账号保留备注，不改变 `device_id -> account_id` 绑定。账号清理默认保留，可由服主配置无备注账号的超时删除；清理事务会写审计记录。玩家页的“清除 EX 能力”会同时清空该玩家所有角色的 EX 状态 ID 和能力列表，并返回实际受影响的角色数量；重复执行是成功的零修改操作，不返还任何养成材料。
 
@@ -46,7 +50,11 @@ Server Bundle 始终打包完整 `web/dist/`，manifest 固定为 `admin.require
 
 ## 当前页面与验收边界
 
-后台目前包含总览、时间与千里眼、账号与存档、玩家详情、公告、礼包、邮件、种子管理和游戏设置页面。账号与存档页已接入设备名称修改，所有 React Query 写操作都提供成功和失败反馈。公告和礼包页使用服务端 revision 冲突与业务错误反馈；active 礼包只读并仅提供停止，礼包领取记录只读。源码级测试覆盖 API 契约、EX 能力清除、设备修改、表单规则和页面接线；电脑浏览器的完整破坏性操作回归，以及手机和平板布局验收仍延期。
+后台目前包含总览、时间与千里眼、账号与存档、玩家详情、绑定管理、公告、礼包、邮件、种子管理和游戏设置页面。账号与存档页已接入设备名称修改，所有 React Query 写操作都提供成功和失败反馈。公告和礼包页使用服务端 revision 冲突与业务错误反馈；active 礼包只读并仅提供停止，礼包领取记录只读。源码级测试覆盖 API 契约、EX 能力清除、设备修改、表单规则和页面接线；电脑浏览器的完整破坏性操作回归，以及手机和平板布局验收仍延期。
+
+绑定管理页的路由是 `/admin/bindings`（菜单名「账号绑定」，源码 `admin/src/pages/Bindings.tsx`）。它只通过共享 API 客户端访问服务端——`apiGet`（`admin/src/pages/Bindings.tsx:131`、`:141`）、`apiPost`（`:152`、`:169`、`:187`、`:201`）和 `apiDelete`（`:178`），页面内没有 SQLite、没有裸 `fetch`、也不引用 bot 接口；解绑是破坏性操作，必须经二次确认（`admin/src/pages/Bindings.tsx:369-382`）。这页提供的操作与[自研账号与账号绑定](../systems/client-binding.md)里的绑定状态机一一对应：新增绑定只建非主绑定，主绑定迁移走独立的设主操作，解绑主绑定是管理员独有的路径。
+
+玩家被绑定闸门挡在门外时，后台是排查入口：网关拒绝会以 `action="gate_reject"` 写进 `bind_audit`（`src/lib/bind-gate.ts:474-492`，actor 固定为 `bind-gate`），并在服务端日志留一行 `event:"bind_gate_reject"`；其中 `code=BIND_REQUIRED` 表示还没绑上（让玩家去登录页或 bot 取码），`code=ACCOUNT_DISABLED` 表示账号被停用，要在这页或账号页改状态。闸门本身没有后台开关——它只认进程环境变量 `BIND_GATE_ENABLED`（见 [`.env.example`](../../.env.example) 的「账号绑定闸门」一节），改完要重启服务端。
 
 ## 运行时游戏设置
 

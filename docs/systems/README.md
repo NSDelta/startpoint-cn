@@ -15,6 +15,8 @@
 - [首次教程状态与中断恢复](./start-tutorial.md)
 - [存档与输入校验](./save-validation.md)
 - [账号管理与继承码](./account-management-and-takeover.md)
+- [自研账号与账号绑定](./client-binding.md)
+- [iOS 客户端接入](./ios-client.md)
 - [玩家资料与玩家履历](./player-history.md)
 - [多人联机与 Hub 优化架构](./multiplayer-hub-optimization.md)
 - [多人救援碎片兼容奖励](./multi-rescue-fragments.md)

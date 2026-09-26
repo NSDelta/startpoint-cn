@@ -126,6 +126,11 @@ const SOURCE_RULES = [
     },
     { pattern: /^docs\/(?:admin\/README|systems\/mail)\.md$/, groups: ["admin"] },
     {
+        pattern: /^docs\/systems\/client-binding\.md$/,
+        groups: ["admin", "integration:database"],
+    },
+    { pattern: /^docs\/systems\/ios-client\.md$/, groups: ["integration:cdn"] },
+    {
         pattern: /^src\/(?:data\/domains\/session|validate_cdn)\.ts$/,
         groups: ["quick:workflow"],
     },
@@ -844,12 +849,28 @@ const SOURCE_RULES = [
     },
     { pattern: /^src\/multi\//, groups: ["quick:protocol", "integration:multi-hub"] },
     { pattern: /^src\/multi\/tcp\/server\.ts$/, groups: ["integration:runtime"] },
+    // 自研账号与账号绑定（P2/P3/P5）：登录页契约、验证码与绑定域各自有专属测试面。
+    // 注意：SOURCE_RULES 是「全部命中并集」（groupsForFile 用 filter+flatMap），规则顺序不影响结果；
+    // 因此下面两条兜底规则里的负向断言也要同步排除这些文件，否则仍会被追加一个 "full"。
+    { pattern: /^src\/lib\/sp-auth\//, groups: ["integration:database"] },
+    { pattern: /^src\/lib\/signup-code\.ts$/, groups: ["integration:database"] },
+    { pattern: /^src\/routes\/sp-auth\//, groups: ["integration:database"] },
     {
-        pattern: /^src\/data\/(?!player-save\/|defaultSave\.ts$|domains\/(?:bondTokenExchange|gift|item-maintenance|news)\.ts$|schema\/server-(?:gifts|news)\.ts$)/,
+        pattern: /^src\/data\/(?:domains|schema)\/account-binding\.ts$/,
+        groups: ["admin", "integration:database"],
+    },
+    // 绑定闸门（P4，契约 C3）：实现自带 tools/bind_gate.test.cjs（integration:database）。
+    // 注意 src/routes/cn/tool.ts（拦截面所在）仍走下面的 src/routes 兜底 "full"：
+    // 它是登录入口，被多个包与多组测试同时覆盖，收紧会漏，故意保留全量。
+    { pattern: /^src\/lib\/bind-gate\.ts$/, groups: ["integration:database"] },
+    // 客户端重命名工具（P12）：APK/IPA 包名重写，自带 tools/rename_package.test.cjs（quick:runtime）。
+    { pattern: /^client-patch\/tools\/rename-package\.mjs$/, groups: ["quick:runtime"] },
+    {
+        pattern: /^src\/data\/(?!player-save\/|defaultSave\.ts$|domains\/(?:account-binding|bondTokenExchange|gift|item-maintenance|news)\.ts$|schema\/(?:account-binding|server-(?:gifts|news))\.ts$)/,
         groups: ["integration:database", "full"],
     },
     {
-        pattern: /^src\/routes\/(?!api\/(?:encyclopedia|exchange|gift|news|singleBattleQuest)\.ts$|api\/gacha\/crazy-routes\.ts$|web_api\/)/,
+        pattern: /^src\/routes\/(?!api\/(?:encyclopedia|exchange|gift|news|singleBattleQuest)\.ts$|api\/gacha\/crazy-routes\.ts$|sp-auth\/|web_api\/)/,
         groups: ["full"],
     },
 ]
