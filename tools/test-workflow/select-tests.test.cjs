@@ -1506,6 +1506,7 @@ test("registers focused runtime state and socket smoke groups", () => {
             "tools/udid_probe.test.cjs",
             "tools/ios_ipa_patch.test.cjs",
             "tools/build_client.test.cjs",
+            "tools/rename_package.test.cjs",
         ],
     })
     assert.deepEqual(
@@ -2041,6 +2042,7 @@ test("splits isolated integration tests into focused domains", () => {
         "tools/follow_domain.test.cjs",
         "tools/account_binding.test.cjs",
         "tools/sp_auth.test.cjs",
+        "tools/bind_gate.test.cjs",
         "tools/follow_routes.test.cjs",
         "tools/stamina_serialization.test.cjs",
         "tools/sql_write_shape.test.cjs",

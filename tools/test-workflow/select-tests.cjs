@@ -859,10 +859,12 @@ const SOURCE_RULES = [
         pattern: /^src\/data\/(?:domains|schema)\/account-binding\.ts$/,
         groups: ["admin", "integration:database"],
     },
-    // 预留（对应实现与测试尚未合并，登记进 groups.cjs 会让 runner 指向死文件）：
-    //   src/lib/bind-gate.ts + src/routes/cn/tool.ts → P4 的 tools/bind_gate.test.cjs
-    //   client-patch/tools/rename-package.mjs        → P12 的 tools/rename_package.test.cjs
-    // P4/P12 合并后由 P11 第二趟补规则与 groups.cjs 登记。
+    // 绑定闸门（P4，契约 C3）：实现自带 tools/bind_gate.test.cjs（integration:database）。
+    // 注意 src/routes/cn/tool.ts（拦截面所在）仍走下面的 src/routes 兜底 "full"：
+    // 它是登录入口，被多个包与多组测试同时覆盖，收紧会漏，故意保留全量。
+    { pattern: /^src\/lib\/bind-gate\.ts$/, groups: ["integration:database"] },
+    // 客户端重命名工具（P12）：APK/IPA 包名重写，自带 tools/rename_package.test.cjs（quick:runtime）。
+    { pattern: /^client-patch\/tools\/rename-package\.mjs$/, groups: ["quick:runtime"] },
     {
         pattern: /^src\/data\/(?!player-save\/|defaultSave\.ts$|domains\/(?:account-binding|bondTokenExchange|gift|item-maintenance|news)\.ts$|schema\/(?:account-binding|server-(?:gifts|news))\.ts$)/,
         groups: ["integration:database", "full"],
