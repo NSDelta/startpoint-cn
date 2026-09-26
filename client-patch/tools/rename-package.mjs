@@ -54,24 +54,56 @@ import zlib from 'node:zlib';
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 官方安装身份（Android package 与 iOS CFBundleIdentifier 同值）。 */
-export const OFFICIAL_PACKAGE = 'com.leiting.wf';
-/** 等长（14 字符）自有包名候选；默认值见报告 §新依赖理由/§做了什么。 */
-export const DEFAULT_COEXIST_PACKAGE = 'com.starpoints';
 /**
- * 等长替代候选（全部 14 字符，任选其一都满足全部安全性质）：
- *   com.star.point / com.spcn.games / starpoint.wfcn
- * 派工令里的 `com.starpoint.wfcn` 是 18 字符，只能用
- * --allow-unequal-length 走降级路径（放弃 dex 身份串改写）。
+ * 官方安装身份的**默认**值（仅用于兜底/文档）。
+ *
+ * 注意：两个平台的安装身份**不保证同值**，实测：
+ *   - Android `安卓v15.2.apk`  → `AndroidManifest.xml` 的 package = `com.leiting.wf`
+ *   - iOS `iOS-1.8.4.ipa`      → `CFBundleIdentifier`           = `com.leiting.wf`
+ *   - iOS `苹果v15.2.ipa`      → `CFBundleIdentifier`           = `com.kulo.wf`
+ * ⇒ 本工具**从不假设** `from`，一律从产物里现读（见 renameApk / renameIpa）。
  */
-export const EQUAL_LENGTH_CANDIDATES = ['com.starpoints', 'com.star.point', 'com.spcn.games', 'starpoint.wfcn'];
+export const OFFICIAL_PACKAGE = 'com.leiting.wf';
+/** iOS v15.2 分支的官方 Bundle ID（实测值；仅用于文档与 inspect 兜底展示）。 */
+export const OFFICIAL_BUNDLE_ID_IOS_15_2 = 'com.kulo.wf';
+/** 默认共存包名（派工卡 A14 暂定值）。14 字符 ⇒ 与 `com.leiting.wf` 等长。 */
+export const DEFAULT_COEXIST_PACKAGE = 'cn.starpoint.a';
+/** 默认共存显示名（iOS `CFBundleDisplayName`，便于与官方客户端区分）。 */
+export const DEFAULT_DISPLAY_NAME = '星点弹射';
+/**
+ * 等长（14 字符）替代候选，任选其一都满足全部安全性质（AXML 字符串池原地替换）：
+ *   cn.starpoint.a / com.starpoints / com.star.point / com.spcn.games / starpoint.wfcn
+ */
+export const EQUAL_LENGTH_CANDIDATES = [
+  'cn.starpoint.a',
+  'com.starpoints',
+  'com.star.point',
+  'com.spcn.games',
+  'starpoint.wfcn',
+];
 
-/** 已编译类型的 FQN / 计费 SKU：**逐字保留**，它们不是安装身份。 */
-const PROTECTED_RE =
-  /air\.com\.leiting\.wf\.AppEntry|com\.leiting\.sdk\.[A-Za-z0-9_$]+|com\.leiting\.wf\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)/g;
+/**
+ * 已编译类型的 FQN / 计费 SKU **保护规则**：逐字保留，它们不是安装身份。
+ * 必须按 `from` 现构造：iOS v15.2 的 `from` 是 `com.kulo.wf`，
+ * `air.com.kulo.wf.AppEntry` 与 `com.kulo.wf.stonepack_*` 同样受保护。
+ */
+function protectedRe(from = OFFICIAL_PACKAGE) {
+  const esc = from.replace(/\./g, '\\.');
+  return new RegExp(
+    `air\\.${esc}\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|${esc}\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)`,
+    'g',
+  );
+}
 
-/** 唯一被改的 AIR 模板串（URI authority，不是类名）——必须排在 `com.leiting.wf` 之前替换。 */
-const AIR_FILEPROVIDER = 'air.com.leiting.wf.fileprovider';
+/** AIR 主类 FQN（唯一被保留的 `air.<id>.AppEntry`）。 */
+function appEntryOf(from) {
+  return `air.${from}.AppEntry`;
+}
+
+/** AIR FileProvider 的 URI authority 模板串——必须排在 `from` 之前替换。 */
+function airFileProviderOf(from) {
+  return `air.${from}.fileprovider`;
+}
 
 const AXML_MAGIC = 0x0003;
 const CHUNK_STRING_POOL = 0x0001;
@@ -88,14 +120,22 @@ const APK_SIG_BLOCK_MAGIC = Buffer.from('APK Sig Block 42');
 const V1_SIGNATURE_RE = /^META-INF\/(?:MANIFEST\.MF|[^/]+\.(?:SF|RSA|DSA|EC))$/i;
 
 export class RenameError extends Error {
-  constructor(message) {
+  constructor(message, { usage = false } = {}) {
     super(message);
     this.name = 'RenameError';
+    this.usage = usage;
+    /** 退出码：2 = 用法错误，1 = 业务失败 */
+    this.exitCode = usage ? 2 : 1;
   }
 }
 
 function fail(message) {
   throw new RenameError(message);
+}
+
+/** 用法错误（退出码 2）——未知参数 / 参数缺值 / 缺少 --in。 */
+function usageFail(message) {
+  throw new RenameError(message, { usage: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -168,24 +208,35 @@ export function validatePackageName(name) {
   return name;
 }
 
+/** 非抛出版本，供 CLI 预判 `--rename-package` 后跟的可选目标名。 */
+export function isValidPackageName(name) {
+  try {
+    validatePackageName(name);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 构造"安装身份串 → 新值"的映射函数。**长的先替换**，并整体跳过保护串。
- * 返回 null 表示该串不需要改。
+ * 返回 null 表示该串不需要改（或受保护，必须逐字保留）。
+ *
+ * 规则顺序是关键：`air.<from>.fileprovider` 必须排在裸 `<from>` 之前，
+ * 否则 `air.com.leiting.wf.fileprovider` 会被先拆成 `air.cn.starpoint.a.fileprovider`。
  */
 export function makeStringMapper({ from = OFFICIAL_PACKAGE, to, extra = [] }) {
+  const re = protectedRe(from);
   const rules = [
-    [AIR_FILEPROVIDER, `${to}.fileprovider`],
+    [airFileProviderOf(from), `${to}.fileprovider`],
     ...extra,
     [from, to],
   ];
   return (s) => {
     if (typeof s !== 'string' || s.length === 0) return null;
-    if (PROTECTED_RE.test(s)) {
-      PROTECTED_RE.lastIndex = 0;
-      // 保护串整体跳过：AppEntry 类 FQN / leiting SDK FQN / 计费 SKU
-      return null;
-    }
-    PROTECTED_RE.lastIndex = 0;
+    re.lastIndex = 0;
+    // 保护串整体跳过：AppEntry 类 FQN / leiting SDK FQN / 计费 SKU
+    if (re.test(s)) return null;
     let out = s;
     for (const [a, b] of rules) {
       if (a && out.includes(a)) out = out.split(a).join(b);
@@ -541,65 +592,484 @@ export function readDexStrings(buf) {
 // 纯文本补丁（AIR application.xml / iOS Info.plist）
 // ---------------------------------------------------------------------------
 
-export function patchAirDescriptor(buf, { mapper }) {
+/**
+ * 改 AIR 的 `application.xml`（明文 XML）。
+ * `from` **必须传入**：iOS v15.2 的 app id 是 `com.kulo.wf`，写死 `com.leiting.wf` 会一字不改、
+ * 却因为后续断言拿 `to` 去匹配而失败（或更糟：静默漏改）。
+ */
+export function patchAirDescriptor(buf, { mapper, from = OFFICIAL_PACKAGE }) {
   const text = buf.toString('utf8');
   if (!text.startsWith('<?xml')) fail('AIR application.xml 不是明文 XML？');
+  const re = protectedRe(from);
+  const esc = from.replace(/\./g, '\\.');
+  const scan = new RegExp(
+    `air\\.${esc}\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|air\\.${esc}\\.fileprovider|${esc}(?:\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+))?`,
+    'g',
+  );
   const changes = [];
   const seen = new Set();
-  const out = text.replace(
-    /air\.com\.leiting\.wf\.AppEntry|com\.leiting\.sdk\.[A-Za-z0-9_$]+|air\.com\.leiting\.wf\.fileprovider|com\.leiting\.wf(?:\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+))?/g,
-    (m) => {
-      if (PROTECTED_RE.test(m)) {
-        PROTECTED_RE.lastIndex = 0;
-        if (!seen.has(`keep:${m}`)) {
-          seen.add(`keep:${m}`);
-          changes.push({ kind: 'keep', value: m, reason: '受保护（类 FQN / SDK FQN / 计费 SKU）' });
-        }
-        return m;
+  const out = text.replace(scan, (m) => {
+    re.lastIndex = 0;
+    if (re.test(m)) {
+      if (!seen.has(`keep:${m}`)) {
+        seen.add(`keep:${m}`);
+        changes.push({ kind: 'keep', value: m, reason: '受保护（类 FQN / SDK FQN / 计费 SKU）' });
       }
-      PROTECTED_RE.lastIndex = 0;
-      const next = mapper(m);
-      const value = next === null ? m : next;
-      const key = `set:${m}->${value}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        changes.push({ kind: next === null ? 'keep' : 'replace', from: m, to: value });
-      }
-      return value;
-    },
-  );
+      return m;
+    }
+    const next = mapper(m);
+    const value = next === null ? m : next;
+    const key = `set:${m}->${value}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      changes.push({ kind: next === null ? 'keep' : 'replace', from: m, to: value });
+    }
+    return value;
+  });
   if (out === text) return { buf, changes: [], mode: 'noop' };
   return { buf: Buffer.from(out, 'utf8'), changes, mode: 'text' };
 }
 
-/** iOS Info.plist（XML 明文）。二进制 plist 只支持等长原地改。 */
-export function patchInfoPlist(buf, { from, to }) {
+// ---------------------------------------------------------------------------
+// 二进制 plist（bplist00）—— 零依赖编解码器
+// ---------------------------------------------------------------------------
+// 实测：`苹果v15.2.ipa` 的 Info.plist 是 **二进制 plist**（`bplist00`，4319 B，212 对象），
+// 而 `iOS-1.8.4.ipa` 是 XML。官方 plist 里 `CFBundleIdentifier` 长度任选，
+// 旧实现"只支持等字节长原地改"对 `com.kulo.wf`(11) → `cn.starpoint.a`(14) 直接做不到，
+// 且其长度前缀硬编码 0x0f（=ASCII 串长 15）在本仓任何真实产物上都不成立。
+// ⇒ 这里做**完整解码 → 改值 → 重新编码**，再用"解码回来逐键比对"做硬断言。
+
+const BPLIST_MAGIC = 'bplist00';
+
+/** bplist 的字符串是 **big-endian** UTF-16；Node 只认 utf16le，故读后/写前 swap16。 */
+function readUtf16BE(buf, start, units) {
+  const b = Buffer.from(buf.subarray(start, start + units * 2));
+  b.swap16();
+  return b.toString('utf16le');
+}
+
+function writeUtf16BE(str) {
+  const b = Buffer.from(str, 'utf16le');
+  b.swap16();
+  return b;
+}
+
+function decodeBplistObject(buf, off, info) {
+  const marker = buf[off];
+  const hi = marker >> 4;
+  const lo = marker & 0x0f;
+  const readLen = (p) => {
+    if (lo !== 0x0f) return { len: lo, size: 0 };
+    const m2 = buf[p];
+    if ((m2 >> 4) !== 0x1) fail(`bplist 长度标记非法 @${p}`);
+    const n = 1 << (m2 & 0x0f);
+    let len = 0;
+    for (let i = 0; i < n; i++) len = len * 256 + buf[p + 1 + i];
+    return { len, size: 1 + n };
+  };
+
+  switch (hi) {
+    case 0x0: {
+      if (marker === 0x08) return { value: false, end: off + 1 };
+      if (marker === 0x09) return { value: true, end: off + 1 };
+      if (marker === 0x00) return { value: null, end: off + 1 };
+      fail(`bplist 未知简单对象 0x${marker.toString(16)} @${off}`);
+      break;
+    }
+    case 0x1: {
+      const n = 1 << lo;
+      return { value: Number(buf.readBigUInt64BE(off + 1, Math.min(n, 8))) === 0 ? 0 : readInt(buf, off + 1, n), end: off + 1 + n };
+    }
+    case 0x2: {
+      if (lo !== 3 || buf.length < off + 9) fail(`bplist 不支持 real 长度 ${lo} @${off}`);
+      return { value: buf.readDoubleBE(off + 1), end: off + 9 };
+    }
+    case 0x3: {
+      if (lo !== 3) fail(`bplist 不支持 date 长度 ${lo} @${off}`);
+      return { value: new Date(Math.round((buf.readDoubleBE(off + 1) + 978307200) * 1000)), end: off + 9, isDate: true };
+    }
+    case 0x4: {
+      const { len, size } = readLen(off + 1);
+      const start = off + 1 + size;
+      return { value: Buffer.from(buf.subarray(start, start + len)), end: start + len, isData: true };
+    }
+    case 0x5: {
+      const { len, size } = readLen(off + 1);
+      const start = off + 1 + size;
+      return { value: buf.subarray(start, start + len).toString('latin1'), end: start + len, isAsciiString: true };
+    }
+    case 0x6: {
+      const { len, size } = readLen(off + 1);
+      const start = off + 1 + size;
+      return { value: readUtf16BE(buf, start, len), end: start + len * 2 };
+    }
+    case 0xa: {
+      const { len, size } = readLen(off + 1);
+      const start = off + 1 + size;
+      const out = [];
+      for (let i = 0; i < len; i++) out.push(buf.readUIntBE(start + i * info.refSize, info.refSize));
+      return { value: { __refs: out, __kind: 'array' }, end: start + len * info.refSize };
+    }
+    case 0xd: {
+      const { len, size } = readLen(off + 1);
+      const start = off + 1 + size;
+      const out = [];
+      for (let i = 0; i < len; i++) {
+        out.push(buf.readUIntBE(start + i * info.refSize, info.refSize));
+        out.push(buf.readUIntBE(start + (len + i) * info.refSize, info.refSize));
+      }
+      return { value: { __refs: out, __kind: 'dict' }, end: start + len * 2 * info.refSize };
+    }
+    default:
+      fail(`bplist 未知对象类型 0x${hi.toString(16)} @${off}`);
+  }
+  return null;
+}
+
+function readInt(buf, off, n) {
+  let v = 0n;
+  for (let i = 0; i < n; i++) v = (v << 8n) | BigInt(buf[off + i]);
+  if (n === 8 && v >= 1n << 63n) v -= 1n << 64n;
+  return Number(v);
+}
+
+/** 解码 bplist00 → 纯 JS 值（dict/array/string/number/bool/Date/Buffer）。 */
+export function decodeBplist(buf) {
+  if (buf.subarray(0, 8).toString('latin1') !== BPLIST_MAGIC) fail('不是二进制 plist（magic != bplist00）');
+  const t = buf.subarray(buf.length - 32);
+  const info = {
+    offsetIntSize: t[6],
+    refSize: t[7],
+    numObjects: Number(t.readBigUInt64BE(8)),
+    topObject: Number(t.readBigUInt64BE(16)),
+    offsetTableOffset: Number(t.readBigUInt64BE(24)),
+  };
+  if (info.offsetIntSize < 1 || info.offsetIntSize > 8) fail(`bplist offsetIntSize 非法：${info.offsetIntSize}`);
+  if (info.refSize < 1 || info.refSize > 8) fail(`bplist refSize 非法：${info.refSize}`);
+  if (info.numObjects < 1 || info.numObjects > 1e7) fail(`bplist numObjects 非法：${info.numObjects}`);
+  if (info.offsetTableOffset + info.numObjects * info.offsetIntSize > buf.length) fail('bplist 偏移表越界');
+
+  const offsets = [];
+  for (let i = 0; i < info.numObjects; i++) {
+    offsets.push(buf.readUIntBE(info.offsetTableOffset + i * info.offsetIntSize, info.offsetIntSize));
+  }
+
+  const memo = new Map();
+  const resolve = (ref) => {
+    if (ref < 0 || ref >= offsets.length) fail(`bplist 对象引用越界：${ref}`);
+    if (memo.has(ref)) return memo.get(ref);
+    const node = decodeBplistObject(buf, offsets[ref], info);
+    if (node.value && node.value.__refs) {
+      // 先占位再填充，容忍 plist 里理论上的环
+      const isDict = node.value.__kind === 'dict';
+      const holder = isDict ? {} : [];
+      memo.set(ref, holder);
+      if (isDict) {
+        for (let i = 0; i < node.value.__refs.length; i += 2) {
+          holder[String(resolve(node.value.__refs[i]))] = resolve(node.value.__refs[i + 1]);
+        }
+      } else {
+        for (const r of node.value.__refs) holder.push(resolve(r));
+      }
+      return holder;
+    }
+    memo.set(ref, node.value);
+    return node.value;
+  };
+
+  return { value: resolve(info.topObject), info, objects: offsets.length };
+}
+
+/** 把纯 JS 值编码为 bplist00。 */
+export function encodeBplist(value) {
+  const objects = [];
+  const indexOfKey = new Map();
+  const keyOf = (v) => `${typeof v}:${v instanceof Date ? `d${v.getTime()}` : v instanceof Buffer ? `b${v.toString('base64')}` : String(v)}`;
+
+  const addObject = (v) => {
+    const body = encodeBplistObject(v, objects);
+    objects.push(body);
+    return objects.length - 1;
+  };
+
+  // 自底向上：先给子对象分配编号，再编码父对象
+  const build = (v) => {
+    if (v === null || v === undefined) return addObject(null);
+    if (Array.isArray(v)) {
+      const refs = v.map(build);
+      return addObject({ __kind: 'array', refs });
+    }
+    if (v instanceof Date) return addObject({ __kind: 'date', value: v });
+    if (Buffer.isBuffer(v)) return addObject({ __kind: 'data', value: v });
+    if (typeof v === 'object') {
+      // ⚠ bplist 的 dict 布局是 **先全部 key 引用、再全部 value 引用**（各 count 个），
+      //   交错写 [k0,v0,k1,v1,...] 会让任何标准解析器把后半段 value 当 key 读 —— 不报错，
+      //   只是静默解出一棵错树。必须分两组收集。
+      const keys = [];
+      const vals = [];
+      for (const k of Object.keys(v)) {
+        keys.push(keyIndexOf(k));
+        vals.push(build(v[k]));
+      }
+      return addObject({ __kind: 'dict', refs: [...keys, ...vals] });
+    }
+    return addObject({ __kind: 'scalar', value: v });
+  };
+  const keyIndexOf = (k) => {
+    if (indexOfKey.has(`s:${k}`)) return indexOfKey.get(`s:${k}`);
+    const i = addObject({ __kind: 'scalar', value: k });
+    indexOfKey.set(`s:${k}`, i);
+    return i;
+  };
+
+  const top = build(value);
+
+  const numObjects = objects.length;
+  const refSize = Math.max(1, Math.ceil(Math.log2(numObjects + 1) / 8));
+
+  // 编码所有对象，收集偏移
+  const chunks = [];
+  const offsets = [];
+  let cursor = 8; // bplist00 + 1 字节填充
+  for (let i = 0; i < numObjects; i++) {
+    offsets.push(cursor);
+    const b = renderBplistObject(objects[i], refSize);
+    chunks.push(b);
+    cursor += b.length;
+  }
+  const offsetTableOffset = cursor;
+  const offsetIntSize = Math.max(1, Math.ceil(Math.log2(cursor + 1) / 8));
+
+  const head = Buffer.alloc(8);
+  head.write(BPLIST_MAGIC, 0, 'latin1');
+  const body = Buffer.concat(chunks);
+  const offTab = Buffer.alloc(numObjects * offsetIntSize);
+  offsets.forEach((o, i) => offTab.writeUIntBE(o, i * offsetIntSize, offsetIntSize));
+
+  const trailer = Buffer.alloc(32);
+  trailer[6] = offsetIntSize;
+  trailer[7] = refSize;
+  trailer.writeBigUInt64BE(BigInt(numObjects), 8);
+  trailer.writeBigUInt64BE(BigInt(top), 16);
+  trailer.writeBigUInt64BE(BigInt(offsetTableOffset), 24);
+
+  return Buffer.concat([head, body, offTab, trailer]);
+}
+
+function encodeBplistObject(v, _objects) {
+  if (v === null || v === undefined) return { __kind: 'scalar', value: null };
+  if (typeof v === 'object' && v.__kind) return v;
+  return { __kind: 'scalar', value: v };
+}
+
+function intMarker(n) {
+  if (n < 0) return null;
+  if (n <= 0xff) return { marker: 0x10, size: 1 };
+  if (n <= 0xffff) return { marker: 0x11, size: 2 };
+  if (n <= 0xffffffff) return { marker: 0x12, size: 4 };
+  return { marker: 0x13, size: 8 };
+}
+
+/**
+ * bplist 的长长度前缀：低半字节 0xF 之后跟一个**整数对象**（marker `0x1n` + n 字节），
+ * 而不是 `0xF0|pow` 那种自造格式 —— 后者能骗过自己却让任何标准解析器（含本文件的解码器）报错。
+ * 仅在 len >= 15 时调用；返回含 marker 的完整前缀。
+ */
+function lenPrefix(len) {
+  if (len < 15) return Buffer.alloc(0);
+  const size = len <= 0xff ? 1 : len <= 0xffff ? 2 : len <= 0xffffffff ? 4 : 8;
+  const pow = size === 1 ? 0 : size === 2 ? 1 : size === 4 ? 2 : 3;
+  const b = Buffer.alloc(1 + size);
+  b[0] = 0x10 | pow;
+  if (size === 8) b.writeBigUInt64BE(BigInt(len), 1);
+  else b.writeUIntBE(len, 1, size);
+  return b;
+}
+
+function renderBplistObject(o, refSize) {
+  if (o.__kind === 'scalar') {
+    const v = o.value;
+    if (v === null || v === undefined) return Buffer.from([0x00]);
+    if (v === true) return Buffer.from([0x09]);
+    if (v === false) return Buffer.from([0x08]);
+    if (typeof v === 'number') {
+      if (Number.isInteger(v)) {
+        const m = intMarker(v);
+        if (m) {
+          const b = Buffer.alloc(1 + m.size);
+          b[0] = m.marker;
+          if (m.size === 8) b.writeBigUInt64BE(BigInt(v), 1);
+          else b.writeUIntBE(v, 1, m.size);
+          return b;
+        }
+      }
+      const b = Buffer.alloc(9);
+      b[0] = 0x23;
+      b.writeDoubleBE(v, 1);
+      return b;
+    }
+    if (typeof v === 'string') {
+      if (isAscii(v)) {
+        const body = Buffer.from(v, 'latin1');
+        return Buffer.concat([Buffer.from([0x50 | (body.length < 15 ? body.length : 0x0f)]), body.length < 15 ? Buffer.alloc(0) : lenPrefix(body.length), body]);
+      }
+      const body = writeUtf16BE(v);
+      return Buffer.concat([Buffer.from([0x60 | (v.length < 15 ? v.length : 0x0f)]), v.length < 15 ? Buffer.alloc(0) : lenPrefix(v.length), body]);
+    }
+    fail(`bplist 编码不支持的类型：${typeof v}`);
+  }
+  if (o.__kind === 'date') {
+    const b = Buffer.alloc(9);
+    b[0] = 0x33;
+    b.writeDoubleBE(o.value.getTime() / 1000 - 978307200, 1);
+    return b;
+  }
+  if (o.__kind === 'data') {
+    const body = o.value;
+    return Buffer.concat([Buffer.from([0x40 | (body.length < 15 ? body.length : 0x0f)]), body.length < 15 ? Buffer.alloc(0) : lenPrefix(body.length), body]);
+  }
+  if (o.__kind === 'array') {
+    const n = o.refs.length;
+    const head = Buffer.concat([Buffer.from([0xa0 | (n < 15 ? n : 0x0f)]), n < 15 ? Buffer.alloc(0) : lenPrefix(n)]);
+    const body = Buffer.alloc(n * refSize);
+    o.refs.forEach((r, i) => body.writeUIntBE(r, i * refSize, refSize));
+    return Buffer.concat([head, body]);
+  }
+  if (o.__kind === 'dict') {
+    const n = o.refs.length / 2;
+    const head = Buffer.concat([Buffer.from([0xd0 | (n < 15 ? n : 0x0f)]), n < 15 ? Buffer.alloc(0) : lenPrefix(n)]);
+    const body = Buffer.alloc(o.refs.length * refSize);
+    o.refs.forEach((r, i) => body.writeUIntBE(r, i * refSize, refSize));
+    return Buffer.concat([head, body]);
+  }
+  fail(`bplist 编码遇到未知对象种类 ${o.__kind}`);
+  return null;
+}
+
+/** 结构比对：返回所有"路径 → 值"扁平表，用于改写前后逐键核对。 */
+export function flattenPlist(value, prefix = '') {
+  const out = new Map();
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      for (const [k, x] of flattenPlist(v, `${prefix}[${i}]`)) out.set(k, x);
+    });
+    return out;
+  }
+  if (value instanceof Date || Buffer.isBuffer(value) || value === null || typeof value !== 'object') {
+    out.set(prefix, value instanceof Date ? `date:${value.toISOString()}` : Buffer.isBuffer(value) ? `data:${value.toString('base64')}` : `${typeof value}:${value}`);
+    return out;
+  }
+  for (const k of Object.keys(value)) {
+    for (const [kk, x] of flattenPlist(value[k], prefix ? `${prefix}.${k}` : k)) out.set(kk, x);
+  }
+  return out;
+}
+
+/** 从 Info.plist（XML 明文 或 bplist00）读出 Bundle ID —— iOS 没有统一身份，必须实测。 */
+export function readBundleIdFromPlist(buf) {
   const head = buf.subarray(0, 8).toString('latin1');
-  if (head.startsWith('bplist00')) {
-    if (Buffer.byteLength(from) !== Buffer.byteLength(to)) {
-      fail('Info.plist 是二进制 plist，只支持等字节长改名（本包是 XML plist，不应走到这里）');
-    }
-    const out = Buffer.from(buf);
-    let n = 0;
-    let idx = -1;
-    while ((idx = out.indexOf(from, idx + 1)) >= 0) {
-      if (out[idx - 1] !== 0x0f) continue; // ASCII 串长度前缀（≤14 用 1 字节 0x0f）
-      Buffer.from(to).copy(out, idx);
-      n++;
-    }
-    if (n === 0) fail('二进制 plist 未找到旧 Bundle ID');
-    return { buf: out, changes: n, mode: 'bplist-inplace' };
+  if (head === BPLIST_MAGIC) {
+    const root = decodeBplist(buf).value;
+    const id = root?.CFBundleIdentifier;
+    if (typeof id !== 'string') fail('二进制 plist 内 CFBundleIdentifier 缺失');
+    return { id, kind: 'bplist' };
   }
   const text = buf.toString('utf8');
-  const re = /(<key>CFBundleIdentifier<\/key>\s*<string>)([^<]*)(<\/string>)/;
-  const m = re.exec(text);
+  const m = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]*)<\/string>/.exec(text);
   if (!m) fail('Info.plist 未找到 CFBundleIdentifier');
-  const old = m[2];
-  if (old !== from) fail(`Info.plist CFBundleIdentifier 期望 ${from}，实得 ${old}`);
-  let out = text.replace(re, (_all, a, _b, c) => `${a}${to}${c}`);
-  // CFBundleURLName 等其它同值处一并改（Info.plist 内旧值出现 2 次）
-  out = out.split(from).join(to);
-  return { buf: Buffer.from(out, 'utf8'), changes: [{ kind: 'cfbundleidentifier', from: old, to }], mode: 'plist' };
+  return { id: m[1], kind: 'xml' };
+}
+
+/** 旧 Info.plist（XML 明文 或 bplist00）。二进制走完整解码 → 改值 → 重新编码。 */
+export function patchInfoPlist(buf, { from, to, displayName = null }) {
+  const head = buf.subarray(0, 8).toString('latin1');
+
+  if (head === BPLIST_MAGIC) {
+    const before = decodeBplist(buf);
+    const root = before.value;
+    if (root === null || typeof root !== 'object' || Array.isArray(root)) fail('二进制 plist 顶层不是字典');
+    const flatBefore = flattenPlist(root);
+
+    const changes = [];
+    if (root.CFBundleIdentifier !== from) {
+      fail(`Info.plist CFBundleIdentifier 期望 ${from}，实得 ${root.CFBundleIdentifier}`);
+    }
+    root.CFBundleIdentifier = to;
+    changes.push({ kind: 'cfbundleidentifier', from, to });
+
+    // CFBundleURLName 与 Bundle ID 同值时一并改（URL scheme 的展示名，不是安装身份，但保持自洽）
+    for (const t of Array.isArray(root.CFBundleURLTypes) ? root.CFBundleURLTypes : []) {
+      if (t && t.CFBundleURLName === from) {
+        t.CFBundleURLName = to;
+        changes.push({ kind: 'cfbundleurlname', from, to });
+      }
+    }
+    if (displayName && typeof root.CFBundleDisplayName === 'string') {
+      const was = root.CFBundleDisplayName;
+      if (was !== displayName) {
+        root.CFBundleDisplayName = displayName;
+        changes.push({ kind: 'cfbundledisplayname', from: was, to: displayName });
+      }
+    }
+
+    const out = encodeBplist(root);
+
+    // ---- 回读断言：解码回来逐路径比对，除被改的键外必须逐一相同 ----
+    const after = decodeBplist(out);
+    const flatAfter = flattenPlist(after.value);
+    const changedPaths = new Set(['CFBundleIdentifier']);
+    if (changes.some((c) => c.kind === 'cfbundledisplayname')) changedPaths.add('CFBundleDisplayName');
+    for (let i = 0; i < (Array.isArray(root.CFBundleURLTypes) ? root.CFBundleURLTypes.length : 0); i++) {
+      if (root.CFBundleURLTypes[i]?.CFBundleURLName === to) changedPaths.add(`CFBundleURLTypes[${i}].CFBundleURLName`);
+    }
+
+    const diffs = [];
+    for (const [k, v] of flatBefore) {
+      if (changedPaths.has(k)) continue;
+      if (!flatAfter.has(k)) diffs.push(`丢失键 ${k}`);
+      else if (flatAfter.get(k) !== v) diffs.push(`${k}: ${v} → ${flatAfter.get(k)}`);
+    }
+    for (const k of flatAfter.keys()) if (!flatBefore.has(k)) diffs.push(`新增键 ${k}`);
+    if (diffs.length) fail(`二进制 plist 回读比对失败（非预期改动）：\n  - ${diffs.slice(0, 10).join('\n  - ')}`);
+    // 比对扁平表时值是带类型前缀的标签，这里直接查解码后的对象，避免拿标签跟裸值比
+    if (after.value.CFBundleIdentifier !== to) fail(`二进制 plist 回读 CFBundleIdentifier != ${to}（实得 ${after.value.CFBundleIdentifier}）`);
+    if (flatAfter.size !== flatBefore.size) fail(`二进制 plist 回读键数变化：${flatBefore.size} → ${flatAfter.size}`);
+
+    return { buf: out, changes, mode: 'bplist-reencode', decoded: after.value };
+  }
+
+  const text = buf.toString('utf8');
+  const changes = [];
+  const swap = (key, value) => {
+    const re = new RegExp(`(<key>${key}</key>\\s*<string>)([^<]*)(</string>)`);
+    const m = re.exec(text);
+    if (!m) return false;
+    if (m[2] === value) return true;
+    changes.push({ kind: key.toLowerCase(), from: m[2], to: value });
+    text = text.replace(re, (_a, a, _b, c) => `${a}${value}${c}`);
+    return true;
+  };
+  const m = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]*)<\/string>/.exec(text);
+  if (!m) fail('Info.plist 未找到 CFBundleIdentifier');
+  if (m[1] !== from) fail(`Info.plist CFBundleIdentifier 期望 ${from}，实得 ${m[1]}`);
+
+  let text2 = text;
+  const replaceKey = (key, value) => {
+    const re = new RegExp(`(<key>${key}</key>\\s*<string>)([^<]*)(</string>)`);
+    const mm = re.exec(text2);
+    if (!mm || mm[2] === value) return false;
+    changes.push({ kind: key.toLowerCase(), from: mm[2], to: value });
+    text2 = text2.replace(re, (_a, a, _b, c) => `${a}${value}${c}`);
+    return true;
+  };
+
+  replaceKey('CFBundleIdentifier', to);
+  replaceKey('CFBundleURLName', to);
+  if (displayName) replaceKey('CFBundleDisplayName', displayName);
+
+  const leftover = text2.split(from).length - 1;
+  if (leftover !== 0) fail(`Info.plist 改写后仍残留旧 Bundle ID ${from} × ${leftover} 处`);
+  return { buf: Buffer.from(text2, 'utf8'), changes, mode: 'plist-xml' };
 }
 
 // ---------------------------------------------------------------------------
@@ -887,34 +1357,48 @@ const RESIDUAL_RE = new RegExp(
   'g',
 );
 
+/**
+ * 残留扫描用的正则。**必须按实际旧身份生成**：iOS v15.2 的 app id 是 `com.kulo.wf`，
+ * 写死 `com.leiting.wf` 会让 `identity` 恒为 0 —— 假绿，改名是否真生效无从验证。
+ */
+export function residualRe(from = OFFICIAL_PACKAGE) {
+  const esc = from.replace(/\./g, '\\.');
+  return new RegExp(
+    `air\\.${esc}\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|${esc}\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)|${esc}`,
+    'g',
+  );
+}
+
 /** 把一个条目解压后的内容按类别统计旧包名出现次数。 */
-export function classifyResiduals(data) {
+export function classifyResiduals(data, { from = OFFICIAL_PACKAGE } = {}) {
   const text = data.toString('latin1');
   const out = { identity: [], protected: [], outOfScope: [] };
-  RESIDUAL_RE.lastIndex = 0;
+  const re = residualRe(from);
   let m;
-  while ((m = RESIDUAL_RE.exec(text)) !== null) {
+  while ((m = re.exec(text)) !== null) {
     const v = m[0];
-    if (v === OFFICIAL_PACKAGE) out.identity.push({ offset: m.index, value: v });
-    else if (v.startsWith('com.leiting.wf.')) out.outOfScope.push({ offset: m.index, value: v });
+    if (v === from) out.identity.push({ offset: m.index, value: v });
+    else if (v.startsWith(`${from}.`)) out.outOfScope.push({ offset: m.index, value: v });
     else out.protected.push({ offset: m.index, value: v });
   }
   return out;
 }
 
-export function scanResiduals(zip, { skip = new Set() } = {}) {
+export function scanResiduals(zip, { skip = new Set(), from = OFFICIAL_PACKAGE, maxEntrySize = 512 * 1024 * 1024 } = {}) {
   const per = {};
   const totals = { identity: 0, protected: 0, outOfScope: 0 };
   for (const e of zip.entries) {
     if (skip.has(e.name)) continue;
-    if (e.usize > 64 * 1024 * 1024) continue;
+    // 上限 512MB：iOS 主二进制实测 192MB，旧的 64MB 上限会把它静默跳过
+    // ⇒ iOS 的残留统计变成假绿（二进制里的 AppEntry / 计费 SKU 全看不见）。
+    if (e.usize > maxEntrySize) continue;
     let data;
     try {
       data = readEntryData(zip, e);
     } catch {
       continue;
     }
-    const r = classifyResiduals(data);
+    const r = classifyResiduals(data, { from });
     if (r.identity.length || r.protected.length || r.outOfScope.length) {
       per[e.name] = {
         identity: r.identity.length,
@@ -933,6 +1417,59 @@ export function scanResiduals(zip, { skip = new Set() } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// 主二进制身份串分类（只读；iOS 特有风险）
+// ---------------------------------------------------------------------------
+
+/**
+ * 主二进制里出现的身份串**不是**安装身份，改不了也不该改，但必须让调用方看见。
+ *
+ * 实测 `苹果v15.2.ipa` 的 `Payload/worldflipper.app/worldflipper`（192MB）：
+ *   `com.kulo.wf` × 0（与 Info.plist 一致 ⇒ 按 from 扫是"干净"的）
+ *   `com.leiting.wf` × 122，分三类：
+ *     · sku      `com.leiting.wf.stonepack_*` / `weekly_set_*` —— 计费 SKU，**改了就是改商品 ID**，禁改
+ *     · keychain `<string>RUH384Q4E8.com.leiting.wf</string>` —— entitlements 的 keychain access group
+ *     · bare     `com.leiting.wf`
+ * ⇒ 只按 Info.plist 的 from 扫会给出"0 残留"的假绿，而二进制里其实躺着 122 处旧身份。
+ */
+export function classifyBinaryIdentities(data, { from, other = OFFICIAL_PACKAGE } = {}) {
+  const text = data.toString('latin1');
+  const ids = [...new Set([from, other].filter((x) => typeof x === 'string' && x))];
+  const out = { bytes: text.length, ids: {} };
+  for (const id of ids) {
+    const count = text.split(id).length - 1;
+    const rec = { count, kinds: { sku: 0, keychain: 0, bare: 0, other: 0 }, samples: { sku: [], keychain: [], other: [] } };
+    if (count > 0) {
+      const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`[\\x20-\\x7e]{0,48}${esc}[\\x20-\\x7e]{0,36}`, 'g');
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const ctx = m[0];
+        const at = ctx.indexOf(id);
+        const tail = ctx.slice(at + id.length);
+        const head = ctx.slice(0, at);
+        if (/^\.(?:stonepack_|weekly_set_)/.test(tail)) {
+          rec.kinds.sku++;
+          const v = id + tail.match(/^\.(?:stonepack_|weekly_set_)[A-Za-z0-9_]*/)[0];
+          if (rec.samples.sku.length < 8 && !rec.samples.sku.includes(v)) rec.samples.sku.push(v);
+        } else if (/[A-Z0-9]{10}\.$/.test(head)) {
+          rec.kinds.keychain++;
+          const v = head.match(/[A-Z0-9]{10}\.$/)[0] + id;
+          if (rec.samples.keychain.length < 4 && !rec.samples.keychain.includes(v)) rec.samples.keychain.push(v);
+        } else if (tail === '' || /^[^\x20-\x7e]/.test(tail)) {
+          rec.kinds.bare++;
+        } else {
+          rec.kinds.other++;
+          const v = `${head.slice(-24)}${id}${tail.slice(0, 16)}`;
+          if (rec.samples.other.length < 4) rec.samples.other.push(v);
+        }
+      }
+    }
+    out.ids[id] = rec;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // 只读侦察
 // ---------------------------------------------------------------------------
 
@@ -947,23 +1484,37 @@ export function inspect(filePath) {
 
   if (isIpa) {
     const plistEntry = zip.entries.find((e) => /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.name));
-    const plist = readEntryData(zip, plistEntry).toString('utf8');
-    report.bundleId = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]*)<\/string>/.exec(plist)?.[1] ?? null;
-    report.bundleIdLength = report.bundleId?.length ?? null;
+    const plistBuf = readEntryData(zip, plistEntry);
+    const { id, kind } = readBundleIdFromPlist(plistBuf);
+    report.plistFormat = kind;
+    report.bundleId = id;
+    report.bundleIdLength = id.length;
+    report.from = id;
     const appXml = zip.entries.find((e) => /^Payload\/[^/]+\.app\/META-INF\/AIR\/application\.xml$/.test(e.name));
     if (appXml) {
       const ax = readEntryData(zip, appXml).toString('utf8');
       report.airId = /<id>([^<]*)<\/id>/.exec(ax)?.[1] ?? null;
+      report.airIdMatchesPlist = report.airId === id;
+    }
+    if (kind === 'bplist') {
+      const root = decodeBplist(plistBuf).value;
+      report.bundleDisplayName = root?.CFBundleDisplayName ?? null;
+      report.extensionIds = (root?.Extensions ?? []).map((e) => e?.CFBundleIdentifier).filter(Boolean);
     }
   } else {
     const ax = zip.entries.find((e) => e.name === 'AndroidManifest.xml');
     const parsed = readAxmlPackage(readEntryData(zip, ax));
     report.package = parsed.packageName;
     report.packageLength = parsed.packageName.length;
+    report.from = parsed.packageName;
     report.manifestStringsToRename = parsed.parsed.pool.strings
       .map((s, i) => ({ i, s }))
-      .filter(({ s }) => s.includes(OFFICIAL_PACKAGE) && !/air\.com\.leiting\.wf\.AppEntry|com\.leiting\.sdk\./.test(s));
-    report.manifestProtectedStrings = parsed.parsed.pool.strings.filter((s) => /air\.com\.leiting\.wf\.AppEntry|com\.leiting\.sdk\./.test(s));
+      .filter(({ s }) => s.includes(parsed.packageName) && !protectedRe(parsed.packageName).test(s));
+    report.manifestProtectedStrings = parsed.parsed.pool.strings.filter((s) => {
+      const re = protectedRe(parsed.packageName);
+      re.lastIndex = 0;
+      return re.test(s);
+    });
     const arsc = zip.entries.find((e) => e.name === 'resources.arsc');
     if (arsc) report.arscPackages = findArscPackageChunks(readEntryData(zip, arsc));
     const dex = zip.entries.find((e) => /^classes\d*\.dex$/.test(e.name));
@@ -980,7 +1531,7 @@ export function inspect(filePath) {
       }
     }
   }
-  report.residuals = scanResiduals(zip);
+  report.residuals = scanResiduals(zip, { from: report.from });
   return report;
 }
 
@@ -1103,7 +1654,10 @@ export async function renameApk({
       }
       const text = (res.mode === 'noop' ? data : res.buf).toString('utf8');
       checks.push({ name: 'air.appid', ok: new RegExp(`<id>${to.replace(/\./g, '\\.')}</id>`).test(text), detail: /<id>([^<]*)<\/id>/.exec(text)?.[1] });
-      checks.push({ name: 'air.appentry-preserved', ok: text.includes('air.com.leiting.wf.AppEntry'), detail: 'air.com.leiting.wf.AppEntry' });
+      const appEntry = appEntryOf(from);
+      if (data.includes(appEntry)) {
+        checks.push({ name: 'air.appentry-preserved', ok: text.includes(appEntry), detail: appEntry });
+      }
     }
   }
 
@@ -1163,7 +1717,7 @@ export async function renameApk({
     }
   }
 
-  const residuals = scanResiduals(outZip);
+  const residuals = scanResiduals(outZip, { from });
   verify.push({
     name: 'out.residual.identity',
     ok: residuals.totals.identity === 0,
@@ -1227,6 +1781,7 @@ export async function renameIpa({
   inPath,
   outPath,
   bundleId = DEFAULT_COEXIST_PACKAGE,
+  displayName = null,
   extraRenames = [],
   dryRun = false,
 } = {}) {
@@ -1240,10 +1795,14 @@ export async function renameIpa({
   const appDir = plistEntry.name.replace(/\/Info\.plist$/, '');
   const binaryPath = `${appDir}/${appDir.replace(/^Payload\//, '').replace(/\.app$/, '')}`;
 
+  // ⚠ iOS 的 app id 不是常量：`苹果v15.2.ipa` 是 com.kulo.wf，`iOS-1.8.4.ipa` 是 com.leiting.wf。
+  //   写死旧值 = 一字不改却仍按新值断言 → 只能靠实测读取。
   const plistBuf = readEntryData(zip, plistEntry);
-  const plistText = plistBuf.toString('utf8');
-  const from = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]*)<\/string>/.exec(plistText)?.[1];
-  if (!from) fail('Info.plist 未找到 CFBundleIdentifier');
+  const fromRead = readBundleIdFromPlist(plistBuf);
+  const from = fromRead.id;
+  const warnings = [];
+  if (from === bundleId) fail(`Info.plist 的 CFBundleIdentifier 已经是 ${bundleId}（无需改名）`);
+  warnings.push(`iOS 旧 Bundle ID 实测为 ${from}（Info.plist 格式：${fromRead.kind}）`);
   const mapper = makeStringMapper({ from, to: bundleId, extra: extraRenames });
 
   const transforms = new Map();
@@ -1251,18 +1810,28 @@ export async function renameIpa({
   const checks = [];
 
   {
-    const res = patchInfoPlist(plistBuf, { from, to: bundleId });
-    perEntry[plistEntry.name] = { mode: res.mode, changes: res.changes };
-    transforms.set(plistEntry.name, { run: () => res.buf, changes: [`CFBundleIdentifier: ${from} → ${bundleId}`] });
+    const res = patchInfoPlist(plistBuf, { from, to: bundleId, displayName });
+    perEntry[plistEntry.name] = { mode: res.mode, source: fromRead.kind, changes: res.changes };
+    transforms.set(plistEntry.name, {
+      run: () => res.buf,
+      changes: res.changes.map((c) => `${c.kind}: ${c.from} → ${c.to}`),
+    });
   }
   {
     const e = zip.entries.find((x) => x.name === `${appDir}/META-INF/AIR/application.xml`);
     if (e) {
-      const res = patchAirDescriptor(readEntryData(zip, e), { mapper });
+      const raw = readEntryData(zip, e);
+      const airIdBefore = /<id>([^<]*)<\/id>/.exec(raw.toString('utf8'))?.[1] ?? null;
+      if (airIdBefore !== from) {
+        warnings.push(`AIR application.xml 的 <id>=${airIdBefore} 与 Info.plist 的 ${from} 不一致 —— 按 application.xml 自身的值改写，Air 运行时以 <id> 为准`);
+      }
+      const res = patchAirDescriptor(raw, { mapper, from: airIdBefore ?? from });
       perEntry[e.name] = { mode: res.mode, changes: res.changes };
       if (res.mode !== 'noop') transforms.set(e.name, { run: () => res.buf, changes: res.changes.filter((c) => c.kind === 'replace').map((c) => `${c.from} → ${c.to}`) });
-      const text = (res.mode === 'noop' ? readEntryData(zip, e) : res.buf).toString('utf8');
+      const text = (res.mode === 'noop' ? raw : res.buf).toString('utf8');
       checks.push({ name: 'air.appid', ok: new RegExp(`<id>${bundleId.replace(/\./g, '\\.')}</id>`).test(text), detail: /<id>([^<]*)<\/id>/.exec(text)?.[1] });
+    } else {
+      warnings.push('IPA 内没有 META-INF/AIR/application.xml');
     }
   }
 
@@ -1272,27 +1841,38 @@ export async function renameIpa({
   const verify = [];
   {
     const e = outZip.entries.find((x) => x.name === plistEntry.name);
-    const text = readEntryData(outZip, e).toString('utf8');
-    const id = /<key>CFBundleIdentifier<\/key>\s*<string>([^<]*)<\/string>/.exec(text)?.[1];
-    verify.push({ name: 'out.cfbundleidentifier', ok: id === bundleId, detail: id });
+    const outBuf = readEntryData(outZip, e);
+    const { id, kind } = readBundleIdFromPlist(outBuf);
+    verify.push({ name: 'out.cfbundleidentifier', ok: id === bundleId, detail: `${id}（${kind}）` });
+    // 二进制 plist 重新编码后必须还能被解出全部键（patchInfoPlist 已比对，这里再核一次大小合理性）
+    if (fromRead.kind === 'bplist') {
+      const okSize = outBuf.length > 32 && outBuf.subarray(outBuf.length - 32).length === 32;
+      verify.push({ name: 'out.plist.trailer', ok: okSize, detail: `${plistBuf.length} → ${outBuf.length} 字节` });
+    }
+    if (displayName) {
+      const shown = /<key>CFBundleDisplayName<\/key>\s*<string>([^<]*)<\/string>/.exec(outBuf.toString('utf8'))?.[1]
+        ?? decodeBplist(outBuf).value?.CFBundleDisplayName;
+      verify.push({ name: 'out.cfbundledisplayname', ok: shown === displayName, detail: shown });
+    }
   }
-  const residuals = scanResiduals(outZip, { skip: new Set([binaryPath]) });
+  const residuals = scanResiduals(outZip, { skip: new Set([binaryPath]), from });
   verify.push({
     name: 'out.residual.identity',
     ok: residuals.totals.identity === 0,
-    detail: `identity=${residuals.totals.identity} protected=${residuals.totals.protected} outOfScope(SKU)=${residuals.totals.outOfScope}`,
+    detail: `identity=${residuals.totals.identity} protected=${residuals.totals.protected} outOfScope(SKU)=${residuals.totals.outOfScope}（按 from=${from} 统计）`,
   });
   // 主二进制单独统计（只读报告，不改）
   {
     const e = zip.entries.find((x) => x.name === binaryPath);
     if (e) {
-      const r = classifyResiduals(readEntryData(zip, e));
+      const r = classifyResiduals(readEntryData(zip, e), { from });
       perEntry[binaryPath] = {
         mode: 'not-modified',
         identity: r.identity.length,
         protected: r.protected.length,
         outOfScope: r.outOfScope.length,
-        note: '9 处计费 SKU + 5 处在代码签名（CodeDirectory identifier / entitlements application-identifier），重签时由 ldid/Sideloadly 重新生成',
+        sampleOutOfScope: [...new Set(r.outOfScope.map((x) => x.value))].slice(0, 12),
+        note: '计费 SKU + 代码签名（CodeDirectory identifier / entitlements application-identifier）都在二进制内；重签时由 ldid/Sideloadly 重新生成，本工具不碰二进制',
       };
     }
   }
@@ -1313,19 +1893,22 @@ export async function renameIpa({
     dryRun: Boolean(dryRun),
     from,
     to: bundleId,
+    plistFormat: fromRead.kind,
     changedEntries: result.changed,
     plan: perEntry,
     checks: [...checks, ...verify],
     residuals,
     warnings: [
+      ...warnings,
       'iOS 主二进制内的代码签名（CodeDirectory identifier + entitlements application-identifier）在重签时重新生成；本工具不碰二进制',
       '若该包使用推送 / keychain access group，重签后 entitlements 的 application-identifier 前缀可能仍指向旧 id——交 P10-A 处理',
+      'AIR 存档（SharedObject）按 app id 隔离：改 Bundle ID 后旧存档不可见，这是预期行为',
     ],
-    unsigignedNote: true,
+    unsigned: true,
     resignCommands: [
-      `# 越狱（iOS 15.8.3 / Dopamine rootless）：解包后对主二进制伪签名`,
+      '# 越狱（iOS 15.8.3 / Dopamine rootless）：解包后对主二进制伪签名',
       `ldid -S ${binaryPath}`,
-      `# 重新打包为 ipa 后安装；或用 Sideloadly（非越狱，自带重签 + bundle id 覆盖）`,
+      '# 重新打包为 ipa 后安装；或用 Sideloadly（非越狱，自带重签 + bundle id 覆盖）',
     ],
   };
 }
@@ -1340,14 +1923,31 @@ function parseArgs(argv) {
     const a = argv[i];
     const next = () => {
       const v = argv[++i];
-      if (v === undefined) fail(`参数 ${a} 缺少值`);
+      if (v === undefined) usageFail(`参数 ${a} 缺少值`);
       return v;
     };
     switch (a) {
       case '--in': args.inPath = next(); break;
       case '--out': args.outPath = next(); break;
+      case '--rename-package': {
+        // 主开关。值可省略：`--rename-package` 单独出现 ⇒ 用默认目标 cn.starpoint.a
+        args.renamePackage = true;
+        const peek = argv[i + 1];
+        if (peek !== undefined && !peek.startsWith('-') && isValidPackageName(peek)) {
+          i++;
+          args.packageName = peek;
+        }
+        break;
+      }
+      case '--no-rename-package': args.renamePackage = false; break;
       case '--package':
-      case '--bundle-id': args.packageName = next(); break;
+      case '--bundle-id': {
+        // 显式给出目标名 = 明确的改名意图（与 --rename-package 等价）
+        args.packageName = next();
+        if (args.renamePackage === undefined) args.renamePackage = true;
+        break;
+      }
+      case '--display-name': args.displayName = next(); break;
       case '--extra': {
         const [k, v] = next().split('=');
         if (!k || !v) fail('--extra 需要 old=new');
@@ -1362,7 +1962,7 @@ function parseArgs(argv) {
       case '--json': args.json = true; break;
       case '-h':
       case '--help': args.help = true; break;
-      default: fail(`未知参数 ${a}`);
+      default: usageFail(`未知参数 ${a}`);
     }
   }
   return args;
@@ -1370,18 +1970,69 @@ function parseArgs(argv) {
 
 const HELP = `rename-package.mjs — StarPoint CN 客户端共存（改包名 / Bundle ID）
 
+  ⚠ 默认关：不指定 --rename-package / --package / --bundle-id 时，本工具
+     **不改任何字节**，产物与输入逐字节一致（脚本内部断言，不一致即退出码 2）。
+
   --in <path>               输入 APK / IPA（只读）
   --out <path>              输出路径（省略 = 只分析不写）
-  --package <name>          Android 新包名（等长 14 字符，默认 ${DEFAULT_COEXIST_PACKAGE}）
-  --bundle-id <name>        iOS 新 Bundle ID（同上；--package 亦可）
+  --rename-package [name]   主开关。省略 name ⇒ 用默认目标 ${DEFAULT_COEXIST_PACKAGE}
+  --package <name>          Android 新包名（等价于 --rename-package <name>）
+  --bundle-id <name>        iOS 新 Bundle ID（同上）
+  --display-name <name>     iOS 同时改 CFBundleDisplayName（默认不改；共存时便于区分图标）
   --extra <old=new>         额外精确串替换（可重复，用于改 URL scheme 等）
   --allow-unequal-length    放行不等长包名（放弃 dex 身份串改写，需真机验证）
   --keep-v1-signature       保留残留 v1 JAR 签名文件（默认剥离）
   --keep-signing-block      保留 APK Signing Block（默认剥离；输出反正必须重签名）
   --dry-run                 只验证不写文件
-  --inspect                 只读侦察：打印官方包名 / 待改位置 / 残留分类
+  --inspect                 只读侦察：打印实测身份 / 待改位置 / 残留分类
   --json                    以 JSON 打印结果
+  -h, --help                本帮助
+
+退出码：0 = 成功（含默认关的零改动透传、幂等 noop）
+        1 = 业务失败（断言不通过 / 找不到身份串 / 输入非法）
+        2 = 用法错误（未知参数、参数缺值、缺少 --in）
 `;
+
+/** 默认关（未要求改名）时的零改动路径：产物必须与输入逐字节一致，并自证。 */
+export function passthroughCopy({ inPath, outPath } = {}) {
+  if (!inPath) fail('缺少 --in');
+  if (!existsSync(inPath)) fail(`输入不存在：${inPath}`);
+  const buf = readFileSync(inPath);
+  const digest = (b) => createHash('sha256').update(b).digest('hex');
+  const sha256 = digest(buf);
+
+  let wrote = false;
+  if (outPath) {
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, buf);
+    const back = readFileSync(outPath);
+    if (!back.equals(buf) || digest(back) !== sha256) {
+      fail(`默认关（未指定 --rename-package）时产物与输入不逐字节一致：${outPath}`);
+    }
+    wrote = true;
+  }
+
+  const zip = parseZip(buf);
+  const isIpa = zip.entries.some((e) => /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.name));
+
+  return {
+    ok: true,
+    renamed: false,
+    platform: isIpa ? 'ios' : 'android',
+    in: inPath,
+    out: outPath ?? null,
+    bytes: buf.length,
+    sha256,
+    byteIdentical: true,
+    writesFile: wrote,
+    changedEntries: [],
+    checks: [
+      { name: 'default-off.no-rewrite', ok: true, detail: '未指定 --rename-package ⇒ 不进入任何改写路径' },
+      { name: 'default-off.byte-identical', ok: true, detail: outPath ? `sha256 ${sha256}（输出=输入，已回读校验）` : `sha256 ${sha256}（未写文件）` },
+    ],
+    warnings: [],
+  };
+}
 
 export async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
@@ -1389,7 +2040,7 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(HELP);
     return { ok: true, help: true };
   }
-  if (!args.inPath) fail('缺少 --in');
+  if (!args.inPath) usageFail('缺少 --in');
 
   if (args.inspect) {
     const report = inspect(args.inPath);
@@ -1397,19 +2048,26 @@ export async function main(argv = process.argv.slice(2)) {
     return report;
   }
 
+  const emit = (report) => {
+    if (args.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    else printReport(report);
+    return report;
+  };
+
+  // ---- 默认关：不做任何改写 ----
+  if (args.renamePackage !== true) {
+    return emit(passthroughCopy(args));
+  }
+
   const buf = readFileSync(args.inPath);
   const zip = parseZip(buf);
   const isIpa = zip.entries.some((e) => /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.name));
+  const target = args.packageName ?? DEFAULT_COEXIST_PACKAGE;
   const report = isIpa
-    ? await renameIpa({ ...args, bundleId: args.packageName ?? DEFAULT_COEXIST_PACKAGE })
-    : await renameApk(args);
+    ? await renameIpa({ ...args, bundleId: target, displayName: args.displayName ?? null })
+    : await renameApk({ ...args, packageName: target });
 
-  if (args.json) {
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  } else {
-    printReport(report);
-  }
-  return report;
+  return emit(report);
 }
 
 function printInspect(report, asJson) {
@@ -1441,6 +2099,15 @@ function printInspect(report, asJson) {
 
 function printReport(report) {
   const L = [];
+  if (report.renamed === false) {
+    L.push(`[rename-package] 默认关（未指定 --rename-package）——零改动透传`);
+    L.push(`  ${report.platform}  ${report.in}`);
+    L.push(`  字节数：${report.bytes}   sha256：${report.sha256}`);
+    if (report.out) L.push(`  已写出（逐字节等于输入，已回读校验）：${report.out}`);
+    else L.push('  （未指定 --out，未写文件）');
+    process.stdout.write(`${L.join('\n')}\n`);
+    return;
+  }
   L.push(`[rename-package] ${report.platform} ${report.from} → ${report.to}${report.equalLength === false ? '  ⚠ 不等长' : ''}`);
   for (const c of report.changedEntries) {
     L.push(`  改 ${c.name}: csize ${c.before.csize}→${c.after.csize} usize ${c.before.usize}→${c.after.usize}（${c.mode}）`);
@@ -1457,8 +2124,10 @@ function printReport(report) {
 const isDirectRun = process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('client-patch/tools/rename-package.mjs');
 if (isDirectRun) {
   main().catch((err) => {
-    process.stderr.write(`[rename-package] FAIL: ${err.message}\n`);
+    const code = err?.exitCode ?? 1;
+    process.stderr.write(`[rename-package] FAIL(${code}): ${err.message}\n`);
+    if (code === 2) process.stderr.write('[rename-package] 用法：node client-patch/tools/rename-package.mjs --help\n');
     if (process.env.P12_DEBUG) process.stderr.write(`${err.stack}\n`);
-    process.exitCode = 1;
+    process.exitCode = code;
   });
 }
