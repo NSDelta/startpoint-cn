@@ -108,6 +108,7 @@ const D = {
   aligned: path.join(WORK, "aligned.apk"),
   signed: path.join(OUTDIR, "sp-cn-p0-probe.apk"),
   report: path.join(OUTDIR, "sp-cn-p0-probe.apk.build-report.json"),
+  patchInfo: path.join(WORK, "patch-info.json"),
 };
 D.asBefore = path.join(D.expBefore, "scripts", ...CLASS.split(".")) + ".as";
 D.asAfter = path.join(D.expAfter, "scripts", ...CLASS.split(".")) + ".as";
@@ -135,7 +136,8 @@ function run(cmd, cmdArgs, opts = {}) {
   if (r.error) throw new Error(`spawn 失败 ${cmd}: ${r.error.message}`);
   if (r.status !== 0 && !opts.allowFail) {
     throw new Error(
-      `${cmd} 退出码 ${r.status}（原始 stderr：${(r.stderr || "").split(/\r?\n/).filter(Boolean).slice(-4).join(" | ")}）`
+      `${cmd} 退出码 ${r.status}（stdout 尾：${(r.stdout || "").split(/\r?\n/).filter(Boolean).slice(-6).join(" | ")}` +
+        ` ／ 原始 stderr 尾：${(r.stderr || "").split(/\r?\n/).filter(Boolean).slice(-6).join(" | ")}）`
     );
   }
   return { ...r, tail };
@@ -399,6 +401,7 @@ function stageExportBefore() {
 function stagePatch() {
   step("4/8 改靶类（改既有方法 startLoginServer 的返回串 + 一个 static const）");
   let text = fs.readFileSync(D.asBefore, "utf8");
+  const residualBefore = (text.match(/param1\(""\)/g) || []).length;
   const beforeBody = /public function startLoginServer\(param1:Function\) : void\s*\{\s*param1\(""\);\s*\}/;
   if (!beforeBody.test(text)) throw new Error(`靶类里找不到 startLoginServer 目标体，锚点不匹配：${D.asBefore}`);
   text = text.replace(beforeBody, m => m.replace('param1("")', `param1(${PROBE_TAG})`));
@@ -410,11 +413,231 @@ function stagePatch() {
   );
   if (!text.includes(`param1(${PROBE_TAG})`)) throw new Error("改写后没找到新方法体");
   const oldCount = (text.match(/param1\(""\)/g) || []).length;
+  // 基座导出里 param1("") 出现在多个方法（startLoginServer 只是其中之一，实测 4 处），
+  // 所以断言不能写死「残留 1 处」，必须按「基座残留 - 1」判定。两个数落盘给 6a 用。
+  const info = { residual_before: residualBefore, residual_after: oldCount, expected_residual: residualBefore - 1 };
+  fs.writeFileSync(D.patchInfo, JSON.stringify(info, null, 2), "utf8");
   fs.writeFileSync(D.asBefore, text, "utf8");
   log(
     `改后 .as = ${Buffer.byteLength(text)} B：startLoginServer → param1(${PROBE_TAG})，` +
-      `static const ${PROBE_TAG}="${PROBE_SENTINEL}"，残留 param1("") = ${oldCount}（原 2 处）`
+      `static const ${PROBE_TAG}="${PROBE_SENTINEL}"，param1("") 残留 ${residualBefore} → ${oldCount}`
   );
+}
+
+/**
+ * 决定性附加实验：路线 A（整类 .as 回填）到底能不能**新增方法**、能不能**新增类**？
+ * 这直接决定 P6 的登录页走哪条路（路线 B 只能替换已存在的方法体，不能新增任何东西）。
+ *   · 变体 1：给靶类加一个全新方法 SP_CN_P0_AddedMethod()（P6 真实需求：新 API 方法）
+ *   · 变体 2：在同一个 .as 里追加一个全新非 public 类 SP_CN_P0_AddedClass（P6 真实需求：新 UI 类）
+ *   · 变体 3：以一个**全新类的 FQN**当 -replace 的 scriptName（凭空插新类）
+ * 各跑一次 -replace，再用 -dumpAS3 数类数/方法数、用 -selectclass 回读确认。
+ */
+function stageAddClass() {
+  step("附加实验 A：-replace 能否新增方法 / 新增类");
+  if (!fs.existsSync(D.swfIn)) stageExtract();
+  const baseFp = fs.existsSync(D.dumpBase) ? fingerprintClassList(D.dumpBase) : stageDumpBase();
+  const baseLine = baseFp.lines.find(l => l.startsWith(CLASS + " ")) || "";
+  const baseMethods = Number((baseLine.split(/\s+/)[1] || "0"));
+  log(`基座：类数 ${baseFp.count}，${CLASS} 方法数 ${baseMethods}`);
+
+  const dir = path.join(WORK, "addclass");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  ffdec(["-selectclass", CLASS, "-export", "script", dir, D.swfIn]);
+  const origAs = fs.readFileSync(path.join(dir, "scripts", ...CLASS.split(".")) + ".as", "utf8");
+
+  const out = { base_class_count: baseFp.count, base_method_count: baseMethods, variants: [] };
+
+  // ── 变体 1：新增方法
+  {
+    const asPath = path.join(dir, "v1_add_method.as");
+    const anchor = /public class ChannelSDKDummy extends RealRemoteService implements ChannelSDKImpl\s*\{\s*\n/;
+    if (!anchor.test(origAs)) throw new Error("变体 1 锚点不匹配");
+    const text = origAs.replace(
+      anchor,
+      m => `${m}      public function SP_CN_P0_AddedMethod() : String { return "${ADDED_METHOD_TAG}"; }\n      \n`
+    );
+    fs.writeFileSync(asPath, text, "utf8");
+    const swf = path.join(WORK, "addclass_v1.swf");
+    let replaced = true;
+    let err = "";
+    try {
+      ffdec(["-replace", D.swfIn, swf, CLASS, asPath]);
+    } catch (e) {
+      replaced = false;
+      err = e.message.split("\n")[0];
+    }
+    const v = { variant: "v1-add-method", replace_ok: replaced, error: err, swf_bytes: fs.existsSync(swf) ? fs.statSync(swf).size : null };
+    if (replaced) {
+      const r = spawnSync(JAVA, ["-Xmx4g", "-Djava.awt.headless=true", "-jar", FFDEC, "-air", "-onerror", "abort", "-dumpAS3", swf], { encoding: "utf8", maxBuffer: 1 << 28 });
+      const dump = path.join(WORK, "dumpAS3_addclass_v1.txt");
+      fs.writeFileSync(dump, r.stdout || "");
+      const fp = fingerprintClassList(dump);
+      const line = fp.lines.find(l => l.startsWith(CLASS + " ")) || "";
+      v.class_count = fp.count;
+      v.method_count = Number((line.split(/\s+/)[1] || "0"));
+      v.tag_in_swf = fs.readFileSync(swf).includes(Buffer.from(ADDED_METHOD_TAG, "utf8"));
+      const re = path.join(WORK, "addclass_v1_readback");
+      fs.rmSync(re, { recursive: true, force: true });
+      fs.mkdirSync(re, { recursive: true });
+      ffdec(["-selectclass", CLASS, "-export", "script", re, swf]);
+      const back = fs.readFileSync(path.join(re, "scripts", ...CLASS.split(".")) + ".as", "utf8");
+      v.readback_has_added_method = back.includes("SP_CN_P0_AddedMethod");
+      v.readback_has_original_body = back.includes("param1(\"\")") || back.includes("sdkLoginManual");
+      log(`变体 1（加方法）：replace=${replaced} 类数 ${fp.count}（基座 ${baseFp.count}）方法数 ${v.method_count}（基座 ${baseMethods}）回读含新方法=${v.readback_has_added_method}`);
+    }
+    out.variants.push(v);
+  }
+
+  // ── 变体 2：新增类
+  {
+    const asPath = path.join(dir, "v2_add_class.as");
+    const text =
+      origAs +
+      `\nclass SP_CN_P0_AddedClass {\n      public static const TAG:String = "${ADDED_CLASS_TAG}";\n      \n      public function SP_CN_P0_AddedClass() {\n         super();\n      }\n   }\n`;
+    fs.writeFileSync(asPath, text, "utf8");
+    const swf = path.join(WORK, "addclass_v2.swf");
+    let replaced = true;
+    let err = "";
+    try {
+      ffdec(["-replace", D.swfIn, swf, CLASS, asPath]);
+    } catch (e) {
+      replaced = false;
+      err = e.message.split("\n")[0];
+    }
+    const newName = "pinball.channels.dummy.SP_CN_P0_AddedClass";
+    const v = { variant: "v2-add-class", replace_ok: replaced, error: err, new_class_name: newName, swf_bytes: fs.existsSync(swf) ? fs.statSync(swf).size : null };
+    if (replaced) {
+      const r = spawnSync(JAVA, ["-Xmx4g", "-Djava.awt.headless=true", "-jar", FFDEC, "-air", "-onerror", "abort", "-dumpAS3", swf], { encoding: "utf8", maxBuffer: 1 << 28 });
+      const dump = path.join(WORK, "dumpAS3_addclass_v2.txt");
+      fs.writeFileSync(dump, r.stdout || "");
+      const fp = fingerprintClassList(dump);
+      v.class_count = fp.count;
+      v.new_class_added = fp.lines.some(l => l.startsWith(newName + " "));
+      v.tag_in_swf = fs.readFileSync(swf).includes(Buffer.from(ADDED_CLASS_TAG, "utf8"));
+      v.added_lines = fp.lines.filter(l => !baseFp.lines.includes(l)).slice(0, 5);
+      v.missing_lines = baseFp.lines.filter(l => !fp.lines.includes(l)).slice(0, 5);
+      log(`变体 2（加类）：replace=${replaced} 类数 ${fp.count}（基座 ${baseFp.count}）新类出现=${v.new_class_added}`);
+    }
+    out.variants.push(v);
+  }
+
+  // ── 变体 3：以一个**全新类的 FQN**当 scriptName（FFDec 是否允许凭空插一个新类？）
+  {
+    const newFqn = "pinball.channels.dummy.SP_CN_P0_BrandNewClass";
+    const asPath = path.join(dir, "v3_new_class.as");
+    fs.writeFileSync(
+      asPath,
+      `package pinball.channels.dummy\n{\n   public class SP_CN_P0_BrandNewClass\n   {\n      public static const TAG:String = "${ADDED_CLASS_TAG}";\n      \n      public function SP_CN_P0_BrandNewClass()\n      {\n         super();\n      }\n   }\n}\n`,
+      "utf8"
+    );
+    const swf = path.join(WORK, "addclass_v3.swf");
+    let replaced = true;
+    let err = "";
+    try {
+      ffdec(["-replace", D.swfIn, swf, newFqn, asPath]);
+    } catch (e) {
+      replaced = false;
+      err = e.message.split("\n")[0];
+    }
+    const v = { variant: "v3-new-class-own-fqn", new_class_name: newFqn, replace_ok: replaced, error: err, swf_bytes: fs.existsSync(swf) ? fs.statSync(swf).size : null };
+    v.unknown_script_name_rejected = !replaced && /is not recognized as a CharacterId or a script name/.test(err);
+    out.variants.push(v);
+    log(`变体 3（以新类 FQN 当 scriptName）：replace=${replaced}${err ? "  err=" + err.slice(0, 140) : ""}`);
+  }
+
+  fs.writeFileSync(path.join(OUTDIR, "sp-cn-p0-addclass-report.json"), JSON.stringify({ ...out, generated_at: new Date().toISOString() }, null, 2), "utf8");
+  log("附加实验 A 结果:\n" + JSON.stringify(out, null, 2));
+  return out;
+}
+
+/**
+ * 体量边界实验：P6 的登录页要写进**一个方法体**，必须先知道这个容器能装多大。
+ * 做法：构造二进制等价但逐步变长的合法方法体（`pushbyte 0` + `pop` 是栈平衡的无害填充，
+ * 2 B + 1 B = 3 B/对），用同一个 -replace 回填，再重新索引 AVM2 读回真实 code 长度。
+ * 注意：这里测的是「FFDec 汇编器 + ABC 结构」的上限；**真机 AIR 运行时/校验器的上限需真机验证**。
+ */
+function stageBodySize() {
+  step("附加实验 B：方法体体量边界");
+  const idxBase = indexSwfMethods(D.swfIn);
+  const clsParts = CLASS.split(".");
+  const targetName = `${clsParts.slice(0, -1).join(".")}:${clsParts[clsParts.length - 1]}/startLoginServer`;
+  const ref = requireRef(idxBase, targetName);
+  log(`靶方法 ${targetName} → abcIndex=${ref.abcIndex} bodyIndex=${ref.bodyIndex} 基座 code=${ref.codeLen} B`);
+
+  const dir = path.join(WORK, "bodysize");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  ffdec(["-format", "script:pcode", "-selectclass", CLASS, "-export", "script", dir, D.swfIn]);
+  const basePcode = fs.readFileSync(path.join(dir, "scripts", ...CLASS.split(".")) + ".pcode", "utf8");
+  const blk = extractMethodBlock(basePcode, "method", "startLoginServer");
+  const hasLocalcount = /^\s*localcount \d+\s*$/m.test(blk.text);
+  log(`靶方法块 = pcode:${blk.startLine}-${blk.endLine}（含 localcount 行 = ${hasLocalcount}）`);
+
+  const head = blk.text.split(/^\s*code\s*$/m)[0]; // …body 头 + "code" 之前的全部内容
+  const results = [];
+  // pushbyte 0 (2B) + pop (1B) = 3 B/对；另加尾部 returnvoid(1B)
+  const TARGETS = [64, 1024, 8192, 32768, 65536, 262144];
+  for (const want of TARGETS) {
+    const pairs = Math.max(1, Math.floor((want - 1) / 3));
+    const pad = "                                 pushbyte 0\n                                 pop\n".repeat(pairs);
+    const body =
+      head +
+      "                                 getlocal1\n" +
+      "                                 getglobalscope\n" +
+      `                                 pushstring "${PCODE_TAG}"\n` +
+      "                                 call 1\n" +
+      "                                 coerce_a\n" +
+      "                                 pop\n" +
+      pad +
+      "                                 returnvoid\n" +
+      "                              end ; code\n" +
+      "                           end ; body\n" +
+      "                        end ; method\n";
+    const f = path.join(dir, `body_${want}.pcode`);
+    fs.writeFileSync(f, body, "utf8");
+    const swf = path.join(dir, `swf_${want}.swf`);
+    const rec = { want_code_bytes: want, instr_pairs: pairs, pcode_file_bytes: Buffer.byteLength(body) };
+    const t0 = Date.now();
+    try {
+      ffdec(["-replace", D.swfIn, swf, CLASS, f, String(ref.bodyIndex)]);
+      rec.replace_ok = true;
+      rec.seconds = Number(((Date.now() - t0) / 1000).toFixed(1));
+      rec.swf_bytes = fs.statSync(swf).size;
+      const idx2 = indexSwfMethods(swf);
+      const ref2 = requireRef(idx2, targetName);
+      rec.actual_code_bytes = ref2.codeLen;
+      let other = 0;
+      const baseById = new Map(idxBase.refs.map(x => [x.id, x]));
+      for (const b of idx2.refs) {
+        if (b.id === ref2.id) continue;
+        const a = baseById.get(b.id);
+        if (!a || a.codeSha !== b.codeSha || a.methodInfoIndex !== b.methodInfoIndex) other += 1;
+      }
+      rec.other_bodies_changed = other;
+      rec.bodyIndex_unchanged = ref2.bodyIndex === ref.bodyIndex;
+    } catch (e) {
+      rec.replace_ok = false;
+      rec.error = e.message.split("\n")[0].slice(0, 300);
+      rec.seconds = Number(((Date.now() - t0) / 1000).toFixed(1));
+    }
+    log(`体量 ${want} B → replace_ok=${rec.replace_ok} 实际 code=${rec.actual_code_bytes ?? "-"} B 其它方法体变化=${rec.other_bodies_changed ?? "-"}${rec.error ? "  err=" + rec.error : ""}`);
+    results.push(rec);
+  }
+
+  const out = {
+    target_method: targetName,
+    target_abc_index: ref.abcIndex,
+    target_body_index: ref.bodyIndex,
+    base_code_bytes: ref.codeLen,
+    method_block_pcode_lines: `${blk.startLine}-${blk.endLine}`,
+    note: "bodyIndex 是**该类所在那个 DoABC 里 method_body 表的 0 基序号**（不是全局序号）；填充用 pushbyte 0 + pop（3 B/对）",
+    results,
+    generated_at: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(OUTDIR, "sp-cn-p0-bodysize-report.json"), JSON.stringify(out, null, 2), "utf8");
+  log("附加实验 B 结果:\n" + JSON.stringify(out, null, 2));
+  return out;
 }
 
 function stageReplace() {
@@ -442,10 +665,18 @@ function stageVerify(baseListFp) {
   fpOut.newSentinelPresent = afterText.includes(PROBE_SENTINEL);
   fpOut.residualOldBodies = (afterText.match(/param1\(""\)/g) || []).length;
   fpOut.userIdDefaultIntact = afterText.includes('userId = "abcde001"');
+  // 只看 startLoginServer 这一个方法体：必须已经是新调用、且旧调用消失
+  const slsBody = (afterText.match(/public function startLoginServer\([^)]*\)\s*:\s*void\s*\{[^}]*\}/) || [""])[0];
+  fpOut.startLoginServerBody = slsBody.replace(/\s+/g, " ").trim().slice(0, 160);
+  fpOut.startLoginServerBodyOk = slsBody.includes(`param1(${PROBE_TAG})`) && !slsBody.includes('param1("")');
+  const pi = fs.existsSync(D.patchInfo) ? JSON.parse(fs.readFileSync(D.patchInfo, "utf8")) : null;
+  fpOut.expectedResidualOldBodies = pi ? pi.expected_residual : null;
   if (!fpOut.newBodyPresent) failures.push(`回读 AS3 里没有改动后的 startLoginServer 体 param1(${PROBE_TAG})`);
   if (!fpOut.newSentinelPresent) failures.push(`回读 AS3 里没有 static const 的值 "${PROBE_SENTINEL}"`);
-  if (fpOut.residualOldBodies !== 1) failures.push(`param1("") 残留 ${fpOut.residualOldBodies} 处（期望 1：sdkLoginManual 那处未动）`);
-  if (!fpOut.userIdDefaultIntact) failures.push("顺带被改坏了：userId 默认值不再等于 abcde001");
+  if (!fpOut.startLoginServerBodyOk) failures.push(`回读的 startLoginServer 方法体不对：${fpOut.startLoginServerBody}`);
+  if (pi && fpOut.residualOldBodies !== pi.expected_residual) {
+    failures.push(`param1("") 残留 ${fpOut.residualOldBodies} 处（期望 ${pi.expected_residual} = 基座 ${pi.residual_before} 减去改掉的 1 处）`);
+  }
 
   // ── 6b. 类清单（类数 + 逐行）
   const r = spawnSync(JAVA, ["-Xmx4g", "-Djava.awt.headless=true", "-jar", FFDEC, "-air", "-onerror", "abort", "-dumpAS3", D.swfPatched], {
@@ -543,16 +774,24 @@ function stageVerify(baseListFp) {
   return { fpOut, failures, dumpAfter };
 }
 
-function stageApk() {
+/**
+ * 重封 + 对齐 + 签名。默认用路线 A 的 patched.swf；传 opts.swfPath 可换成别的 SWF
+ * （路线 B 用它把 pcode_patched.swf 也走一遍完整链），产物名一并可覆盖，避免互相覆盖。
+ */
+function stageApk(opts = {}) {
+  const src = opts.swfPath || D.swfPatched;
+  const unsigned = opts.unsigned || D.unsigned;
+  const aligned = opts.aligned || D.aligned;
+  const signed = opts.signed || D.signed;
   step("7/8 重封 APK + zipalign + apksigner");
-  const patched = fs.readFileSync(D.swfPatched);
-  const info = rewriteApk(BASE, D.unsigned, MAIN_SWF_IN_APK, patched, UNCOMPRESSED_SWF);
-  log(`重封：保留 ${info.kept} 条，抹掉签名成员 ${info.dropped.length} 条，SWF method=${info.swapMethod}`);
-  run(ZIPALIGN, ["-p", "-f", "4", D.unsigned, D.aligned]);
+  const patched = fs.readFileSync(src);
+  const info = rewriteApk(BASE, unsigned, MAIN_SWF_IN_APK, patched, UNCOMPRESSED_SWF);
+  log(`重封（源 ${path.basename(src)}，${patched.length} B）：保留 ${info.kept} 条，抹掉签名成员 ${info.dropped.length} 条，SWF method=${info.swapMethod}`);
+  run(ZIPALIGN, ["-p", "-f", "4", unsigned, aligned]);
 
   if (!KS) {
     log("未给 --ks：跳过签名，保留 unsigned/aligned 供人工签名");
-    return { info, signedPath: null, verifyOutput: null };
+    return { info, signedPath: null, verifyOutput: null, unsigned, aligned, source: src };
   }
   if (!process.env[KS_PASS_ENV]) throw new Error(`环境变量 ${KS_PASS_ENV} 未设置（keystore 口令只走 env，不入命令行/仓库）`);
   fs.mkdirSync(OUTDIR, { recursive: true });
@@ -565,12 +804,12 @@ function stageApk() {
     "--ks-pass",
     `env:${KS_PASS_ENV}`,
     "--out",
-    D.signed,
-    D.aligned,
+    signed,
+    aligned,
   ]);
-  const v = run(APKSIGNER, ["verify", "--verbose", D.signed]);
+  const v = run(APKSIGNER, ["verify", "--verbose", signed]);
   log("apksigner verify:\n" + (v.stdout || "").trim());
-  return { info, signedPath: D.signed, verifyOutput: (v.stdout || "").trim() };
+  return { info, signedPath: signed, verifyOutput: (v.stdout || "").trim(), unsigned, aligned, source: src };
 }
 
 function buildReport(files, extra) {
@@ -1010,6 +1249,8 @@ function extractMethodBlock(pcodeText, traitKind, traitName) {
 }
 
 const PCODE_TAG = "SP_CN_P0_PCODE_TAG_1";
+const ADDED_METHOD_TAG = "SP_CN_P0_ADDED_METHOD_1";
+const ADDED_CLASS_TAG = "SP_CN_P0_ADDED_CLASS_1";
 
 /**
  * 路线 B 探针：只替换**单个既有方法体**（不改类结构、不重编译整类）。
@@ -1024,7 +1265,7 @@ function stagePcode(baseListFp) {
   const clsPkg = clsParts.slice(0, -1).join(".");
   const targetName = `${clsPkg}:${clsLeaf}/startLoginServer`;
   const ref = requireRef(idxBase, targetName);
-  log(`靶方法 ${targetName} → bodyIndex=${ref.bodyIndex}  code=${ref.codeLen} B  code_sha256=${ref.codeSha.slice(0, 16)}…`);
+  log(`靶方法 ${targetName} → abcIndex=${ref.abcIndex} bodyIndex=${ref.bodyIndex}  code=${ref.codeLen} B  code_sha256=${ref.codeSha.slice(0, 16)}…`);
   if (ref.codeLen > 64) throw new AbcError(`startLoginServer 的字节码异常地长（${ref.codeLen} B），锚点可能已失效`);
 
   step("B2/4 导出整类 pcode 并抽出该方法块");
@@ -1113,6 +1354,7 @@ function stagePcode(baseListFp) {
     abc_tags: idxBase.abcCount,
     method_bodies: idxBase.bodyCount,
     target_method: targetName,
+    target_abc_index: ref.abcIndex,
     target_body_index: ref.bodyIndex,
     base_code_sha256: ref.codeSha,
     patched_code_sha256: targetAfter.codeSha,
@@ -1121,6 +1363,7 @@ function stagePcode(baseListFp) {
     other_bodies_changed: changed.length,
     other_bodies_changed_examples: changed.slice(0, 10),
     class_count_unchanged: listPc.count === baseListFp.count && listPc.sha256 === baseListFp.sha256,
+    class_list_sha256: listPc.sha256,
     patched_swf: { path: swfPcode, sha256: sha256File(swfPcode), bytes: fs.statSync(swfPcode).size },
   };
   log("P-code 路线断言结果:\n" + JSON.stringify(fpOut, null, 2));
@@ -1128,6 +1371,22 @@ function stagePcode(baseListFp) {
     console.error("FAIL P-code 路线断言未通过：");
     for (const f of failures) console.error("  - " + f);
     process.exit(1);
+  }
+  // 可选：把这条路线也走完整链（重封 → 对齐 → 签名），产物名与路线 A 区分开
+  if (args.apk === true || args.apk === "true") {
+    fpOut.apk = stageApk({
+      swfPath: swfPcode,
+      unsigned: path.join(WORK, "pcode_unsigned.apk"),
+      aligned: path.join(WORK, "pcode_aligned.apk"),
+      signed: path.join(OUTDIR, "sp-cn-p0-pcode.apk"),
+    });
+    fpOut.apk = {
+      signed: fpOut.apk.signedPath ? { path: fpOut.apk.signedPath, sha256: sha256File(fpOut.apk.signedPath), bytes: fs.statSync(fpOut.apk.signedPath).size } : null,
+      entries_kept: fpOut.apk.info.kept,
+      signature_members_dropped: fpOut.apk.info.dropped,
+      swf_method: fpOut.apk.info.swapMethod,
+      apksigner_verify: fpOut.apk.verifyOutput,
+    };
   }
   fs.writeFileSync(path.join(OUTDIR, "sp-cn-p0-pcode-report.json"), JSON.stringify({ ...fpOut, failures: [], generated_at: new Date().toISOString() }, null, 2), "utf8");
   return fpOut;
@@ -1147,6 +1406,20 @@ function main() {
     if (!fs.existsSync(D.swfIn)) stageExtract();
     const fpBase = fs.existsSync(D.dumpBase) ? fingerprintClassList(D.dumpBase) : stageDumpBase();
     stagePcode(fpBase);
+    log(`DONE 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+
+  if (STAGE === "addclass") {
+    if (!fs.existsSync(D.swfIn)) stageExtract();
+    stageAddClass();
+    log(`DONE 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+
+  if (STAGE === "bodysize") {
+    if (!fs.existsSync(D.swfIn)) stageExtract();
+    stageBodySize();
     log(`DONE 用时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     return;
   }
