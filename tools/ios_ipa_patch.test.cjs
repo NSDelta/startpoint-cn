@@ -148,7 +148,10 @@ test("zip rewrite preserves entry attributes and payloads round-trip", async () 
     const reparsed = readZipEntries(rewritten)
     assert.equal(reparsed.length, 1)
     assert.deepEqual(readEntryData(reparsed[0]), patchedPayload)
-    // 属性逐项保持——这是 AltStore 拒装 `jar uf0` 产物的根因
+    // 属性逐项保持——纯 Node 回写（lib/zip-ipa.mjs）会原样搬运这些字段。
+    // 注：任务书曾把这里写成「AltStore 拒装 jar uf0 产物的根因」，P10-A 实测**未复现**该现象
+    //（B0 的 jar 产物与官方件逐条比对 3568 个 entry 的 method/madeBy/externalAttr/时间戳差异为 0），
+    // 所以这条断言只保证「我们自己不回退属性」，不声称修好了 AltStore。
     assert.equal(reparsed[0].method, 8)
     assert.equal(reparsed[0].versionMadeBy, 0x1300)
     assert.equal(reparsed[0].externalAttr, 0x81ed0000)
@@ -160,7 +163,7 @@ test("zip rewrite preserves entry attributes and payloads round-trip", async () 
 test("patch CLI refuses to run without an explicit host", async () => {
     const { spawnSync } = require("node:child_process")
     const path = require("node:path")
-    const cli = path.join(__dirname, "..", "client-patch", "build", "patch-ios-ipa.mjs")
+    const cli = path.join(__dirname, "..", "client-patch", "build", "patch-ipa.mjs")
     const result = spawnSync(process.execPath, [cli, "--ipa", __filename, "--out", "out/nope.ipa"], {
         cwd: path.join(__dirname, ".."),
         encoding: "utf8",

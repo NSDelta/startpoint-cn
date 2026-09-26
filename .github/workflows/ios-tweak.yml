@@ -1,0 +1,113 @@
+# ios-tweak.yml —— 构建 SpLogin.dylib / .deb（P10-B）
+#
+# 为什么必须在 CI 上编译：本机（Windows）没有 make/clang/ldid，也没有 WSL 发行版。
+# 官方包注入线（P10-A）与越狱安装线（本文件）都只能在这里出产物。
+#
+# ⚠️ [未验证-CI] 本工作流**一次都没有真正跑过**：这个仓库不允许 push（派工总表 §5 黑名单），
+#    所以它只做过 YAML 语法检查。首跑时最可能出问题的地方按概率排序：
+#      1. Theos 的 theos 目录克隆分支名（master）与 makefiles 路径假设；
+#      2. `chmod +x layout/DEBIAN/*` —— Windows 检出物没有可执行位，dpkg-deb 会拒包；
+#      3. rootless 方案下 Theos 的安装前缀（/var/jb）与 control 里的 Architecture 字段；
+#      4. ldid 是否在 PATH 里（brew 装的 ldid 有时需要 `brew link`）。
+#    真跑通之后请把本注释改成 [已验证-CI] 并附 run URL。
+#
+# 地址注入：默认用 hygiene 白名单占位 192.168.1.10:8001（**不是**任何真实机器）。
+# 真实地址只能从 workflow_dispatch 的输入传进来，且**绝不写进仓库文件**。
+
+name: ios-tweak
+
+on:
+  workflow_dispatch:
+    inputs:
+      sp_login_host:
+        description: "自建服务地址 host:port（默认是白名单占位值，真机请填你自己的）"
+        required: false
+        default: "192.168.1.10:8001"
+  push:
+    paths:
+      - "ios/tweak/**"
+      - ".github/workflows/ios-tweak.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.scheme || 'rootful' }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # rootless = Dopamine / 无根越狱（服主那台 iPhone 7 Plus / iOS 15.8.3 走这个）
+        scheme: ["rootless", ""]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 环境信息（取证）
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version || true
+          uname -m
+
+      - name: 安装 ldid
+        run: |
+          set -euo pipefail
+          brew install ldid
+          which ldid || brew link --overwrite ldid
+          ldid -h >/dev/null || true
+
+      - name: 克隆 Theos
+        run: |
+          set -euo pipefail
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: 可执行位（Windows 检出物没有）
+        run: |
+          set -euo pipefail
+          chmod +x ios/tweak/layout/DEBIAN/postinst ios/tweak/layout/DEBIAN/prerm
+
+      - name: make（编译 SpLogin.dylib）
+        working-directory: ios/tweak
+        env:
+          SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+        run: |
+          set -euo pipefail
+          echo "SP_LOGIN_HOST=$SP_LOGIN_HOST"
+          if [ -n "${{ matrix.scheme }}" ]; then
+            export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
+          fi
+          make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST"
+
+      - name: make package（打成 .deb）
+        working-directory: ios/tweak
+        env:
+          SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.scheme }}" ]; then
+            export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
+          fi
+          make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST"
+
+      - name: 产物清单（取证）
+        working-directory: ios/tweak
+        run: |
+          set -euo pipefail
+          ls -l .theos/obj 2>/dev/null || true
+          ls -l packages 2>/dev/null || true
+          for deb in packages/*.deb; do
+            echo "== $deb"
+            dpkg-deb -I "$deb" || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sp-login-${{ matrix.scheme || 'rootful' }}
+          path: |
+            ios/tweak/packages/*.deb
+            ios/tweak/.theos/obj/SpLogin.dylib
+          if-no-files-found: error
+          retention-days: 30

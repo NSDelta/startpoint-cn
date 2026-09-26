@@ -126,6 +126,21 @@ const schemaColumns = {
         column: "takeover_udid",
         definition: "TEXT DEFAULT NULL",
     },
+    "accounts.bind_state": {
+        table: "accounts",
+        column: "bind_state",
+        definition: "TEXT NOT NULL DEFAULT 'active'",
+    },
+    "accounts.bind_platform": {
+        table: "accounts",
+        column: "bind_platform",
+        definition: "TEXT DEFAULT NULL",
+    },
+    "accounts.bind_uid": {
+        table: "accounts",
+        column: "bind_uid",
+        definition: "TEXT DEFAULT NULL",
+    },
     "players_characters_mana_nodes.awake_level": {
         table: "players_characters_mana_nodes",
         column: "awake_level",

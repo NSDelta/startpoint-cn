@@ -11,6 +11,7 @@ import { ensureSchemaColumn } from "../schema";
 import { initializeServerNewsSchemaSync } from "../schema/server-news";
 import { initializeServerGiftsSchemaSync } from "../schema/server-gifts";
 import { initializePlayerFollowsSchemaSync } from "../schema/player-follows";
+import { initializeAccountBindingSchemaSync } from "../schema/account-binding";
 import { pruneSpecialEventPartyGroupsSync } from "../../lib/party-group-persistence";
 import { getRealNow } from "../../runtime/time/game-time";
 
@@ -89,6 +90,12 @@ export default function init(
     ensureSchemaColumn(database, "accounts.cleanup_state")
     ensureSchemaColumn(database, "accounts.takeover_password_hash")
     ensureSchemaColumn(database, "accounts.takeover_udid")
+    ensureSchemaColumn(database, "accounts.bind_state")
+    ensureSchemaColumn(database, "accounts.bind_platform")
+    ensureSchemaColumn(database, "accounts.bind_uid")
+
+    // binding tables reference accounts, so they are created after it
+    initializeAccountBindingSchemaSync(database)
 
     database.prepare(`CREATE TABLE IF NOT EXISTS account_cleanup_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
