@@ -399,6 +399,7 @@ async function main() {
     const state = {
         fingerprintBefore: null,
         fingerprintAfter: null,
+        swfSha256Before: null,
         rewrite: null,
         route: "abc-pair",
         hookActive: false,
@@ -523,6 +524,9 @@ async function main() {
         unwrapped.logical.length === (unwrapped.magic === "FWS" ? state.swfBefore.length : unwrapped.declaredFileLength),
         `${unwrapped.logical.length} B（头部声明 ${unwrapped.declaredFileLength} B）`)
 
+    // sha256 必须**当场**算：applyApiBaseRewrite 可能就地改写传入的 Buffer（实测 FWS 分支就是就地改的），
+    // 到写报告时再算「改写前」哈希只会得到「改写后」的值 —— 报告会自相矛盾还看不出问题。
+    state.swfSha256Before = sha256Hex(unwrapped.logical)
     state.fingerprintBefore = siteFingerprint(unwrapped.logical)
     console.log(`  站点指纹(前)：offset=${state.fingerprintBefore.pairOffsetHex} 出现=${state.fingerprintBefore.pairOccurrences}`
         + ` 字节=${state.fingerprintBefore.pairTotalBytes} scheme=${state.fingerprintBefore.schemeCount} host=${state.fingerprintBefore.hostCount}`)
@@ -604,6 +608,9 @@ async function main() {
             `${unwrapped.logical.length} → ${logical.length} B`)
         assertions.check("改写字节数 = 计划范围", (state.rewrite.diffRanges || []).length > 0,
             hexRanges(state.rewrite.diffRanges, 4))
+        // 防「派生件静默丢补丁」：字节没变却一路 PASS，是这类产线最危险的失效模式。
+        assertions.check("主 SWF 字节确实变了（防静默丢补丁）", sha256Hex(logical) !== state.swfSha256Before,
+            `${state.swfSha256Before} → ${sha256Hex(logical)}`)
     }
 
     state.fingerprintAfter = dryRun && rewrote === false && state.route === "abc-pair"
@@ -711,6 +718,7 @@ async function main() {
             copyFileSync(alignedPath, out)
             console.log(`  已交出未签名产物：${out}`)
             if (requireSignature) {
+                console.error(`Error: --require-signature 要求产物必须已签名，但${signReason}。`)
                 assertions.check("产物已签名（--require-signature）", false, signReason)
                 return finish(2)
             }
@@ -743,7 +751,7 @@ async function main() {
                 logicalBytesAfter: state.logicalBytesAfter,
                 entryBytesBefore: state.swfBefore.length,
                 entryBytesAfter: state.swfAfter ? state.swfAfter.length : null,
-                sha256Before: sha256Hex(state.unwrapped.logical),
+                sha256Before: state.swfSha256Before,
                 sha256After: state.logicalBytesAfter === null ? null : sha256Hex(state.swfAfter),
             } : null,
             siteFingerprint: { before: state.fingerprintBefore, after: state.fingerprintAfter },
@@ -780,7 +788,7 @@ async function main() {
                 signerCertificateDN: state.certs,
             },
             output: readOutput(),
-            assertions: assertions.list,
+            assertions: { passed: assertions.passed.length, failed: assertions.failed.length, list: assertions.list },
             warnings,
             unverified,
         }

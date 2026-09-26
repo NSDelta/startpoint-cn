@@ -107,7 +107,7 @@ async function buildFixtureApk(zip, dir, { encoding = "fws" } = {}) {
     add("META-INF/1.RSA", Buffer.alloc(64, 3))
     // 这两个是 Play/Oppo 的市场元数据，不是签名件 —— 产线绝不许摘掉它们
     add("META-INF/com.android.tools.metadata/drm/com.google.play/metadata.bin", Buffer.alloc(134, 9), 0, 0x300, 0x81a40000)
-    const file = path.join(dir, "base.apk")
+    const file = path.join(dir, `base-${encoding}.apk`)
     fs.writeFileSync(file, zip.writeZipEntries(entries))
     return { file, entries, mainSwf, logical, worker }
 }
@@ -322,14 +322,17 @@ test("缺凭据时产出未签名 APK 并明确报「未签名（缺凭据）」
     assert.match(report.signing.reason, /未签名（缺凭据）/)
     assert.equal(report.signing.verify, null)
     assert.equal(report.ok, true, "未签名默认不算失败（除非 --require-signature）")
-    assert.equal(report.assertions.failed.length, 0, JSON.stringify(report.assertions.failed))
+    assert.equal(report.assertions.failed, 0, JSON.stringify(report.assertions.list.filter(item => !item.ok)))
     assert.ok(report.unverified.some(line => /签名与安装/.test(line)), "未验证项里必须挂上签名/装机这一条")
 })
 
 test("--require-signature 把「未签名」升级为硬失败（退出码 2）", () => {
     const result = run(baseArgs("require", ["--require-signature"]))
     assert.equal(result.status, 2)
-    assert.match(String(result.stderr || result.stdout), /已签名|未签名/)
+    assert.match(String(result.stderr) + String(result.stdout), /未签名（缺凭据）/)
+    const report = readReport(out("require.apk"))
+    assert.equal(report.ok, false)
+    assert.ok(report.assertions.failed >= 1, "断言里必须记一条失败")
 })
 
 // ───────────────────────── 4. 报告结构与地址落盘 ─────────────────────────
@@ -360,6 +363,8 @@ test("构建报告结构齐备，host/port 真的落到 SWF 里（站点前后�
     assert.equal(report.swf.swfVersion, 44)
     assert.equal(report.swf.logicalBytesBefore, fx.fws.logical.length)
     assert.equal(report.swf.logicalBytesAfter, fx.fws.logical.length, "33 B 成对改写必须长度守恒")
+    assert.notEqual(report.swf.sha256Before, report.swf.sha256After,
+        "改写前后哈希必须不同 —— applyApiBaseRewrite 会就地改写 Buffer，惰性计算会把改写后的值当成改写前的")
 
     // 站点指纹前后对照
     assert.equal(report.siteFingerprint.before.hostCount, 1)
@@ -448,7 +453,7 @@ test("给了 keystore + 口令环境变量时走完整签名链，并把 verify 
     assert.equal(report.signing.verify.ok, true)
     assert.match(report.signing.signerCertificateDN, /StartPoint CN Launcher/)
     assert.equal(JSON.stringify(report).includes("fixture-passphrase"), false, "口令绝不进报告")
-    assert.equal(report.assertions.failed.length, 0, JSON.stringify(report.assertions.failed))
+    assert.equal(report.assertions.failed, 0, JSON.stringify(report.assertions.list.filter(item => !item.ok)))
     assert.equal(fs.readFileSync(target).includes(Buffer.from("SPCN-FAKE-SIGNATURE")), true)
 })
 
