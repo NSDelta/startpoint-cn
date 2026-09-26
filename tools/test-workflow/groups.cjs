@@ -460,6 +460,7 @@ const TEST_GROUPS = Object.freeze({
             "tools/account_binding.test.cjs",
             "tools/sp_auth.test.cjs",
             "tools/bind_gate.test.cjs",
+            "tools/ios_notice_code.test.cjs",
             "tools/follow_routes.test.cjs",
             "tools/stamina_serialization.test.cjs",
             "tools/sql_write_shape.test.cjs",
