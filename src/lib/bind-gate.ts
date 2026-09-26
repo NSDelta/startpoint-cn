@@ -49,8 +49,9 @@ export const BIND_GATE_AUDIT_ACTOR = "bind-gate"
 /** iOS 客户端固定发送的 dummy udid（任务卡 §2 真机实测；Android 不这样发）。 */
 export const IOS_DUMMY_UDID = "10000001"
 
-/** iOS 侧 UA 特征：AdobeAIR（AIR 打包）/ CFNetwork（原生网络栈）；大小写不敏感。 */
-export const IOS_USER_AGENT_HINTS = ["adobeair", "cfnetwork"] as const
+/** iOS 侧 UA 特征：`iOS;`（本仓既有判据，见 `src/utils.ts:156` 的 `getRequestPlatformSync`）/
+ * AdobeAIR（AIR 打包）/ CFNetwork（原生网络栈）；大小写不敏感。 */
+export const IOS_USER_AGENT_HINTS = ["ios;", "adobeair", "cfnetwork"] as const
 
 /** iOS 没有验证码界面（I1b 未决）⇒ 只能人工绑定；这行给服主看的。 */
 export const IOS_MANUAL_BIND_HINT =
@@ -138,11 +139,22 @@ export function reportBindGateMode(env: NodeJS.ProcessEnv = process.env): BindGa
 
 export type BindGateClient = "ios" | "android"
 
-/** `udid` 头是 dummy 或 UA 命中 AdobeAIR/CFNetwork ⇒ iOS。身份键永远用 `body.device_id`。 */
-export function resolveBindGateClient(input: { udid?: string | null; userAgent?: string | null }): BindGateClient {
+/**
+ * 平台判定（**只影响日志与 iOS 提示，不影响放行/拒绝**）：
+ *  ① `udid` 头 == dummy `10000001`（任务卡 §2 真机实测）；
+ *  ② UA 命中 `iOS;` / `AdobeAIR` / `CFNetwork`；
+ *  ③ `requestedby: ios` 头（`src/utils.ts:160` 既有判据）。
+ * 身份键永远是 `body.device_id`，这里判错也不会改变判定结果。
+ */
+export function resolveBindGateClient(input: {
+    udid?: string | null
+    userAgent?: string | null
+    requestedBy?: string | null
+}): BindGateClient {
     if ((input.udid ?? "").trim() === IOS_DUMMY_UDID) return "ios"
     const userAgent = (input.userAgent ?? "").toLowerCase()
     if (IOS_USER_AGENT_HINTS.some((hint) => userAgent.includes(hint))) return "ios"
+    if ((input.requestedBy ?? "").trim().toLowerCase() === "ios") return "ios"
     return "android"
 }
 
@@ -241,6 +253,8 @@ export interface BindGateInput {
     readonly udid?: string | string[] | null
     /** `request.headers["user-agent"]` 原值。 */
     readonly userAgent?: string | string[] | null
+    /** `request.headers["requestedby"]` 原值（iOS 判据之一，见 `src/utils.ts:160`）。 */
+    readonly requestedBy?: string | string[] | null
     /** env 注入点；缺省 `process.env`。 */
     readonly env?: NodeJS.ProcessEnv
     /** 直接给配置（优先于 `env`），测试用。 */
@@ -283,7 +297,7 @@ export function evaluateBindGate(input: BindGateInput, deps: BindGateDeps = {}):
     const config = input.config ?? resolveBindGateConfig(input.env ?? process.env)
     const udid = firstHeaderValue(input.udid)
     const userAgent = firstHeaderValue(input.userAgent)
-    const client = resolveBindGateClient({ udid, userAgent })
+    const client = resolveBindGateClient({ udid, userAgent, requestedBy: firstHeaderValue(input.requestedBy) })
     const shared = { client, udid, userAgent, exemptToken: null, config } as const
 
     // ① 开关关：在读任何表之前返回（逐字节一致 + 零额外开销）。

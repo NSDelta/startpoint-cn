@@ -92,6 +92,7 @@ const routes = async (fastify: FastifyInstance) => {
             deviceId,
             udid: request.headers["udid"],
             userAgent: request.headers["user-agent"],
+            requestedBy: request.headers["requestedby"],
         });
         if (!bindGate.allow) {
             recordBindGateRejection(bindGate);
