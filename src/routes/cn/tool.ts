@@ -8,6 +8,7 @@ import { saveAccountDefaultPlayer } from "../../data/activeAccount";
 import { getAccountIdentityProvider } from "../../lib/account-identity-provider";
 import { isGiftCodeEnabledSync } from "../../lib/gift-code/capability";
 import { getRealNow, getRealNowMs } from "../../runtime/time/game-time";
+import { buildBindGateRejection, evaluateBindGate, recordBindGateRejection } from "../../lib/bind-gate";
 
 interface CnSignupBody {
     device_id: number;
@@ -84,6 +85,20 @@ const routes = async (fastify: FastifyInstance) => {
 
         // Device binding: each device gets its own account
         const binding = getDeviceBindingSync(deviceId)
+
+        // P4 绑定闸门（契约 C3）：必须卡在下面「已知设备 → 复用 binding 账号」分支之前，
+        // 否则 pending（已发码未绑定）账号会被它直接放行。开关缺省关 ⇒ 此处零开销旁路。
+        const bindGate = evaluateBindGate({
+            deviceId,
+            udid: request.headers["udid"],
+            userAgent: request.headers["user-agent"],
+            requestedBy: request.headers["requestedby"],
+        });
+        if (!bindGate.allow) {
+            recordBindGateRejection(bindGate);
+            reply.header("content-type", "application/x-msgpack");
+            return reply.status(200).send(buildBindGateRejection(bindGate));
+        }
 
         if (binding) {
             // Known device — verify account still exists
