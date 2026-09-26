@@ -89,14 +89,27 @@ SDK 用 `%@sdk_v3/get_notice.do` 在运行时拼基址，静态无法确定基�
   - 有码：`服务器绑定验证码：<code> … 把它发给 QQ 群里的 bot（/bind <code>）即完成绑定`
   - 无码：`请先在 QQ 群里向 bot 发送 /bind 获取绑定流程，或联系服主人工绑定。`
 
-> ⚠ **当前接缝未闭合**：`provideCode` 是注入项（`src/routes/cn/ios-leiting.ts:431,441`），
-> 而注册处 `src/cn-server.ts:353` 只传了 `{ ios: config.iosCompat }`，**没有注入码提供者**
-> ⇒ 真机上玩家看到的是**兜底文案，不是 6 位码**。插件自己在启动日志里也报这件事：
-> `provideCode=${noticeOptions.provideCode ? "injected" : "fallback-text"}`
-> （`src/routes/cn/ios-leiting.ts:805`）。注入同源实现的位置就是注册处，
-> 同源实现在 `src/lib/signup-code.ts`（说明见 `src/routes/cn/ios-leiting.ts:426-431`）。
-> **结论：iOS 自助绑定码入口待 P10-B 的 `provideCode` 注入上线后才生效**；
-> 在那之前 iOS 玩家拿不到码，只能走下一节的 R3 人工绑定或群里 bot 的 `/bind`。
+> ✅ **接缝已闭合**：注册处 `src/cn-server.ts:354-364` 已注入码提供者
+> `createIosNoticeCodeProvider()`（实现见 `src/lib/ios-notice-code.ts`），
+> 插件启动日志相应变成 `provideCode=injected`（`src/routes/cn/ios-leiting.ts:805`）。
+>
+> 提供者的语义（改之前先读 `src/lib/ios-notice-code.ts` 顶部注释）：
+>
+> 1. **账号解析与绑定闸门同源**：直接复用 `resolveBindGateSubject`
+>    （`src/lib/bind-gate.ts:195`），即「先 `device_bindings` 再未过期的 `device_grants`」。
+>    刻意不另写一套只查 `device_grants` 的窄解析 —— 否则会出现「闸门认得出这个设备、
+>    公告却查不到人」的不一致（P2 之前的存量玩家只有 `device_bindings`）。
+> 2. **反复打开公告不换码**：顺序永远是「先取活码
+>    （`activeCodeViewForAccount`，`src/lib/signup-code.ts:81`），取不到才发新码」。
+>    若每次请求都 `issueSignupCode`，玩家刚看到的码会立刻失效（CC-1 的 60 秒窗口
+>    不足以救这个场景）。
+> 3. **查不到人不抛错**：`provideCode` 返回 `null` ⇒ 回兜底文案；
+>    内部异常也收成 `null` + 日志，绝不让玩家看到 5xx。
+> 4. **已绑定 / 已封禁不发码**：`outcome` 为 `already_bound` 时回兜底文案
+>    （已绑定玩家不需要新码），`account_disabled` 同理。
+>
+> **未做真机验证**：上述是服务端行为，真机是否真的弹出公告并渲染出 6 位码，
+> 仍取决于 SDK 读取哪个字段（见下方「公告字段是猜的」）。
 
 ### ④ 其余裸路由
 
@@ -177,8 +190,9 @@ iOS 客户端**没有界面显示/输入验证码**（iOS/安卓 SWF 的 ABC 已
 3. 后台用绑定控制面**人工建绑定**
 
 第 3 步使用的接口与状态机见[自研账号与账号绑定](./client-binding.md)（`/api/bindings/*`）。
-公告通道一旦注入 `provideCode`（见上节接缝说明），玩家就能在游戏原生弹窗里直接看到 6 位码，
-届时可降级为 bot 自助绑定；在那之前「游戏里看码」这条路**只是探针目标，不是可用功能**。
+公告通道已注入 `provideCode`（见上节），服务端会把该设备的 6 位绑定码写进公告文案，
+玩家可在游戏原生弹窗里直接看到，再发给群里 bot 的 `/bind <code>` 完成自助绑定。
+R3 人工绑定仍是兜底路径（查不到设备、账号已绑定、或真机上公告文案没被 SDK 渲染出来时）。
 
 ## 边界与未验证项
 
@@ -194,6 +208,9 @@ iOS 客户端**没有界面显示/输入验证码**（iOS/安卓 SWF 的 ABC 已
   并被识别成 `client="ios"` 而多打一行「走 R3 人工绑定」的中文提示
   （`src/lib/bind-gate.ts:57-58`、`:140-163`、`:465`）。分流只影响日志与提示，不影响判定。
   细节见[自研账号与账号绑定](./client-binding.md)的闸门一节。
-- **iOS 的「自助」验证码入口还没生效**：闸门拦下后的正规出路是公告通道显示 6 位码，
-  但那取决于 `provideCode` 注入（上一节 ⚠）。在它上线前，iOS 玩家只有两条路：
-  群里给 bot 发 `/bind`，或走 R3 人工绑定。
+- **iOS 的「自助」验证码入口已接通服务端**：闸门拦下后玩家打开公告即可看到 6 位码，
+  路径 = 游戏原生公告弹窗 → 群里 bot 的 `/bind <code>`。
+  提供者的实现与语义见上节（`src/lib/ios-notice-code.ts`），单测见
+  `tools/ios_notice_code.test.cjs`。**真机是否真的显示该码仍未经确认**
+  （公告触发时机与字段名都是推断，见上一节）；真机确认前，R3 人工绑定与
+  群里 bot 的 `/bind` 仍是可靠出路。

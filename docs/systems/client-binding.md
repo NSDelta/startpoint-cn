@@ -359,8 +359,10 @@ HTTP 状态**恒为 200**，响应体走游戏服务路由族一贯的 msgpack
 
 - 绑定闸门 517 已实现（见上节）；`.env.example` 里 `BIND_GATE_ENABLED=1` 是**默认值**，
   但代码缺省是 0 —— 换部署环境时忘了带这个变量，就等于闸门关着。
-- iOS 的**自助**验证码入口还没通：公告通道的 `provideCode` 注入待 P10-B 上线，
-  在那之前 iOS 只能走 R3 人工绑定（详见 [iOS 客户端接入](./ios-client.md)）。
+- iOS 的**自助**验证码入口已接通：公告通道注入了 `provideCode`
+  （`src/lib/ios-notice-code.ts`，注册处 `src/cn-server.ts:354-364`），
+  iOS 玩家在游戏原生公告弹窗里能看到该设备的 6 位码，再发 `/bind <code>` 给 bot。
+  R3 人工绑定仍是查不到设备 / 已绑定时的兜底（详见 [iOS 客户端接入](./ios-client.md)）。
 - 平台只有 `qq` / `kook`；新增平台要同时改 `src/data/types.ts:931` 与
   `src/data/domains/account-binding.ts:39` 的白名单，并补 C7 话术。
 - iOS 客户端的绑定路径与人机流程见 [iOS 客户端接入](./ios-client.md)；
