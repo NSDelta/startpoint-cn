@@ -95,6 +95,8 @@ SDK 用 `%@sdk_v3/get_notice.do` 在运行时拼基址，静态无法确定基�
 > `provideCode=${noticeOptions.provideCode ? "injected" : "fallback-text"}`
 > （`src/routes/cn/ios-leiting.ts:805`）。注入同源实现的位置就是注册处，
 > 同源实现在 `src/lib/signup-code.ts`（说明见 `src/routes/cn/ios-leiting.ts:426-431`）。
+> **结论：iOS 自助绑定码入口待 P10-B 的 `provideCode` 注入上线后才生效**；
+> 在那之前 iOS 玩家拿不到码，只能走下一节的 R3 人工绑定或群里 bot 的 `/bind`。
 
 ### ④ 其余裸路由
 
@@ -188,5 +190,10 @@ iOS 客户端**没有界面显示/输入验证码**（iOS/安卓 SWF 的 ABC 已
 - **公告触发时机未知**：`get_notice.do` 可能只在登录后或特定场景被请求。
 - **IPA 补丁的长度预算**：Mach-O 中的 API authority 只有约 26 bytes
   （`.env.example`「iOS 实验性兼容」一节），过长域名写不进去。
-- **绑定闸门（517）当前未实现**，iOS/Android 的闸门分流日志因此也还不存在；
-  契约见[自研账号与账号绑定](./client-binding.md)的闸门一节。
+- **绑定闸门（517）已实现**：iOS 设备同样会被 `src/routes/cn/tool.ts:89-101` 拦下，
+  并被识别成 `client="ios"` 而多打一行「走 R3 人工绑定」的中文提示
+  （`src/lib/bind-gate.ts:57-58`、`:140-163`、`:465`）。分流只影响日志与提示，不影响判定。
+  细节见[自研账号与账号绑定](./client-binding.md)的闸门一节。
+- **iOS 的「自助」验证码入口还没生效**：闸门拦下后的正规出路是公告通道显示 6 位码，
+  但那取决于 `provideCode` 注入（上一节 ⚠）。在它上线前，iOS 玩家只有两条路：
+  群里给 bot 发 `/bind`，或走 R3 人工绑定。

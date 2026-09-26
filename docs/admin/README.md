@@ -54,6 +54,8 @@ Server Bundle 始终打包完整 `web/dist/`，manifest 固定为 `admin.require
 
 绑定管理页的路由是 `/admin/bindings`（菜单名「账号绑定」，源码 `admin/src/pages/Bindings.tsx`）。它只通过共享 API 客户端访问服务端——`apiGet`（`admin/src/pages/Bindings.tsx:131`、`:141`）、`apiPost`（`:152`、`:169`、`:187`、`:201`）和 `apiDelete`（`:178`），页面内没有 SQLite、没有裸 `fetch`、也不引用 bot 接口；解绑是破坏性操作，必须经二次确认（`admin/src/pages/Bindings.tsx:369-382`）。这页提供的操作与[自研账号与账号绑定](../systems/client-binding.md)里的绑定状态机一一对应：新增绑定只建非主绑定，主绑定迁移走独立的设主操作，解绑主绑定是管理员独有的路径。
 
+玩家被绑定闸门挡在门外时，后台是排查入口：网关拒绝会以 `action="gate_reject"` 写进 `bind_audit`（`src/lib/bind-gate.ts:474-492`，actor 固定为 `bind-gate`），并在服务端日志留一行 `event:"bind_gate_reject"`；其中 `code=BIND_REQUIRED` 表示还没绑上（让玩家去登录页或 bot 取码），`code=ACCOUNT_DISABLED` 表示账号被停用，要在这页或账号页改状态。闸门本身没有后台开关——它只认进程环境变量 `BIND_GATE_ENABLED`（见 [`.env.example`](../../.env.example) 的「账号绑定闸门」一节），改完要重启服务端。
+
 ## 运行时游戏设置
 
 数据库 schema 8 增加单例表 `server_gameplay_settings`。这类设置属于运行中的游戏规则，不属于进程监听、文件目录或 CDN 拓扑，因此由管理后台持久化，保存后无需重启服务。

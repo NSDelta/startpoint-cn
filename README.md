@@ -141,7 +141,22 @@ npm run build
 bash client-patch/apply.sh <AS3_EXPORT_DIR> <SERVER_HOST>:8001
 ```
 
-完整步骤见[客户端补丁说明](./client-patch/README.md)。
+也可以走仓库内的产线，一条命令把官方 APK 打成可安装产物（地址经 `--host/--port` 传入，
+**编译期常量**，换服务器 = 改一处 + 重新构建一次；每次出包留一份构建报告）：
+
+```bash
+node client-patch/build/build-client.mjs \
+  --base apkipa/V1.8.1.apk --host <SERVER_HOST> --port 8001 --out out/sp-cn.apk
+```
+
+要让自研客户端与官方（或他人服务器的）客户端**同机共存**，用
+`node client-patch/tools/rename-package.mjs --in <apk> --out <apk> --package <等长包名>`
+改成等长包名（AIR 存档按应用 id 隔离，新包 = 全新存档）。
+
+客户端有两个版本：**免登录版**（跳过官方登录，直接连本服）与**注册验证码版**（带上自研登录页，
+玩家自己注册、页面显示 6 位验证码，用码完成 QQ/KOOK 绑定后才能进游戏 —— 绑定前服务端会返回
+`result_code = 517`，见 [账号绑定与闸门](./docs/systems/client-binding.md)）。登录页 AS3 尚在
+P6 包里，构建口径与当前状态见[客户端补丁说明](./client-patch/README.md)。
 
 ## 项目结构
 

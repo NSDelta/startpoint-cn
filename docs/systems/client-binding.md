@@ -226,24 +226,98 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 bot 侧的对接契约（含 `SP_BOT_TOKEN` / `BOT_API_TOKEN` 别名关系）在 bot 仓库的
 `startpoint-cn-bot/CONTRACT.md`，tag `baseline-bot-v0`。
 
-## 绑定闸门（HTTP 517）—— ⚠ P4 未合并
+## 绑定闸门（HTTP 517）
 
-**本节描述的是已冻结契约，但当前 dev 顶端（`d8dd8b1a`）没有实现。**
-`src/lib/bind-gate.ts` 不存在，全仓 grep `BIND_GATE_ENABLED` / `sp_binding` 无命中；
-唯一叫 `BIND_REQUIRED` 的东西是上面登录响应里的**账号态**错误码
-（`src/lib/sp-auth/login.ts:97,106`），与本节闸门无关。契约原文见
-`D:\wfcnmod\分工文档-自研登录页与账号绑定.md` §3.3。
+owner：P4。实现 `src/lib/bind-gate.ts`（524 行），拦截面 `src/routes/cn/tool.ts`。
 
-约定（owner：P4）：
+### 拦在哪一步
 
-- **拦截面**：`src/routes/cn/tool.ts` 的「已知设备」分支之后、`insertDeviceBindingSync` 之前。
-- **开闸形态**：HTTP 200 + `data_headers.result_code = 517`
-  + `data_headers.sp_binding = {ok:false, code:"BIND_REQUIRED", …}`。
-- **517 是新值**：516 已被 `src/lib/takeover-access.ts` 占用，不要复用。
-- **开关**：`BIND_GATE_ENABLED`，**代码默认 0**；关闭时必须逐字节等价于闸门不存在。
-- 客户端话术与错误码沿用 C7 字典。
+`POST /tool/signup` 是客户端拿 `login_token` 的唯一入口，闸门就卡在这里：
+`src/routes/cn/tool.ts:87` 先 `getDeviceBindingSync(deviceId)`，
+`:89-101` 在**已知设备短路之前**做判定（`:89-90` 的注释原文：
+「必须卡在已知设备分支之前，否则老设备会绕过闸门」），拒绝时
+`reply.header("content-type", "application/x-msgpack")` + `reply.status(200).send(buildBindGateRejection(...))`
+⇒ 不走到 `insertDeviceBindingSync`，也不下发 `login_token`。
 
-> P4 合并后由 P11 补 `src/lib/bind-gate.ts` 与 `src/routes/cn/tool.ts` 的行号。
+### 开闸响应（契约 C3 冻结形状）
+
+HTTP 状态**恒为 200**，响应体走游戏服务路由族一贯的 msgpack
+（`content-type: application/x-msgpack`，`src/routes/cn/tool.ts:99`；序列化见 `src/server.ts:64`）。
+形状如下（下面用 JSON 写法表示同一份 map）：
+
+```jsonc
+{
+  "data_headers": {
+    "force_update": false, "asset_update": false, "short_udid": 0,
+    "viewer_id": 0,                      // 拒绝路径绝不回可登录凭据
+    "servertime": "…",
+    "result_code": 517,
+    "sp_binding": { "ok": false, "code": "BIND_REQUIRED", "message": "该账号尚未完成 QQ/KOOK 绑定。" }
+  },
+  "data": { "result_code": 517, "code": "BIND_REQUIRED", "message": "…", "sp_binding": { … } }
+}
+```
+
+- `sp_binding` **恰好三个键**：`ok` / `code` / `message`
+  （`src/lib/bind-gate.ts:411`）。**不含** `data`、也不含 `code_expires_at` ——
+  验证码状态与过期时间去问 `POST /sp-auth/bind-status`，别指望闸门响应里带。
+- `data` 里再镜像一份同样的 `sp_binding` 与可读 `message`
+  （`src/lib/bind-gate.ts:417-422`），给拿不到头部的客户端兜底。
+- `viewer_id` 保持 `generateDataHeaders` 的默认 0：拒绝路径绝不回可登录凭据
+  （`src/lib/bind-gate.ts:403`）。
+- `code` 只有两种取值：`BIND_REQUIRED`（未绑定、无映射、grant 过期、
+  `bind_state='pending'`、device_id 非法）与 `ACCOUNT_DISABLED`
+  （`bind_state='disabled'`，话术「该账号已被停用，请联系管理员。」）。
+  话术统一取自 C7 字典（`messageFor` → `src/lib/sp-auth/contract.ts:39-54`），闸门不另造文案。
+
+### 判定逻辑
+
+`evaluateBindGate(input, deps)`（`src/lib/bind-gate.ts:296-364`）是**纯函数**：
+不查库、不写日志，返回值里带九种 `reason`（`:238-247`）。判定顺序：
+
+1. 闸门关 ⇒ `allow`（`reason: "gate_disabled"`）。
+2. 命中白名单 ⇒ `allow`（`reason: "udid_exempt"`）。
+3. device_id 解析失败 / 查不到映射 / 映射指向已删除账号 / grant 过期 ⇒ 拒绝，`BIND_REQUIRED`
+   （`reason` 分别为 `device_id_invalid`、`device_unmapped`、`device_orphaned`、`grant_expired`）。
+4. `bind_state='active'` ⇒ 放行；`='pending'` ⇒ 拒绝 `BIND_REQUIRED`；
+   `='disabled'` ⇒ 拒绝 `ACCOUNT_DISABLED`。
+
+### 开关语义（安全边界，与普通开关不同）
+
+| `BIND_GATE_ENABLED` 取值 | 结果 |
+| --- | --- |
+| 缺失 / 空 / `0` / `false` / `no` / `off` | **关**（代码默认） |
+| `1` / `true` / `yes` / `on` | 开 |
+| 其它任何值（含拼错） | **开 + fail-closed，并在启动横幅告警** |
+
+- 关闭时 `evaluateBindGate` 在**读任何表之前**就 `return allow`（`src/lib/bind-gate.ts:304`）
+  ⇒ 零额外查库，行为与闸门引入前逐字节一致。
+- 拼错即开是刻意的：闸门是安全边界，不能因为 `BIND_GATE_ENABLED=TURE` 就静默放行。
+  这与 `src/lib/udid-probe.ts` 的 `flagEnabled`（只认 `1`/`true`、默认关）**故意不同**，
+  理由写在 `src/lib/bind-gate.ts:76-82`。
+- 白名单 `BIND_GATE_EXEMPT_UDIDS`：逗号分隔，`matchExemptToken`（`:511`）
+  同时比对 `device_id` 与 `udid` 头，空 token 与垃圾 token 永不匹配 ——
+  给服主自测用，别拿来当长期后门。
+
+### 启动横幅与观测
+
+- 启动时 `src/cn-server.ts:145` 调 `reportBindGateMode()`（import 在 `:94`），
+  打印当前模式；开闸会打印「拒绝未绑定设备（契约 C3, result_code=517）」，
+  关闸会打印警告「生产环境必须设为 1，否则绑定流程形同虚设」。
+- 每次拒绝：`recordBindGateRejection`（`src/lib/bind-gate.ts:474-492`）是**唯一副作用出口** ——
+  ① 打一行 JSON 日志（`event:"bind_gate_reject"`、`result_code`、`code`、`reason`、`client`、
+  `device_id`、`udid`、`account_id`、`bind_state`、`time`）；
+  ② 写审计 `bind_audit(action="gate_reject", actor="bind-gate")`。
+  审计写失败只记一行日志，**绝不影响 517 响应**。
+- iOS 被挡时会额外打一行中文提示（`IOS_MANUAL_BIND_HINT`，`src/lib/bind-gate.ts:57-58`）：
+  iOS 端没有验证码界面，让玩家走 R3 人工绑定 —— 群内报 UDID/设备号 → bot → 后台人工绑定。
+  `client` 字段（`ios`/`android`）只影响日志与这句提示，**不影响判定结果**
+  （`resolveBindGateClient`，`:140-163`；iOS 的判据是 dummy udid `10000001` 与
+  User-Agent 里的 `ios;` / `adobeair` / `cfnetwork`）。
+
+### 517 是新值
+
+516 已被 `src/lib/takeover-access.ts:6` 的接管旧件错误占用，不要复用。
 
 ## 运维手册
 
@@ -253,6 +327,9 @@ bot 侧的对接契约（含 `SP_BOT_TOKEN` / `BOT_API_TOKEN` 别名关系）在
    玩家用 bot 自助绑定会全部失败。
 2. `SIGNUP_CODE_TTL_MINUTES` 不设也能跑（默认 30 分钟），设了不要超过 10080。
 3. 后台不提供管理员账号体系：`/api/bindings/*` 与 `/admin/` 只能暴露在可信网络内。
+4. `BIND_GATE_ENABLED` 在公网部署必须显式设成 `1`。代码缺省是**关**，
+   漏设的后果是未绑定设备直接进游戏、整套绑定流程形同虚设；
+   启动横幅会打印当前模式，部署后先看那一行。
 
 **常见现象对照**
 
@@ -273,7 +350,10 @@ bot 侧的对接契约（含 `SP_BOT_TOKEN` / `BOT_API_TOKEN` 别名关系）在
 
 ## 边界与未覆盖项
 
-- 绑定闸门 517 当前**未实现**（见上节）。
+- 绑定闸门 517 已实现（见上节）；`.env.example` 里 `BIND_GATE_ENABLED=1` 是**默认值**，
+  但代码缺省是 0 —— 换部署环境时忘了带这个变量，就等于闸门关着。
+- iOS 的**自助**验证码入口还没通：公告通道的 `provideCode` 注入待 P10-B 上线，
+  在那之前 iOS 只能走 R3 人工绑定（详见 [iOS 客户端接入](./ios-client.md)）。
 - 平台只有 `qq` / `kook`；新增平台要同时改 `src/data/types.ts:931` 与
   `src/data/domains/account-binding.ts:39` 的白名单，并补 C7 话术。
 - iOS 客户端的绑定路径与人机流程见 [iOS 客户端接入](./ios-client.md)；
