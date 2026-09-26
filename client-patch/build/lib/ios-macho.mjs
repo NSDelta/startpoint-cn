@@ -108,9 +108,9 @@ export const OFFICIAL_IOS_184 = {
     siteTotal: 150,
     siteRewriteable: 137,
     siteTooShort: 13,
-    // host:port 必须是 18 字符（分工文档 §C2 / 冻结契约 C6 的 192.168.0.105:8001）
+    // host:port 必须是 18 字符（分工文档 §C2 / 冻结契约 C6 的 LAN 地址；真值只从 --host 传入）
     endpointLength: 18,
-    // 补丁后整包内 `192.168.0.105:8001` 的出现次数 = 137（URL 站点）+ 1（ABC 池）= 138
+    // 补丁后整包内该 18 字符 LAN 地址的出现次数 = 137（URL 站点）+ 1（ABC 池）= 138
     endpointOccurrencesAfter: 138,
     abcPairOffset: 0x5a0e14b,
     abcPairBytes: 33,
