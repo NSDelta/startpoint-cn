@@ -91,6 +91,7 @@ import giftApiPlugin from "./routes/api/gift";
 import bonusApiPlugin from "./routes/api/bonus";
 import { installTakeoverUdidGuard } from "./lib/takeover-access";
 import { installUdidProbeFromEnv } from "./lib/udid-probe";
+import { reportBindGateMode } from "./lib/bind-gate";
 import { AccountCleanupService } from "./lib/account-cleanup";
 import {
     ReceiveHistoryRetentionService,
@@ -140,6 +141,8 @@ registerRuntimeHealthRoute(fastify, () => runtimeCoordinator.getHealthSnapshot()
 installTakeoverUdidGuard(fastify);
 // B0 身份取证探针（默认关，SP_PROBE_UDID=1 才注册）：只记日志，不改行为。
 installUdidProbeFromEnv(fastify);
+// 绑定闸门（契约 C3，卡 A5）：启动时打一行开/关横幅，服主一眼可见。
+reportBindGateMode();
 
 function jsonParser(_: FastifyRequest, body: string, done: ContentTypeParserDoneFunction) {
     try {
