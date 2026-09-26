@@ -92,6 +92,7 @@ import bonusApiPlugin from "./routes/api/bonus";
 import { installTakeoverUdidGuard } from "./lib/takeover-access";
 import { installUdidProbeFromEnv } from "./lib/udid-probe";
 import { reportBindGateMode } from "./lib/bind-gate";
+import { createIosNoticeCodeProvider } from "./lib/ios-notice-code";
 import { AccountCleanupService } from "./lib/account-cleanup";
 import {
     ReceiveHistoryRetentionService,
@@ -353,7 +354,12 @@ function configureRuntimeHttp(config: ReturnType<typeof parseCnRuntimeConfig>): 
     fastify.register(versionCheckPlugin, { ios: config.iosCompat });
     if (config.iosCompat.enabled) {
         // iOS SDK请求的是裸路径（/sdk/v3-3/...、/mobile!...），必须无前缀注册。
-        fastify.register(iosLeitingPlugin, { ios: config.iosCompat });
+        // provideCode：借 SDK 原生公告弹窗把绑定验证码显示给 iOS 玩家（iOS 没有自研登录页）。
+        // 实现见 src/lib/ios-notice-code.ts —— 账号解析复用绑定闸门那套，反复打开公告不换码。
+        fastify.register(iosLeitingPlugin, {
+            ios: config.iosCompat,
+            notice: { provideCode: createIosNoticeCodeProvider() },
+        });
     }
     runtimeHttpConfigured = true;
 }
