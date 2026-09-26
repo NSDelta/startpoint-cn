@@ -3,6 +3,7 @@ import { Layout, Menu, Grid, Button, Drawer, Space } from "antd"
 import {
     Database,
     Gauge,
+    Link2,
     Clock3,
     Mail as MailIcon,
     Menu as MenuIcon,
@@ -17,6 +18,7 @@ import {
 import { Routes, Route, useNavigate, useLocation, Navigate } from "react-router-dom"
 import Dashboard from "./pages/Dashboard"
 import Accounts from "./pages/Accounts"
+import Bindings from "./pages/Bindings"
 import PlayerDetail from "./pages/PlayerDetail"
 import Mail from "./pages/Mail"
 import News from "./pages/News"
@@ -33,6 +35,7 @@ const menuItems = [
     { key: "/", icon: <Gauge size={18} />, label: "总览" },
     { key: "/time", icon: <Clock3 size={18} />, label: "时间 / 千里眼" },
     { key: "/accounts", icon: <Users size={18} />, label: "账号 / 存档" },
+    { key: "/bindings", icon: <Link2 size={18} />, label: "账号绑定" },
     { key: "/mail", icon: <MailIcon size={18} />, label: "邮件" },
     { key: "/news", icon: <Megaphone size={18} />, label: "公告" },
     { key: "/gifts", icon: <Gift size={18} />, label: "礼包" },
@@ -44,6 +47,7 @@ const pageTitles: Record<string, string> = {
     "/": "总览",
     "/time": "时间 / 千里眼",
     "/accounts": "账号 / 存档",
+    "/bindings": "账号绑定",
     "/mail": "邮件",
     "/news": "公告",
     "/gifts": "礼包",
@@ -124,6 +128,7 @@ export default function App({ dark, onToggleDark }: AppProps) {
                         <Route path="/" element={<Dashboard />} />
                         <Route path="/time" element={<TimeControl />} />
                         <Route path="/accounts" element={<Accounts />} />
+                        <Route path="/bindings" element={<Bindings />} />
                         <Route path="/players/:playerId" element={<PlayerDetail />} />
                         <Route path="/mail" element={<Mail />} />
                         <Route path="/news" element={<News />} />
