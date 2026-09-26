@@ -50,6 +50,22 @@ export const REQUIRED_FFDEC_VERSION = "24.0.1"
 const RENAME_PACKAGE_TOOL = path.join(REPO_ROOT, "client-patch", "tools", "rename-package.mjs")
 const PATCH_IPA_TOOL = path.join(HERE, "patch-ipa.mjs")
 
+/**
+ * 共存包名默认目标：与 `com.leiting.wf`（14 字符）等长，所以 AXML 里 package 字符串是定长原地改，
+ * 不需要动 classes.dex 的 uleb128 前缀与 string_ids 绝对偏移（P12 的等长硬约束，见 rename-package.mjs:1616-1630）。
+ */
+export const RENAME_PACKAGE_DEFAULT = "cn.starpoint.a"
+
+/**
+ * 基线包的包名。**只**用于「确认真的是要改的那个包」的前置/回读校验，不是地址常量：
+ * 共存的前提就是我们的客户端与他人客户端同为 `com.leiting.wf` 且签名不同（分工文档 §4-P12）。
+ * 基线换包名时这里必须跟着改，否则构建会在改名阶段以断言失败收场（fail-closed，不静默）。
+ */
+export const BASELINE_PACKAGE_NAME = "com.leiting.wf"
+
+/** Java 包名形状（AXML 的 package 属性 / AIR application.xml 的 <id>）。 */
+export const PACKAGE_NAME_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/
+
 const HELP = `用法：
   node client-patch/build/build-client.mjs --base <apk|ipa> --host <ip> --port <port> --out <apk> [选项]
 
@@ -76,8 +92,9 @@ const HELP = `用法：
   --apksigner <file>    apksigner（同上，APKSIGNER）
 
 其它：
-  --rename-package      P12 的包名改写开关（默认关；缺 rename-package.mjs 时明确报错且不做事）
-  --rename-to <pkg>     透传给 rename-package.mjs 的目标包名
+  --rename-package      改包名共存开关（默认关；不传就完全不走这段，逐字节等价于未接线前）
+  --rename-to <pkg>     目标包名（默认 ${RENAME_PACKAGE_DEFAULT}，须与 com.leiting.wf 等长）
+  --rename-tool <file>  覆盖改名工具路径（默认 client-patch/tools/rename-package.mjs；测试注入桩用）
   --work <dir>          临时目录（默认系统 temp；必须纯 ASCII —— FFDec 的硬要求）
   --keep-work           保留临时目录（排查用）
   --dry-run             只打印完整命令序列，不产生任何文件
@@ -218,6 +235,32 @@ export function countIn(buffer, needle) {
         index = buffer.indexOf(pattern, index + pattern.length)
     }
     return count
+}
+
+/**
+ * 改名结果的独立回读（不看改名工具的 exit code，也不信它的自述报告）：
+ * 用我们自己的 ZIP 引擎重新解析产物，直接找 `AndroidManifest.xml`（二进制 AXML，字符串池多为
+ * UTF-16LE，也兼容 UTF-8 变体）与 `assets/META-INF/AIR/application.xml` 的 `<id>`。
+ * 返回纯数据，由调用方决定断言阈值。
+ */
+export function checkRenamedApk(apkBuffer, { from = null, to }) {
+    const entries = readZipEntries(apkBuffer)
+    const manifestEntry = entries.find(entry => entry.name === "AndroidManifest.xml")
+    const applicationEntry = entries.find(entry => entry.name === "assets/META-INF/AIR/application.xml")
+
+    const hasEither = (buffer, value) => buffer.includes(Buffer.from(value, "utf16le")) || buffer.includes(Buffer.from(value, "utf8"))
+    const manifest = manifestEntry ? readEntryData(manifestEntry) : null
+    const applicationXml = applicationEntry ? readEntryData(applicationEntry).toString("utf8") : null
+
+    return {
+        entryCount: entries.length,
+        hasManifest: Boolean(manifestEntry),
+        hasApplicationXml: Boolean(applicationEntry),
+        manifestHasTo: manifest ? hasEither(manifest, to) : false,
+        manifestHasFrom: manifest && from ? hasEither(manifest, from) : false,
+        applicationXmlHasTo: applicationXml ? applicationXml.includes(`<id>${to}</id>`) : false,
+        applicationXmlHasFrom: applicationXml && from ? applicationXml.includes(`<id>${from}</id>`) : false,
+    }
 }
 
 /**
@@ -380,13 +423,32 @@ async function main() {
 
     // ── [0.5] P12 开关：缺 rename-package.mjs 时明确报错且不做事 ──
     const renamePackage = args["rename-package"] === true
-    if (renamePackage && !existsSync(RENAME_PACKAGE_TOOL)) {
-        fail(`--rename-package 需要 P12 交付的 client-patch/tools/rename-package.mjs，但该文件不存在（P12 未交付）`
+    const renameTo = args["rename-to"] === undefined ? RENAME_PACKAGE_DEFAULT : String(args["rename-to"])
+    const renameTool = args["rename-tool"] ? path.resolve(String(args["rename-tool"])) : RENAME_PACKAGE_TOOL
+    if (renamePackage && !existsSync(renameTool)) {
+        fail(`--rename-package 需要 P12 交付的包名改写工具，但该文件不存在：${renameTool}`
+            + `——本次不做事，未产生任何文件`)
+    }
+    if (renamePackage && !PACKAGE_NAME_RE.test(renameTo)) {
+        fail(`--rename-to 不是合法包名：${JSON.stringify(renameTo)}（形如 cn.starpoint.a）`)
+    }
+    if (renamePackage && renameTo === BASELINE_PACKAGE_NAME) {
+        fail(`--rename-to 不能等于基线包名 ${BASELINE_PACKAGE_NAME}：那样改不出共存包（工具会走 noop 短路）`
             + `——本次不做事，未产生任何文件`)
     }
 
     // ── IPA 基线：转交 P10-A 的唯一补丁入口（只调用不修改）──
-    if (/\.ipa$/i.test(base)) return delegateToPatchIpa()
+    if (/\.ipa$/i.test(base)) {
+        if (renamePackage) {
+            // 显式失败而不是静默忽略：iOS 的 bundle id 改写必须先实测读出 app id
+            // （苹果v15.2.ipa = com.kulo.wf，iOS-1.8.4.ipa = com.leiting.wf），而且主二进制里
+            // 122 处 com.leiting.wf 有 91 处是计费 SKU、1 处是 keychain access group，
+            // 绝不能做二进制全局替换。那条通路属 P10-A 的 patch-ipa.mjs（未实现 --bundle-id）。
+            fail("--rename-package 只支持 Android APK（.ipa 走 P10-A 的 patch-ipa.mjs，本脚本不代改 iOS bundle id）"
+                + "——iOS 的 bundle id 改写必须先从 IPA 实测读出 app id 并保护 91 处计费 SKU，本次不做事，未产生任何文件")
+        }
+        return delegateToPatchIpa()
+    }
 
     const planned = []
     const warnings = []
@@ -418,6 +480,19 @@ async function main() {
         ffdec: null,
         baseBuf: null,
         baseSha: null,
+        rename: {
+            requested: renamePackage,
+            applied: false,
+            tool: renameTool,
+            target: renameTo,
+            from: null,
+            exitCode: null,
+            noop: null,
+            command: null,
+            report: null,
+            probe: null,
+            reason: renamePackage ? null : "未提供 --rename-package（默认关：完全不走改名段）",
+        },
     }
 
     // ── [1] 预检 ──
@@ -466,7 +541,10 @@ async function main() {
     else if (!process.env[ksPassEnv]) signReason = `未签名（缺凭据）：环境变量 ${ksPassEnv} 为空`
     const willSign = signReason === null
     const alignedPath = path.join(workRoot, "aligned.apk")
-    const unsignedPath = path.join(workRoot, "unsigned.apk")
+    // [5.5] 改包名把产物写到这里（不就地覆盖 unsigned.apk：改名失败时 unsigned.apk 仍可用于排查），
+    // 只有回读校验全部通过后才把 unsignedPath 重指向它，让 [6] zipalign / [7] 签名读到改名后的包。
+    const renamedPath = path.join(workRoot, "renamed.apk")
+    let unsignedPath = path.join(workRoot, "unsigned.apk")
     const signArgs = willSign
         ? ["sign", "--ks", ks, "--ks-pass", `env:${ksPassEnv}`, "--key-pass", `env:${ksPassEnv}`,
             "--ks-key-alias", ksAlias, "--v4-signing-enabled", "false",
@@ -673,6 +751,86 @@ async function main() {
         assertions.check("回封保留 .so 条目的压缩方法",
             outputEntries.filter(item => /\.so$/i.test(item.name)).every(item => item.method === 8 || item.method === 0),
             "method 未被打乱")
+    }
+
+    // ── [5.5] 改包名（共存）：默认关 ──
+    // 位置是刻意的：改包名会让 v1/v2 签名**全部失效**，所以只能「回封 → 改名 → zipalign → 签名」，
+    // 签名一次成型；放到签名之后再改就会得到一个签名已坏的包。
+    // 判定完全靠回读（自家 ZIP 引擎读产物的 AXML / application.xml），不看工具自述与 exit code 就下结论。
+    if (renamePackage) {
+        hr("[5.5] 改包名（--rename-package，共存包）")
+        const renameArgs = [
+            "--in", dryRun ? "<unsigned.apk>" : unsignedPath,
+            "--out", dryRun ? "<renamed.apk>" : renamedPath,
+            "--rename-to", renameTo, "--json",
+        ]
+        state.rename.command = renderCommand(renameTool, renameArgs)
+        planned.push(state.rename.command)
+        console.log(`  ${state.rename.command}`)
+
+        if (dryRun) {
+            state.rename.reason = "dry-run：只规划不执行"
+            planned.push(`readback(renamed.apk)   # 断言 package=${renameTo}、无 ${BASELINE_PACKAGE_NAME} 残留、zip 条目数不变`)
+        } else {
+            const run = runTool(renameTool, renameArgs, { allowFailure: true })
+            state.rename.exitCode = run.status
+            try {
+                const parsed = JSON.parse(String(run.stdout || "").trim())
+                state.rename.from = parsed.from || null
+                state.rename.noop = parsed.noop === true
+                state.rename.report = {
+                    ok: parsed.ok === true,
+                    from: parsed.from || null,
+                    to: parsed.to || null,
+                    noop: parsed.noop === true,
+                    equalLength: parsed.equalLength === true,
+                    changedEntries: parsed.changedEntries || null,
+                    droppedEntries: parsed.droppedEntries || null,
+                    residualTotals: parsed.residuals ? parsed.residuals.totals : null,
+                    unsigned: parsed.unsigned === true,
+                }
+            } catch {
+                // 工具没吐 JSON（或吐了非 JSON）：留证，下面的回读校验仍然照做。
+                state.rename.report = null
+            }
+            console.log(`  改名工具 exit=${run.status}，from=${state.rename.from || "(未知)"} → ${renameTo}`)
+            assertions.check("改名工具 exit 0 且写出产物", run.status === 0 && existsSync(renamedPath),
+                `exit=${run.status}${run.status === 0 ? "" : ` stderr=${(run.stderr || "").trim() || "(空)"}`}`)
+            if (!existsSync(renamedPath) || run.status !== 0) {
+                console.log(`  [WARN] 改名失败且未写产物；后续阶段没有可用输入，终止（exit 2）`)
+                return finish(2)
+            }
+
+            const renamedBuf = readFileSync(renamedPath)
+            const probe = checkRenamedApk(renamedBuf, { from: state.rename.from || BASELINE_PACKAGE_NAME, to: renameTo })
+            state.rename.probe = probe
+            assertions.check("改名后 AndroidManifest.xml 的 package 已是目标包名", probe.manifestHasTo,
+                `to=${renameTo} entryCount=${probe.entryCount}`)
+            assertions.check("改名后 AndroidManifest.xml 无旧包名残留", !probe.manifestHasFrom,
+                `from=${state.rename.from || BASELINE_PACKAGE_NAME}`)
+            assertions.check("改名后 assets/META-INF/AIR/application.xml 的 <id> 已是目标包名",
+                !probe.hasApplicationXml || probe.applicationXmlHasTo,
+                probe.hasApplicationXml ? `<id>${renameTo}</id>` : "基线无该 entry（跳过）")
+            assertions.check("改名后 assets/META-INF/AIR/application.xml 无旧包名残留",
+                !probe.hasApplicationXml || !probe.applicationXmlHasFrom, "AIR SharedObject 按包名隔离存档")
+            assertions.check("改名未增删 zip 条目", probe.entryCount === state.entriesAfter,
+                `${state.entriesAfter} → ${probe.entryCount}`)
+            assertions.check("改名确实生效（工具未走 noop 短路）", state.rename.noop !== true,
+                state.rename.noop === true ? "工具报告 from === to：改不出共存包" : "from ≠ to")
+
+            if (assertions.failed.length > 0) {
+                console.log(`  [WARN] 改名回读校验未通过，终止（exit 2）；unsigned.apk 保留在 work 目录可排查`)
+                return finish(2)
+            }
+
+            unsignedPath = renamedPath
+            state.rename.applied = true
+            console.log(`  改名完成：${state.rename.from || BASELINE_PACKAGE_NAME} → ${renameTo}`
+                + `；[6]/[7] 改读 ${path.basename(renamedPath)}`)
+            warnings.push(`产物是共存包 ${renameTo}：与基线 ${BASELINE_PACKAGE_NAME} 是两个不同的应用`
+                + `（不能相互覆盖安装，SharedObject 存档互相隔离）`)
+            unverified.push(`共存包安装/启动/登录/存档读写与 14 个 ANE：需真机验证（[未验证-需真机]）`)
+        }
     }
 
     // ── [6] zipalign ──
