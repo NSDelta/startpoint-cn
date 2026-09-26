@@ -1,0 +1,282 @@
+# 自研账号与账号绑定
+
+本文描述自研登录页（`/sp-auth/*`）、管理后台绑定控制面（`/api/bindings/*`）、
+机器人控制面（`/api/bot/*`）以及「一设备一账号 + 平台绑定」这套模型。
+
+代码入口：
+
+- `src/routes/sp-auth/index.ts`（HTTP 面）、`src/lib/sp-auth/**`（协议与操作）
+- `src/routes/web_api/binding.ts`（后台控制面）、`src/routes/web_api/bot.ts`（bot 控制面）
+- `src/data/domains/account-binding.ts`（全部持久化与状态迁移）、`src/data/schema/account-binding.ts`（DDL）
+- `src/lib/signup-code.ts`（验证码策略：TTL / 限流 / 审计）
+
+协议常量集中在 `src/lib/sp-auth/contract.ts`，**该文件的错误码与字段名是冻结契约**
+（`src/lib/sp-auth/contract.ts:5-7`），新增只能追加、不得改名。
+
+## 三个标识的分工
+
+| 标识 | 载体 | 生命周期 | 代码 |
+| --- | --- | --- | --- |
+| 设备标识 `device_id` | 游戏客户端的设备号 | 永久 | `device_grants.device_id`（主键） |
+| 设备授权令牌 `token` | `/sp-auth/*` 请求体 | 30 天 | `src/data/domains/account-binding.ts:38`、`:923-930` |
+| 绑定验证码 `code` | 游戏内公告 → bot | 默认 30 分钟 | `src/data/domains/account-binding.ts:31-34` |
+
+`device_grants` 以 `device_id` 为主键并 `ON CONFLICT(device_id) DO UPDATE`
+（`src/data/domains/account-binding.ts:957-965`），这是「**一设备一账号**」的落地点：
+同一台设备再注册只会刷新授权行，不会产生第二个账号；登录名冲突时返回 `DEVICE_TAKEN`
+（错误码与话术见 `src/lib/sp-auth/contract.ts:20,43`）。
+
+## 账号绑定状态机
+
+账号级状态只有三个取值（`src/data/types.ts:937`）：
+
+```
+pending ──(绑定平台成功)──▶ active
+   ▲                          │
+   └──(解绑全部平台/解绑主绑定)─┘
+                              │
+                    (管理员停用) ▼
+                          disabled
+```
+
+读写入口是 `getAccountBindStateSync` / `setAccountBindStateSync`
+（`src/data/domains/account-binding.ts:1043`、`:1051`），落库前一律过
+`normalizeBindState`（`src/data/domains/account-binding.ts:81`）过滤非法值。
+
+平台侧则是 **绑定的集合**，不是单值：`account_bindings` 允许一个账号挂多个平台身份，
+最多一个 `is_primary = 1`。两条唯一索引把这个约束交给数据库而不是应用层：
+
+- `uq_account_bindings_primary`：`(platform, platform_uid) WHERE is_primary = 1`
+  —— 一个平台身份在全局只能是一个账号的主绑定（`src/data/schema/account-binding.ts:47-48`）
+- `uq_account_bindings_triple`：`(platform, platform_uid, account_id)`
+  —— 同一账号不会重复挂同一个平台身份（`src/data/schema/account-binding.ts:51-52`）
+
+平台取值为 `"qq" | "kook"`（`src/data/types.ts:931`，运行时白名单
+`src/data/domains/account-binding.ts:39`、断言 `:48`）。
+
+### 绑定状态与登录响应
+
+`pending` 账号用账号密码登录时不会被放行，而是拿到 `BIND_REQUIRED`：
+
+- `src/lib/sp-auth/login.ts:97` —— 没有活码时 `return fail("BIND_REQUIRED")`
+- `src/lib/sp-auth/login.ts:106` —— 有活码时 `return fail("BIND_REQUIRED", view)`，
+  `view` 即 `{code, code_expires_at}`，让登录页直接把码显示出来
+- 话术见 `src/lib/sp-auth/contract.ts:46`「该账号尚未完成 QQ/KOOK 绑定。」
+
+`login.ts:86` 的注释说明了这条分支的边界：账号处于其它失败态时**不得**退化成
+`BIND_REQUIRED`，以免把账号重新拖回待绑定流程。
+
+## 验证码：TTL、限流、审计
+
+策略在 `src/lib/signup-code.ts`，值的生命周期在 P2 数据层。
+
+| 项 | 值 | 代码 |
+| --- | --- | --- |
+| 码字母表 | `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`（去掉易混 `0/O/1/I`） | `src/data/domains/account-binding.ts:31` |
+| 码长度 | 6 | `src/data/domains/account-binding.ts:32` |
+| 默认 TTL | 30 分钟 | `src/data/domains/account-binding.ts:34` |
+| TTL 环境变量 | `SIGNUP_CODE_TTL_MINUTES` | `src/lib/signup-code.ts:8`、`:41` |
+| TTL 兜底 | 缺失/非法 ⇒ 30；上限 7 天 | `src/lib/signup-code.ts:24,27,42-45` |
+| 同设备重发窗口 | 60 秒 | `src/lib/signup-code.ts:30`、`:90-96` |
+| 连续失败上限 | 5 次 | `src/data/domains/account-binding.ts:36` |
+| 设备授权 TTL | 30 天 | `src/data/domains/account-binding.ts:38` |
+
+- **一个账号同时只有一个活码**：发新码时吊销上一枚（`src/lib/signup-code.ts:62-78`）。
+- **重发限流**：`resend` 走 `isWithinCodeIssueWindow`，窗口内返回 `RATE_LIMITED`
+  （`src/lib/signup-code.ts:85-96`；话术 `src/lib/sp-auth/contract.ts:44`）。
+- **审计**：每次发码写一条 `bind_audit`，actor 固定 `"sp-auth"`
+  （`src/lib/signup-code.ts:33`、`:75`；写入入口 `src/data/domains/account-binding.ts:188`）。
+- **环境变量读取方式**：走 `src/lib/udid-probe.ts:117-126` 的注入式 env 模式，
+  **不经过 `src/runtime/config.ts`**（`src/lib/signup-code.ts:36-38`，契约 C9 / CC-4）。
+
+消费一个码是**单事务**的：校验 + 建绑定 + 置码为已用一起提交
+（`src/data/domains/account-binding.ts:459-466`）。失败码是给 `POST /api/bot/bind` 冻结的那一套
+（`src/data/domains/account-binding.ts:439-445`）：
+
+```
+CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISABLED
+```
+
+## HTTP 面一：`/sp-auth/*`（自研登录页）
+
+注册处：`src/cn-server.ts:42` 引入、`src/cn-server.ts:170`
+`fastify.register(spAuthPlugin, { prefix: "/sp-auth" })`。
+
+六条路由全部 `POST` + `application/json`（`src/routes/sp-auth/index.ts:68,73,78,83,88,93`）：
+
+| 路径 | 用途 | 成功 `data` |
+| --- | --- | --- |
+| `POST /sp-auth/register` | 注册并建号 | `{token, viewer_id, username, code, code_expires_at}` |
+| `POST /sp-auth/login` | 账号密码登录 | `{token, viewer_id, username, bound:true}` |
+| `POST /sp-auth/bind-status` | 查绑定状态 / 当前活码 | `{bound, code, code_expires_at, viewer_id?}` |
+| `POST /sp-auth/resend` | 重新发码 | `{code, code_expires_at}` |
+| `POST /sp-auth/profile` | 「我是谁」+ 绑定态 | `{viewer_id, username, bound, bind_state, platform, …}` |
+| `POST /sp-auth/logout` | 注销设备授权 | `{}` |
+
+字段与 `data` 形状的权威定义在 `src/lib/sp-auth/contract.ts:85-135`。
+
+### 响应约定（整个命名空间一致）
+
+**HTTP 状态码一律 200**，失败也 200；成功 `{ok:true,data}`，失败
+`{ok:false,code,message,data?}`（`src/routes/sp-auth/index.ts:4-8`，实现见 `:29-41`）：
+
+- 成功：`reply.status(200).send({ ok: true, data })`（`src/routes/sp-auth/index.ts:32`）
+- 失败（无附加数据）：`{ok:false, code, message}`（`src/routes/sp-auth/index.ts:39`）
+- 失败（带附加数据，如 `DEVICE_TAKEN` 携带占用者）：`{ok:false, code, message, data}`
+  （`src/routes/sp-auth/index.ts:40`）
+- `message` 是 C7 中文兜底话术，由 `messageFor(code)` 生成
+  （`src/routes/sp-auth/index.ts:36`；字典 `src/lib/sp-auth/contract.ts:39-54`）
+- **未捕获异常也不破坏 200**：`guard()` 把抛出转成 `SERVICE_UNAVAILABLE`，
+  且只把错误消息写服务端日志、绝不回传请求体或堆栈
+  （`src/routes/sp-auth/index.ts:48-60`）
+
+错误码全集 14 个见 `src/lib/sp-auth/contract.ts:15-30`。
+
+### 字段规则
+
+| 字段 | 规则 | 代码 |
+| --- | --- | --- |
+| `username` | `/^[A-Za-z_][A-Za-z0-9_]{3,19}$/`（4-20 位，不能以数字开头） | `src/lib/sp-auth/contract.ts:169` |
+| `password` | 8-64 位 ASCII 字母数字，且同时含大写、小写、数字 | `src/lib/sp-auth/contract.ts:182-190` |
+| `device_id` | 正的安全整数 | `src/lib/sp-auth/contract.ts:193-196` |
+| `token` | 64 位小写 hex | `src/lib/sp-auth/contract.ts:199-201` |
+| 平台 uid 回显 | `12345678` → `1234****5678`；长度 ≤ 4 → `****` | `src/lib/sp-auth/contract.ts:211-216` |
+
+## HTTP 面二：`/api/bindings/*`（管理后台控制面）
+
+注册处：`src/routes/web_api/index.ts:52` `fastify.register(bindingApiPlugin, { prefix: "/bindings" })`
+⇒ 对外的完整前缀是 `/api/bindings`。
+
+| 方法 + 路径 | 用途 | 路由行 | 成功状态 |
+| --- | --- | --- | --- |
+| `GET /api/bindings` | 分页查绑定，过滤 `platform` / `state` / `query` / `page` / `pageSize` | `src/routes/web_api/binding.ts:312` | 200 `{page,pageSize,totalCount,rows}` |
+| `GET /api/bindings/codes` | 查验证码（可带 `accountId`） | `src/routes/web_api/binding.ts:356` | 200 `{rows,totalCount}` |
+| `POST /api/bindings/codes` | 补发/新建验证码 | `src/routes/web_api/binding.ts:382` | 201 码行 |
+| `POST /api/bindings/codes/:id/revoke` | 吊销验证码 | `src/routes/web_api/binding.ts:404` | 200 `{ok:true}` |
+| `POST /api/bindings` | 手工新增绑定（`is_primary` 服务端默认 false） | `src/routes/web_api/binding.ts:418` | 201 绑定行 |
+| `POST /api/bindings/:id/primary` | 设为主绑定 | `src/routes/web_api/binding.ts:459` | 200 绑定行 |
+| `DELETE /api/bindings/:id` | 解绑（管理员可解主绑定） | `src/routes/web_api/binding.ts:480` | 200 `{ok:true}` |
+
+分页响应的字段拼装见 `src/routes/web_api/binding.ts:344-350`。手工新增走
+`is_primary = false` 分支（`src/routes/web_api/binding.ts:427`），主绑定迁移只走
+`/:id/primary`——两者是两条不同路径，不要混用。
+
+错误姿态：
+
+| 状态 | 条件 | 代码 |
+| --- | --- | --- |
+| 503 | 数据库未就绪，**每个路由都先检查** | `src/routes/web_api/binding.ts:313,357,383,405,419,460,481` |
+| 404 | 账号不存在 | `:394`、`:443` |
+| 404 | 验证码不存在或已不可吊销 | `:410` |
+| 404 | 绑定不存在 | `:467`、`:492` |
+| 409 | 该平台身份已是**其他账号**的主绑定 | `:447`、`:450` |
+| 409 | 该平台身份已存在主绑定 | `:469` |
+| 400 / 500 | 入参非法 / 绑定操作失败 | `:222`、`:225` |
+
+**鉴权姿态：这组接口没有任何后台鉴权**，与 `/api` 的其它路由一样只依赖可信网络边界
+（`src/routes/web_api/binding.ts:31-32` 明确写了这一点，部署边界见
+[管理后台](../admin/README.md)）。它**不接受** `X-Bot-Token`——bot 令牌属于下一节的
+控制面，两套凭据不混用（`tests/admin-bindings-ui-source.test.js:52-54` 把这条写成了断言）。
+
+## HTTP 面三：`/api/bot/*`（机器人控制面）
+
+注册处：`src/routes/web_api/index.ts:53`
+`fastify.register(botApiPlugin, { prefix: "/bot", env: options.botApiEnv })`
+⇒ 对外完整前缀 `/api/bot`。三条路由**全部是 POST**
+（`src/routes/web_api/bot.ts:240,288,312`）。
+
+| 方法 + 路径 | 用途 |
+| --- | --- |
+| `POST /api/bot/bind` | 用验证码把 QQ/KOOK 身份绑到账号上 |
+| `POST /api/bot/status` | 查某个平台身份已绑定的账号 |
+| `POST /api/bot/unbind` | 自助解绑（只能解非主绑定） |
+
+### 鉴权：fail-closed
+
+- 令牌来自服务端环境变量 `BOT_API_TOKEN`
+  （`src/routes/web_api/bot.ts:48-56`，缺失或全空白 ⇒ `null`）
+- 比较是**常数时间**的：两侧先 `sha256` 再 `crypto.timingSafeEqual`，
+  这样长度不可观测（`src/routes/web_api/bot.ts:63-68`）
+- **env 缺失时整组 403**：`onRequest` 钩子里令牌为 `null` 直接
+  `reply.status(403).send({ok:false, code:"FORBIDDEN"})`，且不区分「没带」和「带错」
+  （`src/routes/web_api/bot.ts:234,236`；响应体常量 `:36`）
+- 这是一处刻意的 fail-closed：**没配令牌 = 整个 bot 面不可用**，而不是「无令牌放行」。
+  因此 `.env.example` 里 `BOT_API_TOKEN` 默认为空串，等于默认关闭该面。
+
+### 状态码与失败码
+
+| 场景 | HTTP | body | 代码 |
+| --- | --- | --- | --- |
+| 令牌缺失 / 不匹配 | 403 | `{ok:false,code:"FORBIDDEN"}` | `src/routes/web_api/bot.ts:234,236` |
+| `unbind` 缺 `code` | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:319` |
+| 入参缺字段（如 platform） | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:222` |
+| `bind` 缺 code / 码格式非法 | 400 | `{ok:false,code:"CODE_INVALID"}` | `:248` |
+| `status` 无绑定 | **200** | `{ok:true,data:{bindings:[]}}` | `:306` |
+| 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:253`、`:324` |
+| 业务失败（码过期/已用/锁定/已绑定） | 200 | `{ok:false,code:<C4 码>}` | `:271`、`:328` |
+| 解绑目标不存在 / 是主绑定 | 200 | `{ok:false,code:"BINDING_NOT_FOUND"｜"PRIMARY_BINDING"}` | `:336`、`:337` |
+
+要点：**鉴权失败和参数缺失用 HTTP 状态码；业务判定失败用 200 + `code`**。
+`CODE_INVALID` 一个码同时出现在 400（格式非法）和 200（查无此码，`:197`、`:203`、
+`:208` 经 `:271` 返回）两条路径上——调用方必须同时看 HTTP 状态和 body 的 `code`。
+
+`unbind` 的权限边界写在注释里：bot 自助**只能解非主绑定**，主绑定解绑需要管理员
+（`src/data/domains/account-binding.ts:695`；后台侧对应 `src/routes/web_api/binding.ts:485-486`）。
+
+bot 侧的对接契约（含 `SP_BOT_TOKEN` / `BOT_API_TOKEN` 别名关系）在 bot 仓库的
+`startpoint-cn-bot/CONTRACT.md`，tag `baseline-bot-v0`。
+
+## 绑定闸门（HTTP 517）—— ⚠ P4 未合并
+
+**本节描述的是已冻结契约，但当前 dev 顶端（`d8dd8b1a`）没有实现。**
+`src/lib/bind-gate.ts` 不存在，全仓 grep `BIND_GATE_ENABLED` / `sp_binding` 无命中；
+唯一叫 `BIND_REQUIRED` 的东西是上面登录响应里的**账号态**错误码
+（`src/lib/sp-auth/login.ts:97,106`），与本节闸门无关。契约原文见
+`D:\wfcnmod\分工文档-自研登录页与账号绑定.md` §3.3。
+
+约定（owner：P4）：
+
+- **拦截面**：`src/routes/cn/tool.ts` 的「已知设备」分支之后、`insertDeviceBindingSync` 之前。
+- **开闸形态**：HTTP 200 + `data_headers.result_code = 517`
+  + `data_headers.sp_binding = {ok:false, code:"BIND_REQUIRED", …}`。
+- **517 是新值**：516 已被 `src/lib/takeover-access.ts` 占用，不要复用。
+- **开关**：`BIND_GATE_ENABLED`，**代码默认 0**；关闭时必须逐字节等价于闸门不存在。
+- 客户端话术与错误码沿用 C7 字典。
+
+> P4 合并后由 P11 补 `src/lib/bind-gate.ts` 与 `src/routes/cn/tool.ts` 的行号。
+
+## 运维手册
+
+**部署前必做**
+
+1. `BOT_API_TOKEN` 必须显式设成一个强随机串。留空 ⇒ `/api/bot/*` 整组 403，
+   玩家用 bot 自助绑定会全部失败。
+2. `SIGNUP_CODE_TTL_MINUTES` 不设也能跑（默认 30 分钟），设了不要超过 10080。
+3. 后台不提供管理员账号体系：`/api/bindings/*` 与 `/admin/` 只能暴露在可信网络内。
+
+**常见现象对照**
+
+| 现象 | 判据 | 处置 |
+| --- | --- | --- |
+| 玩家说「验证码不对」 | 码 6 位、字母表不含 `0/O/1/I` | 让玩家逐字重念；连续 5 次错会 `CODE_LOCKED`，需重新发码 |
+| 玩家说「码过期了」 | 默认 30 分钟 | `POST /api/bindings/codes` 补发 |
+| 玩家一直拿不到码 | 他登录时收到 `BIND_REQUIRED` 的 `data.code` 为空 | 说明没有活码；让他在登录页点重发，注意 60 秒窗口内只会拿到 `RATE_LIMITED` |
+| 绑不上，报 `ALREADY_BOUND` | 该平台身份已挂在别的账号上 | 后台按 `platform` + 平台 uid 查 `/api/bindings`，先解绑旧账号 |
+| 后台改不了主绑定 | `DELETE` 解主绑定走的是一条独立分支 | 主绑定迁移用 `POST /api/bindings/:id/primary`，不要先删后加 |
+
+**查证入口**
+
+- 绑定列表：`GET /api/bindings?platform=qq&state=pending&query=<uid>`
+- 验证码台账：`GET /api/bindings/codes?accountId=<id>`
+- 审计流水：`bind_audit` 表（写入在 `src/data/domains/account-binding.ts:188`，
+  查询在 `:216`）
+
+## 边界与未覆盖项
+
+- 绑定闸门 517 当前**未实现**（见上节）。
+- 平台只有 `qq` / `kook`；新增平台要同时改 `src/data/types.ts:931` 与
+  `src/data/domains/account-binding.ts:39` 的白名单，并补 C7 话术。
+- iOS 客户端的绑定路径与人机流程见 [iOS 客户端接入](./ios-client.md)；
+  它走的是「人工 R3 绑定」，不复用 `/sp-auth/*` 的页面。
+- 各路由的端点级覆盖状态见[路由族覆盖矩阵](../reference/routes-status.md)；
+  客户端是否通过以[测试进度](../status/test-progress.md)为准。
