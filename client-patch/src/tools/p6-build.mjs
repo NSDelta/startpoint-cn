@@ -221,9 +221,6 @@ const main = async () => {
     const refF = finalById.get(refs[t].id);
     assert(refF && refF.codeLen > 64, `靶方法 ${t} 产物字节码非空（${refF ? refF.codeLen : "?"} B，基座原为 ${refs[t].codeLen} B）`);
   }
-  // 未使用变量占位（避免 lint 噪声）
-  void ra;
-
   const report = {
     generated_at: new Date().toISOString(),
     route: "B: pcode-method-body-replace",
