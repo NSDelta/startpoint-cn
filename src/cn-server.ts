@@ -39,6 +39,7 @@ import cnLoadPlugin from "./routes/cn/load";
 import { registerCnAssetProviderRoutes } from "./routes/cn/asset-provider";
 import { registerCnMsgpackOnSend } from "./routes/cn/msgpack";
 import indexWebApiPlugin from "./routes/web_api";
+import spAuthPlugin from "./routes/sp-auth";
 import seedsWebApiPlugin from "./routes/web_api/seeds";
 import { getDefaultGachaSeedQuarantine } from "./lib/gacha-seed-quarantine";
 import reproduceApiPlugin from "./routes/api/reproduce";
@@ -165,6 +166,8 @@ fastify.addContentTypeParser("application/json", { parseAs: "string" }, jsonPars
 
 fastify.register(leitingAuthPlugin, { prefix: "/api/index.php" });
 fastify.register(cnTakeOverPlugin, { prefix: "/api/index.php" });
+// 自研客户端登录/绑定 API（契约 C1）：与游戏 API 分开挂载，客户端硬编码地址时用它。
+fastify.register(spAuthPlugin, { prefix: "/sp-auth" });
 
 const apiPrefix = "/api/index.php";
 
