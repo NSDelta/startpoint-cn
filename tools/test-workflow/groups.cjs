@@ -713,6 +713,7 @@ const TEST_GROUPS = Object.freeze({
         execution: "parallel",
         tests: [
             "tests/admin-account-save-ui.test.js",
+            "tests/admin-bindings-ui-source.test.js",
             "tests/admin-cdn-status-source.test.js",
             "tests/admin-clairvoyance.test.js",
             "tests/admin-gameplay-settings-ui-source.test.js",
@@ -725,6 +726,8 @@ const TEST_GROUPS = Object.freeze({
             "tools/admin_gift_routes.test.cjs",
             "tools/admin_news_routes.test.cjs",
             "tools/admin_mail_type_policy.test.cjs",
+            "tools/bindings_api.test.cjs",
+            "tools/bot_api.test.cjs",
         ],
     },
     generator: {
