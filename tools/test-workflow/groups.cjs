@@ -65,6 +65,7 @@ const TEST_GROUPS = Object.freeze({
             "tools/release_contract.test.cjs",
             "tools/udid_probe.test.cjs",
             "tools/ios_ipa_patch.test.cjs",
+            "tools/build_client.test.cjs",
         ],
     },
     "quick:modes": {

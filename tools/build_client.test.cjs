@@ -1,0 +1,542 @@
+"use strict"
+// A8 / P7 · build-client.mjs 的回归测试。
+//
+// 纪律（照抄 tools/ios_ipa_patch.test.cjs 的路子）：
+//   - 全程用**合成夹具**（自造 SWF + 自造 APK + 假 zipalign/apksigner/java 桩），绝不碰 apkipa/ 里的真素材；
+//   - 地址一律用 172.16.10.105:8001（18 字符）。不用 192.168.x.y：仓库里禁写个人 IP（scripts/check-hygiene.sh 只放行 192.168.1.10）；
+//   - 断言的是**行为契约**：缺 --host 必须拒、报告结构必须齐、地址必须真的落到 SWF 里、缺凭据必须明说「未签名」而不是假装成功。
+
+const assert = require("node:assert/strict")
+const { test, before, after } = require("node:test")
+const { spawnSync } = require("node:child_process")
+const { deflateRawSync, deflateSync, inflateSync } = require("node:zlib")
+const fs = require("node:fs")
+const os = require("node:os")
+const path = require("node:path")
+const { pathToFileURL } = require("node:url")
+
+const REPO = path.join(__dirname, "..")
+const CLI = path.join(REPO, "client-patch", "build", "build-client.mjs")
+const MAIN_SWF = "assets/worldflipper_android_release.swf"
+const RENAME_TOOL = path.join(REPO, "client-patch", "tools", "rename-package.mjs")
+
+const HOST = "172.16.10.105"
+const PORT = "8001"
+const HOST_PORT = `${HOST}:${PORT}`
+const OLD_HOST = "shijtswygamegf.leiting.com"
+const NEW_AUTHORITY = `${"0".repeat(8)}@${HOST_PORT}`
+
+let ROOT = null
+let fx = null
+
+// ───────────────────────── 夹具 ─────────────────────────
+
+/** 确定性伪随机填充：让 FWS 与 CWS 两种形态的体积都随 pad 线性增长（防止 deflate 把夹具压成几十字节）。 */
+function filler(length, seed) {
+    const buffer = Buffer.alloc(length)
+    let x = seed >>> 0
+    for (let i = 0; i < length; i += 1) {
+        x = (Math.imul(x, 1664525) + 1013904223) >>> 0
+        buffer[i] = (x >>> 24) & 0xff
+    }
+    return buffer
+}
+
+/** 合成一份「逻辑 FWS」：只有 ABC 常量池里的 scheme+host 对是真的，其余是填充。 */
+function syntheticSwf({ host = OLD_HOST, pad = 4096, seed = 1 } = {}) {
+    const parts = [filler(pad, seed)]
+    if (host) {
+        parts.push(Buffer.from([0x05]), Buffer.from("https", "latin1"), Buffer.from([0x1a]), Buffer.from(host, "latin1"))
+    }
+    parts.push(filler(pad, seed + 977))
+    const body = Buffer.concat(parts)
+    const header = Buffer.alloc(8)
+    header.write("FWS", 0, "latin1")
+    header[3] = 44
+    header.writeUInt32LE(8 + body.length, 4)
+    return Buffer.concat([header, body])
+}
+
+/** 把逻辑 FWS 包成 CWS（第二份基线 安卓v15.2.apk 就是这个形态）。 */
+function toCws(logical) {
+    const packed = deflateSync(logical.subarray(8), { level: 9 })
+    const header = Buffer.alloc(8)
+    header.write("CWS", 0, "latin1")
+    header[3] = logical[3]
+    header.writeUInt32LE(logical.length, 4)
+    return Buffer.concat([header, packed])
+}
+
+function swfHostCount(entryData) {
+    const logical = entryData.toString("latin1", 0, 3) === "CWS"
+        ? Buffer.concat([Buffer.from("FWS", "latin1"), entryData.subarray(3, 8), inflateSync(entryData.subarray(8))])
+        : entryData
+    const count = (needle) => {
+        const pattern = Buffer.from(needle, "latin1")
+        let hits = 0
+        let at = logical.indexOf(pattern)
+        while (at !== -1) {
+            hits += 1
+            at = logical.indexOf(pattern, at + pattern.length)
+        }
+        return hits
+    }
+    return { logical, old: count(OLD_HOST), authority: count(NEW_AUTHORITY), scheme: count("https") }
+}
+
+/** 用仓库自己的零依赖 ZIP 引擎造一个合成 APK（保住 method/versionMadeBy/externalAttr 的真实性）。 */
+async function buildFixtureApk(zip, dir, { encoding = "fws" } = {}) {
+    const logical = syntheticSwf()
+    const mainSwf = encoding === "cws" ? toCws(logical) : logical
+    const worker = toCws(syntheticSwf({ host: null, pad: 8, seed: 50021 }))
+    const entries = []
+    const add = (name, data, method = 8, versionMadeBy = 0x14, externalAttr = 0) => {
+        const raw = method === 8 ? deflateRawSync(data, { level: 9 }) : data
+        entries.push({
+            name, method, flags: 0, mtime: 0x6000, mdate: 0x5000,
+            crc: zip.crc32(data), csize: raw.length, usize: data.length,
+            versionMadeBy, externalAttr, raw,
+        })
+    }
+    add(MAIN_SWF, mainSwf)
+    add("AndroidManifest.xml", Buffer.from("<manifest package=\"com.leiting.wf\"/>", "utf8"), 8, 0x0, 0)
+    add("assets/BackgroundWorker.swf", worker, 8, 0x0a, 0)
+    add("lib/arm64-v8a/libCore.so", Buffer.alloc(4096, 7), 8, 0x14, 0x81a40000)
+    add("META-INF/MANIFEST.MF", Buffer.from("Manifest-Version: 1.0\r\n\r\n", "utf8"))
+    add("META-INF/1.SF", Buffer.from("Signature-Version: 1.0\r\n\r\n", "utf8"))
+    add("META-INF/1.RSA", Buffer.alloc(64, 3))
+    // 这两个是 Play/Oppo 的市场元数据，不是签名件 —— 产线绝不许摘掉它们
+    add("META-INF/com.android.tools.metadata/drm/com.google.play/metadata.bin", Buffer.alloc(134, 9), 0, 0x300, 0x81a40000)
+    const file = path.join(dir, `base-${encoding}.apk`)
+    fs.writeFileSync(file, zip.writeZipEntries(entries))
+    return { file, entries, mainSwf, logical, worker }
+}
+
+const FAKE_ZIPALIGN = `#!/usr/bin/env node
+import { copyFileSync, existsSync } from "node:fs"
+const argv = process.argv.slice(2)
+if (argv.includes("-c")) { console.log("Verification succesful"); process.exit(0) }
+const [src, dst] = argv.slice(-2)
+if (!existsSync(src)) { console.error("fake zipalign: 输入不存在 " + src); process.exit(1) }
+copyFileSync(src, dst)
+console.log("fake zipalign: " + dst)
+`
+
+const FAKE_APKSIGNER = `#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
+const MARK = Buffer.from("SPCN-FAKE-SIGNATURE")
+const argv = process.argv.slice(2)
+const cmd = argv[0]
+const value = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1] }
+const fail = (m) => { console.error(m); process.exit(1) }
+
+if (cmd === "sign") {
+  const pass = value("--ks-pass")
+  if (!value("--ks")) fail("fake apksigner: 缺少 --ks")
+  if (!pass || !pass.startsWith("env:")) fail("fake apksigner: 口令必须走 env: 语法，收到 " + String(pass))
+  if (!process.env[pass.slice(4)]) fail("fake apksigner: 环境变量 " + pass.slice(4) + " 为空")
+  const input = argv[argv.length - 1]
+  if (!existsSync(input)) fail("fake apksigner: 输入不存在 " + input)
+  writeFileSync(value("--out"), Buffer.concat([readFileSync(input), MARK]))
+  console.log("fake apksigner: signed " + value("--out"))
+  process.exit(0)
+}
+
+if (cmd === "verify") {
+  const target = argv[argv.length - 1]
+  if (!existsSync(target)) fail("fake apksigner: 目标不存在 " + target)
+  if (!readFileSync(target).includes(MARK)) {
+    console.error("DOES NOT VERIFY")
+    console.error("ERROR: Missing signature (fake apksigner: 没有 SPCN-FAKE-SIGNATURE 标记)")
+    process.exit(1)
+  }
+  console.log("Verifies")
+  console.log("Verified using v2 scheme (APK Signature Scheme v2): true")
+  console.log("Signer #1 certificate DN: CN=StartPoint CN Launcher, O=StartPoint, C=TW")
+  process.exit(0)
+}
+
+fail("fake apksigner: 未知子命令 " + String(cmd))
+`
+
+// --java 桩：只负责吐 FFDec 版本横幅（真 java 跑 dummy jar 会直接报错，版本抓不到）
+const FAKE_JAVA = `#!/usr/bin/env node
+console.log("JPEXS Free Flash Decompiler v." + (process.env.FAKE_FFDEC_VERSION || "24.0.1"))
+`
+
+const FAKE_HOOK = `export async function transformSwf(ctx) {
+    return { swf: ctx.logicalSwf, notes: ["fake-hook：原样返回（夹具用）"] }
+}
+`
+
+function writeStubs(dir) {
+    const zipalign = path.join(dir, "fake-zipalign.mjs")
+    const apksigner = path.join(dir, "fake-apksigner.mjs")
+    const java = path.join(dir, "fake-java.mjs")
+    const hook = path.join(dir, "fake-as3-hook.mjs")
+    const jar = path.join(dir, "ffdec-jar-placeholder.jar")
+    const keystore = path.join(dir, "fake.keystore")
+    fs.writeFileSync(zipalign, FAKE_ZIPALIGN)
+    fs.writeFileSync(apksigner, FAKE_APKSIGNER)
+    fs.writeFileSync(java, FAKE_JAVA)
+    fs.writeFileSync(hook, FAKE_HOOK)
+    fs.writeFileSync(jar, "not a real jar")
+    fs.writeFileSync(keystore, "not a real keystore")
+    return { zipalign, apksigner, java, hook, jar, keystore }
+}
+
+let tools = null
+
+function run(argv, { env = {} } = {}) {
+    return spawnSync(process.execPath, [CLI, ...argv], {
+        cwd: REPO,
+        encoding: "utf8",
+        env: { ...process.env, ...env },
+    })
+}
+
+function out(name) {
+    return path.join(fx.dir, name)
+}
+
+function workDir(name) {
+    return path.join(fx.dir, `work-${name}`)
+}
+
+/** 拼一条最常见的实跑命令（假工具 + 不签名）。 */
+function baseArgs(name, extra = []) {
+    return [
+        "--base", fx.fws.file,
+        "--host", HOST,
+        "--port", PORT,
+        "--out", out(`${name}.apk`),
+        "--work", workDir(name),
+        "--zipalign", tools.zipalign,
+        "--apksigner", tools.apksigner,
+        ...extra,
+    ]
+}
+
+function readReport(file) {
+    return JSON.parse(fs.readFileSync(`${file}.build-report.json`, "utf8"))
+}
+
+before(async () => {
+    ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "spcn-build-test-"))
+    assert.match(ROOT, /^[\x20-\x7e]+$/, "夹具根目录必须是纯 ASCII（FFDec 硬要求，脚本会硬拦）")
+    tools = writeStubs(ROOT)
+    const zip = await import(pathToFileURL(path.join(REPO, "client-patch", "build", "lib", "zip-ipa.mjs")).href)
+    fx = { dir: path.join(ROOT, "fx"), zip }
+    fs.mkdirSync(fx.dir, { recursive: true })
+    fx.fws = await buildFixtureApk(zip, fx.dir, { encoding: "fws" })
+    fx.cws = await buildFixtureApk(zip, fx.dir, { encoding: "cws" })
+})
+
+after(() => {
+    if (ROOT) fs.rmSync(ROOT, { recursive: true, force: true })
+})
+
+// ───────────────────────── 1. 参数契约 ─────────────────────────
+
+test("缺 --host 时拒绝执行并以非 0 退出（地址只能来自参数，绝不内嵌实例地址）", () => {
+    const result = run(["--base", fx.fws.file, "--port", PORT, "--out", out("nope.apk")])
+    assert.notEqual(result.status, 0)
+    assert.match(String(result.stderr || result.stdout), /--host/)
+})
+
+test("缺 --out / --port 时同样拒绝，且指出缺的是哪一个", () => {
+    const noOut = run(["--base", fx.fws.file, "--host", HOST, "--port", PORT])
+    assert.notEqual(noOut.status, 0)
+    assert.match(String(noOut.stderr || noOut.stdout), /--out/)
+
+    const noPort = run(["--base", fx.fws.file, "--host", HOST, "--out", out("nope2.apk")])
+    assert.notEqual(noPort.status, 0)
+    assert.match(String(noPort.stderr || noPort.stdout), /--port/)
+})
+
+test("--out 与 --base 同路径被拒（不许就地覆盖素材）", () => {
+    const result = run(["--base", fx.fws.file, "--host", HOST, "--port", PORT, "--out", fx.fws.file])
+    assert.notEqual(result.status, 0)
+    assert.match(String(result.stderr || result.stdout), /同路径|不能与 --base/)
+})
+
+test("--port 非法值被拒", () => {
+    const result = run(["--base", fx.fws.file, "--host", HOST, "--port", "70000", "--out", out("nope3.apk")])
+    assert.notEqual(result.status, 0)
+    assert.match(String(result.stderr || result.stdout), /--port/)
+})
+
+test("--rename-package 在 P12 未交付时给出清晰报错且不做事", { skip: fs.existsSync(RENAME_TOOL) ? "P12 已交付 rename-package.mjs，改由集成验证透传" : false }, () => {
+    const result = run([...baseArgs("rename"), "--rename-package"])
+    assert.notEqual(result.status, 0)
+    const text = String(result.stderr || result.stdout)
+    assert.match(text, /rename-package/)
+    assert.match(text, /P12/)
+    assert.equal(fs.existsSync(out("rename.apk")), false, "报错路径绝不产出文件")
+})
+
+// ───────────────────────── 2. dry-run ─────────────────────────
+
+test("--dry-run 打印完整命令序列且不产生任何文件", () => {
+    const before2 = fs.readdirSync(fx.dir).slice().sort()
+    const result = run([...baseArgs("dry"), "--dry-run"])
+    assert.equal(result.status, 0, result.stderr)
+
+    const stdout = String(result.stdout)
+    // 完整序列 = 常量改写 + 回封 + zipalign(对齐/校验) + 签名或未签名说明
+    assert.match(stdout, /applyApiBaseRewrite\(swf, \{ hostPort: "172\.16\.10\.105:8001" \}\)/)
+    assert.match(stdout, /writeZipEntries\(entries\)/)
+    assert.match(stdout, /fake-zipalign\.mjs -p -f 4/)
+    assert.match(stdout, /fake-zipalign\.mjs -c -p 4/)
+    assert.match(stdout, /未签名（缺凭据）/)
+    assert.match(stdout, /未产生任何文件/)
+
+    assert.deepEqual(fs.readdirSync(fx.dir).slice().sort(), before2, "dry-run 之后目录内容必须逐项不变")
+    assert.equal(fs.existsSync(out("dry.apk")), false)
+    assert.equal(fs.existsSync(`${out("dry.apk")}.build-report.json`), false)
+    assert.equal(fs.existsSync(workDir("dry")), false, "dry-run 连临时目录都不该建")
+})
+
+test("--dry-run 里的计划命令一律用占位符指代中间产物", () => {
+    const result = run([...baseArgs("dry2"), "--dry-run"])
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(String(result.stdout), /"<unsigned\.apk>"/)
+    assert.match(String(result.stdout), /"<aligned\.apk>"/)
+})
+
+// ───────────────────────── 3. 未签名路径 ─────────────────────────
+
+test("缺凭据时产出未签名 APK 并明确报「未签名（缺凭据）」，不伪造签名成功", () => {
+    const target = out("unsigned.apk")
+    const result = run(baseArgs("unsigned"))
+    assert.equal(result.status, 0, result.stderr)
+
+    const stdout = String(result.stdout)
+    assert.match(stdout, /\[WARN\] 未签名（缺凭据）：未提供 --ks/)
+    assert.match(stdout, /不可安装/)
+    assert.equal(fs.existsSync(target), true, "未签名路径也要交出产物")
+
+    const report = readReport(target)
+    assert.equal(report.signing.signed, false)
+    assert.equal(report.signing.requested, false)
+    assert.match(report.signing.reason, /未签名（缺凭据）/)
+    assert.equal(report.signing.verify, null)
+    assert.equal(report.ok, true, "未签名默认不算失败（除非 --require-signature）")
+    assert.equal(report.assertions.failed, 0, JSON.stringify(report.assertions.list.filter(item => !item.ok)))
+    assert.ok(report.unverified.some(line => /签名与安装/.test(line)), "未验证项里必须挂上签名/装机这一条")
+})
+
+test("--require-signature 把「未签名」升级为硬失败（退出码 2）", () => {
+    const result = run(baseArgs("require", ["--require-signature"]))
+    assert.equal(result.status, 2)
+    assert.match(String(result.stderr) + String(result.stdout), /未签名（缺凭据）/)
+    const report = readReport(out("require.apk"))
+    assert.equal(report.ok, false)
+    assert.ok(report.assertions.failed >= 1, "断言里必须记一条失败")
+})
+
+// ───────────────────────── 4. 报告结构与地址落盘 ─────────────────────────
+
+test("构建报告结构齐备，host/port 真的落到 SWF 里（站点前后指纹可对照）", async () => {
+    const target = out("report.apk")
+    const result = run(baseArgs("report"))
+    assert.equal(result.status, 0, result.stderr)
+
+    const report = readReport(target)
+    assert.equal(report.schema, "sp-cn.client-build/v1")
+    assert.equal(report.tool.name, "build-client.mjs")
+    assert.equal(report.dryRun, false)
+    assert.equal(report.ok, true)
+    assert.equal(report.endpoint.host, HOST)
+    assert.equal(report.endpoint.port, PORT)
+    assert.equal(report.endpoint.hostPort, HOST_PORT, "host/port 必须拼成 host:port 一处产出")
+    assert.equal(report.endpoint.apiBase, `http://${NEW_AUTHORITY}`)
+
+    // 输入侧：sha256 必须与素材逐字节一致
+    assert.equal(report.inputs.base.sha256, (await import("node:crypto")).createHash("sha256").update(fs.readFileSync(fx.fws.file)).digest("hex"))
+    assert.equal(report.inputs.baseEntries, fx.fws.entries.length)
+
+    // SWF 侧
+    assert.equal(report.swf.entry, MAIN_SWF)
+    assert.equal(report.swf.encodedAs, "FWS")
+    assert.equal(report.swf.repacked, false)
+    assert.equal(report.swf.swfVersion, 44)
+    assert.equal(report.swf.logicalBytesBefore, fx.fws.logical.length)
+    assert.equal(report.swf.logicalBytesAfter, fx.fws.logical.length, "33 B 成对改写必须长度守恒")
+    assert.notEqual(report.swf.sha256Before, report.swf.sha256After,
+        "改写前后哈希必须不同 —— applyApiBaseRewrite 会就地改写 Buffer，惰性计算会把改写后的值当成改写前的")
+
+    // 站点指纹前后对照
+    assert.equal(report.siteFingerprint.before.hostCount, 1)
+    assert.equal(report.siteFingerprint.before.pairOccurrences, 1)
+    assert.equal(report.siteFingerprint.before.pairTotalBytes, 33)
+    assert.equal(report.siteFingerprint.after.hostCount, 0)
+    assert.equal(report.siteFingerprint.after.pairOccurrences, 0)
+    assert.equal(report.route, "abc-pair")
+    assert.equal(report.rewrite.applied, 1)
+    assert.ok(report.rewrite.diffRanges.length > 0)
+
+    // v1 签名摘掉、市场元数据保留
+    assert.deepEqual(report.zip.droppedV1Signatures.slice().sort(), ["META-INF/1.RSA", "META-INF/1.SF", "META-INF/MANIFEST.MF"])
+    assert.equal(report.zip.entriesAfter, fx.fws.entries.length - 3)
+
+    // 产物侧：主 SWF 里旧 host 清零、新 authority 就位，其它 entry 原样
+    const outEntries = fx.zip.readZipEntries(fs.readFileSync(target))
+    const names = outEntries.map(entry => entry.name)
+    assert.equal(names.includes("META-INF/1.RSA"), false)
+    assert.equal(names.includes("META-INF/com.android.tools.metadata/drm/com.google.play/metadata.bin"), true, "市场元数据不是签名件，绝不能摘")
+    assert.equal(names.length, fx.fws.entries.length - 3)
+
+    const main = outEntries.find(entry => entry.name === MAIN_SWF)
+    const manifest = outEntries.find(entry => entry.name === "AndroidManifest.xml")
+    const so = outEntries.find(entry => entry.name === "lib/arm64-v8a/libCore.so")
+    assert.equal(main.method, 8, "压缩方法必须沿用基线的 deflate")
+    assert.equal(manifest.method, 8)
+    assert.equal(so.method, 8)
+    assert.equal(so.versionMadeBy, 0x14, "versionMadeBy 必须逐条保留")
+    assert.equal(so.externalAttr, 0x81a40000, "externalAttr 必须逐条保留（它决定 unix 权限位）")
+
+    const patched = fx.zip.readEntryData(main)
+    const counts = swfHostCount(patched)
+    assert.equal(counts.old, 0, "旧 host 必须消失")
+    assert.equal(counts.authority, 1, "新 authority 必须出现且只出现一次")
+    assert.equal(patched.length, fx.fws.mainSwf.length, "entry 字节长度守恒")
+
+    // 产物 sha256 = 报告里记的 sha256
+    assert.equal(report.output.sha256, (await import("node:crypto")).createHash("sha256").update(fs.readFileSync(target)).digest("hex"))
+    assert.equal(report.output.bytes, fs.statSync(target).size)
+
+    // ANE/BackgroundWorker 不含旧 host ⇒ 断言应当通过且被记进报告
+    assert.ok(report.assertions.list.some(item => /其它 SWF/.test(item.name) && item.ok))
+})
+
+test("CWS（Deflate 压缩 SWF）基线同样能出包 —— 安卓v15.2.apk 就是这个形态", () => {
+    const target = out("cws.apk")
+    const args = baseArgs("cws").map(item => (item === fx.fws.file ? fx.cws.file : item))
+    const result = run(args)
+    assert.equal(result.status, 0, result.stderr)
+
+    const report = readReport(target)
+    assert.equal(report.swf.encodedAs, "CWS")
+    assert.equal(report.swf.repacked, true)
+    assert.equal(report.swf.logicalBytesBefore, fx.cws.logical.length)
+    assert.equal(report.swf.logicalBytesAfter, fx.cws.logical.length, "CWS 回封后逻辑长度仍守恒")
+    assert.equal(report.siteFingerprint.after.hostCount, 0)
+
+    const main = fx.zip.readZipEntries(fs.readFileSync(target)).find(entry => entry.name === MAIN_SWF)
+    const patched = fx.zip.readEntryData(main)
+    assert.equal(patched.toString("latin1", 0, 3), "CWS", "回封后必须还是 CWS，不能悄悄变成 FWS")
+    assert.equal(patched.readUInt32LE(4), fx.cws.logical.length, "CWS 头部 fileLength 要指向解压后长度")
+    const counts = swfHostCount(patched)
+    assert.equal(counts.old, 0)
+    assert.equal(counts.authority, 1)
+})
+
+// ───────────────────────── 5. 签名路径（假 apksigner） ─────────────────────────
+
+test("给了 keystore + 口令环境变量时走完整签名链，并把 verify 结果写进报告", () => {
+    const target = out("signed.apk")
+    const result = run(baseArgs("signed", ["--ks", tools.keystore, "--ks-pass-env", "SPCN_TEST_KS_PASS"]), {
+        env: { SPCN_TEST_KS_PASS: "fixture-passphrase" },
+    })
+    assert.equal(result.status, 0, result.stderr)
+
+    const stdout = String(result.stdout)
+    assert.equal(/未签名（缺凭据）/.test(stdout), false, "有凭据就不该再喊未签名")
+
+    const report = readReport(target)
+    assert.equal(report.signing.requested, true)
+    assert.equal(report.signing.signed, true)
+    assert.equal(report.signing.reason, null)
+    assert.equal(report.signing.keystore, path.basename(tools.keystore), "报告只记 keystore 文件名，不记路径也不记口令")
+    assert.equal(report.signing.passEnvVar, "SPCN_TEST_KS_PASS")
+    assert.equal(report.signing.verify.ok, true)
+    assert.match(report.signing.signerCertificateDN, /StartPoint CN Launcher/)
+    assert.equal(JSON.stringify(report).includes("fixture-passphrase"), false, "口令绝不进报告")
+    assert.equal(report.assertions.failed, 0, JSON.stringify(report.assertions.list.filter(item => !item.ok)))
+    assert.equal(fs.readFileSync(target).includes(Buffer.from("SPCN-FAKE-SIGNATURE")), true)
+})
+
+test("口令环境变量为空时不签名，也不假装成功（只记原因）", () => {
+    const target = out("nopass.apk")
+    const result = run(baseArgs("nopass", ["--ks", tools.keystore, "--ks-pass-env", "SPCN_TEST_KS_PASS"]))
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(String(result.stdout), /未签名（缺凭据）：环境变量 SPCN_TEST_KS_PASS 为空/)
+    const report = readReport(target)
+    assert.equal(report.signing.signed, false)
+    assert.match(report.signing.reason, /SPCN_TEST_KS_PASS/)
+})
+
+// ───────────────────────── 6. FFDec 版本与 AS3 钩子 ─────────────────────────
+
+test("FFDec 版本不匹配 + AS3 钩子 ⇒ 拒绝执行（整类替换会重写整份 ABC，版本敏感）", () => {
+    const result = run(baseArgs("mismatch", [
+        "--ffdec", tools.jar, "--java", tools.java, "--as3-hook", tools.hook,
+    ]), { env: { FAKE_FFDEC_VERSION: "26.2.1" } })
+    assert.equal(result.status, 2)
+    assert.match(String(result.stderr), /FFDec 版本不匹配/)
+    assert.match(String(result.stderr), /24\.0\.1/)
+    assert.equal(fs.existsSync(out("mismatch.apk")), false, "拒绝执行就不该有产物")
+})
+
+test("--allow-ffdec-version-mismatch 显式承担风险后才继续（钩子被真的调用）", () => {
+    const target = out("hook.apk")
+    const result = run(baseArgs("hook", [
+        "--ffdec", tools.jar, "--java", tools.java, "--as3-hook", tools.hook, "--allow-ffdec-version-mismatch",
+    ]), { env: { FAKE_FFDEC_VERSION: "26.2.1" } })
+    assert.equal(result.status, 0, result.stderr)
+
+    const report = readReport(target)
+    assert.equal(report.as3Hook.executed, true)
+    assert.equal(report.tools.ffdec.version, "26.2.1")
+    assert.equal(report.tools.ffdec.path, tools.jar, "报告必须记录实际用的 FFDec 路径")
+    assert.deepEqual(report.as3Hook.notes, ["fake-hook：原样返回（夹具用）"])
+    assert.equal(report.route, "as3-hook+abc-pair", "钩子没改地址 ⇒ 端点确保阶段照样兜底改写")
+    assert.equal(report.siteFingerprint.after.hostCount, 0)
+})
+
+test("版本不匹配但没开 AS3 钩子时只降级为警告（默认路线不依赖 FFDec）", () => {
+    const result = run(baseArgs("warnonly", ["--ffdec", tools.jar, "--java", tools.java]), { env: { FAKE_FFDEC_VERSION: "26.2.1" } })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(String(result.stdout), /\[WARN\] FFDec 版本 26\.2\.1/)
+    const report = readReport(out("warnonly.apk"))
+    assert.equal(report.as3Hook.executed, false)
+    assert.ok(report.warnings.some(line => /FFDec 版本/.test(line)))
+})
+
+test("--as3-hook 缺 --ffdec 时在预检就拒绝", () => {
+    const result = run(baseArgs("nohook", ["--as3-hook", tools.hook]))
+    assert.notEqual(result.status, 0)
+    assert.match(String(result.stderr || result.stdout), /--ffdec/)
+})
+
+// ───────────────────────── 7. 夹具自检（防止测试自身失效） ─────────────────────────
+
+test("夹具自检：合成 SWF 的常量对唯一且可成对改写", async () => {
+    const { findSchemeHostPair, applyApiBaseRewrite } = await import(
+        pathToFileURL(path.join(REPO, "client-patch", "build", "lib", "ios-abc.mjs")).href)
+    const pair = findSchemeHostPair(fx.fws.logical)
+    assert.equal(pair.occurrences, 1)
+    assert.equal(pair.totalBytes, 33)
+    const applied = applyApiBaseRewrite(fx.fws.logical, { hostPort: HOST_PORT })
+    assert.equal(applied.applied, 1)
+    assert.equal(applied.reason.includes("33 B 守恒"), true)
+})
+
+test("夹具自检：假 APK 能被自家 ZIP 引擎读回，v1 签名件识别得出来", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+    const entries = fx.zip.readZipEntries(fs.readFileSync(fx.fws.file))
+    assert.equal(mod.isV1SignatureEntry("META-INF/MANIFEST.MF"), true)
+    assert.equal(mod.isV1SignatureEntry("META-INF/1.SF"), true)
+    assert.equal(mod.isV1SignatureEntry("META-INF/1.RSA"), true)
+    assert.equal(mod.isV1SignatureEntry("META-INF/com.android.tools.metadata/drm/com.google.play/metadata.bin"), false)
+    assert.equal(mod.isV1SignatureEntry("assets/worldflipper_android_release.swf"), false)
+    assert.equal(mod.isV1SignatureEntry("META-INF/ANE/Android-ARM64/library.swf"), false)
+    assert.equal(mod.findMainSwfEntry(entries).name, MAIN_SWF)
+    const cws = mod.unwrapSwf(fx.cws.mainSwf)
+    assert.equal(cws.magic, "CWS")
+    assert.equal(cws.logical.length, fx.cws.logical.length)
+    assert.throws(() => mod.unwrapSwf(Buffer.concat([Buffer.from("ZWS", "latin1"), fx.cws.mainSwf.subarray(3)])), /ZWS/)
+    const argv = mod.parseArgv(["--base", "a.apk", "--host=1.2.3.4", "--dry-run", "--rename-package"])
+    assert.deepEqual(argv, { base: "a.apk", host: "1.2.3.4", "dry-run": true, "rename-package": true })
+})
