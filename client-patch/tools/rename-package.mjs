@@ -87,7 +87,7 @@ export const EQUAL_LENGTH_CANDIDATES = [
  * 必须按 `from` 现构造：iOS v15.2 的 `from` 是 `com.kulo.wf`，
  * `air.com.kulo.wf.AppEntry` 与 `com.kulo.wf.stonepack_*` 同样受保护。
  */
-function protectedRe(from = OFFICIAL_PACKAGE) {
+export function protectedRe(from = OFFICIAL_PACKAGE) {
   const esc = from.replace(/\./g, '\\.');
   return new RegExp(
     `air\\.${esc}\\.AppEntry|com\\.leiting\\.sdk\\.[A-Za-z0-9_$]+|${esc}\\.(?:stonepack_[A-Za-z0-9_]+|weekly_set_[0-9]+)`,
@@ -509,6 +509,8 @@ export function findArscPackageChunks(buf) {
 
 export function patchArscPackageName(buf, { from, to }) {
   const chunks = findArscPackageChunks(buf);
+  // 幂等：from === to 时"回读仍有旧值"的断言恒真，会把一次无害的重跑判成失败。
+  if (from === to) return { buf, found: chunks, changes: [] };
   const targets = chunks.filter((c) => c.name === from);
   const changes = [];
   let out = buf;
@@ -1499,7 +1501,11 @@ export function inspect(filePath) {
     if (kind === 'bplist') {
       const root = decodeBplist(plistBuf).value;
       report.bundleDisplayName = root?.CFBundleDisplayName ?? null;
-      report.extensionIds = (root?.Extensions ?? []).map((e) => e?.CFBundleIdentifier).filter(Boolean);
+      // plist 里 Extensions 是 **dict（id → 版本）**，不是数组；早期实现对 dict 调 .map 直接 TypeError。
+      const ext = root?.Extensions;
+      report.extensionIds = Array.isArray(ext)
+        ? ext.map((e) => e?.CFBundleIdentifier).filter(Boolean)
+        : Object.keys(ext ?? {});
     }
   } else {
     const ax = zip.entries.find((e) => e.name === 'AndroidManifest.xml');
@@ -1555,6 +1561,7 @@ export async function renameApk({
   const to = packageName;
   const warnings = [];
   const checks = [];
+  const degraded = [];
 
   const buf = readFileSync(inPath);
   const zip = parseZip(buf);
@@ -1572,6 +1579,35 @@ export async function renameApk({
 
   const equalLength = Buffer.byteLength(from) === Buffer.byteLength(to);
   const mapper = makeStringMapper({ from, to, extra: extraRenames });
+
+  // ---- 幂等短路：目标名 == 现有名 ⇒ 零改动（但照常产出产物） ----
+  // 不加这一条，第二跑会拿 `to` 当 `from` 去扫残留，把已经正确的包判成"残留 4 处"而硬失败。
+  if (from === to) {
+    if (!dryRun && outPath) {
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, buf);
+    }
+    return {
+      ok: true,
+      platform: 'android',
+      noop: true,
+      in: inPath,
+      out: outPath ?? null,
+      dryRun: Boolean(dryRun),
+      from,
+      to,
+      equalLength: true,
+      changedEntries: [],
+      droppedEntries: [],
+      plan: {},
+      checks: [{ name: 'identity.already-target', ok: true, detail: `输入已是 ${to}，零改动` }],
+      degraded: [],
+      residuals: scanResiduals(zip, { from }),
+      warnings: [],
+      unsigned: true,
+      resignCommands: [],
+    };
+  }
 
   if (!equalLength && !allowUnequalLength) {
     fail(
@@ -1627,8 +1663,11 @@ export async function renameApk({
       const hasFrom = strings.includes(from);
       const hasTo = strings.includes(to);
       if (!equalLength) {
+        // 降级项，**不进 `checks`**：`checks` 里任何 ok:false 都会被下面的聚合直接 `fail()`，
+        // 而 `--allow-unequal-length` 的语义恰恰是"明知 dex 身份串改不了、仍要出包"。
+        // 放进 degraded 是为了让它照常出现在报告里，而不是被静默吞掉。
         perEntry[e.name] = { mode: 'skipped-unequal-length', hasFrom, hasTo };
-        checks.push({ name: 'dex.identity-string', ok: false, detail: `不等长 ⇒ 跳过改写（hasFrom=${hasFrom} hasTo=${hasTo}，残留 1 处）` });
+        degraded.push({ name: 'dex.identity-string', detail: `不等长 ⇒ 跳过改写（hasFrom=${hasFrom} hasTo=${hasTo}，残留 1 处）` });
       } else if (hasFrom) {
         const res = patchDexString(data, { from, to });
         perEntry[e.name] = { mode: 'in-place', hits: res.hits.length };
@@ -1718,11 +1757,22 @@ export async function renameApk({
   }
 
   const residuals = scanResiduals(outZip, { from });
-  verify.push({
-    name: 'out.residual.identity',
-    ok: residuals.totals.identity === 0,
-    detail: `identity=${residuals.totals.identity} protected=${residuals.totals.protected} outOfScope(SKU)=${residuals.totals.outOfScope}`,
-  });
+  // 不等长时 classes.dex 的壳身份串**故意**保留旧值（dex 无法安全重构），
+  // 所以"残留 identity 必须为 0"这个断言在允许不等长的模式下恒假。
+  // 它是用户显式 --allow-unequal-length 换来的已知代价，登记为降级项而非硬失败。
+  const residualDetail = `identity=${residuals.totals.identity} protected=${residuals.totals.protected} outOfScope(SKU)=${residuals.totals.outOfScope}`;
+  if (!equalLength) {
+    degraded.push({ name: 'out.residual.identity', detail: `${residualDetail}（不等长模式下 dex 旧身份串保留，属已知代价）` });
+  } else {
+    verify.push({ name: 'out.residual.identity', ok: residuals.totals.identity === 0, detail: residualDetail });
+  }
+  // 剩下的残留必须是**受保护串**或（不等长时）dex 身份串，不能是任意东西
+  {
+    const unexplained = Object.entries(residuals.perEntry)
+      .filter(([n, v]) => v.identity > 0 && !(n === 'classes.dex' && !equalLength))
+      .map(([n, v]) => `${n}:identity=${v.identity}`);
+    verify.push({ name: 'out.residual.explained', ok: unexplained.length === 0, detail: unexplained.join(',') || '全部残留均可解释' });
+  }
 
   // 未改动条目字节保真 + 对齐不变
   {
@@ -1762,6 +1812,7 @@ export async function renameApk({
     droppedEntries: [...drop],
     plan: perEntry,
     checks: [...checks, ...verify],
+    degraded,
     residuals,
     warnings: [...warnings, ...result.warnings],
     unsigned: true,
@@ -1801,7 +1852,32 @@ export async function renameIpa({
   const fromRead = readBundleIdFromPlist(plistBuf);
   const from = fromRead.id;
   const warnings = [];
-  if (from === bundleId) fail(`Info.plist 的 CFBundleIdentifier 已经是 ${bundleId}（无需改名）`);
+  if (from === bundleId && !displayName) {
+    // 幂等：已是目标 Bundle ID 且没要求改显示名 ⇒ 零改动（照常产出产物）。
+    // 早期实现直接 fail，会让"同一份产物跑第二遍"这种正常流水线步骤无故中断。
+    if (!dryRun && outPath) {
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, buf);
+    }
+    return {
+      ok: true,
+      platform: 'ios',
+      noop: true,
+      in: inPath,
+      out: outPath ?? null,
+      dryRun: Boolean(dryRun),
+      from,
+      to: bundleId,
+      equalLength: true,
+      changedEntries: [],
+      droppedEntries: [],
+      plan: {},
+      checks: [{ name: 'identity.already-target', ok: true, detail: `Info.plist 已是 ${bundleId}，零改动` }],
+      degraded: [],
+      warnings: [],
+      resignCommands: [],
+    };
+  }
   warnings.push(`iOS 旧 Bundle ID 实测为 ${from}（Info.plist 格式：${fromRead.kind}）`);
   const mapper = makeStringMapper({ from, to: bundleId, extra: extraRenames });
 
@@ -1933,7 +2009,10 @@ function parseArgs(argv) {
         // 主开关。值可省略：`--rename-package` 单独出现 ⇒ 用默认目标 cn.starpoint.a
         args.renamePackage = true;
         const peek = argv[i + 1];
-        if (peek !== undefined && !peek.startsWith('-') && isValidPackageName(peek)) {
+        // 只要不是下一个旗标就吃掉它——**不在这里做合法性预判**，
+        // 否则 `--rename-package 1bad` 会把非法名漏给外层，报成"未知参数 1bad"，
+        // 而用户真正需要看到的是"包名不合法（需 ≥2 段…）：1bad"。
+        if (peek !== undefined && !peek.startsWith('-')) {
           i++;
           args.packageName = peek;
         }
@@ -1941,7 +2020,10 @@ function parseArgs(argv) {
       }
       case '--no-rename-package': args.renamePackage = false; break;
       case '--package':
-      case '--bundle-id': {
+      case '--bundle-id':
+      // P7 的 build-client.mjs 自己的旗标就叫 --rename-to，这里收作别名，
+      // 让 P7 可以把自己的旗标原样透传，不必做名字映射。
+      case '--rename-to': {
         // 显式给出目标名 = 明确的改名意图（与 --rename-package 等价）
         args.packageName = next();
         if (args.renamePackage === undefined) args.renamePackage = true;
@@ -1978,6 +2060,7 @@ const HELP = `rename-package.mjs — StarPoint CN 客户端共存（改包名 / 
   --rename-package [name]   主开关。省略 name ⇒ 用默认目标 ${DEFAULT_COEXIST_PACKAGE}
   --package <name>          Android 新包名（等价于 --rename-package <name>）
   --bundle-id <name>        iOS 新 Bundle ID（同上）
+  --rename-to <name>        --package 的别名（P7 build-client.mjs 的旗标名）
   --display-name <name>     iOS 同时改 CFBundleDisplayName（默认不改；共存时便于区分图标）
   --extra <old=new>         额外精确串替换（可重复，用于改 URL scheme 等）
   --allow-unequal-length    放行不等长包名（放弃 dex 身份串改写，需真机验证）
@@ -2059,6 +2142,9 @@ export async function main(argv = process.argv.slice(2)) {
     return emit(passthroughCopy(args));
   }
 
+  // 先判存在再读：否则 `--in <不存在的路径>` 会以裸 ENOENT 崩栈，
+  // P7 拿到的是一句 Node 内部错误而不是可判断的契约文案。
+  if (!existsSync(args.inPath)) fail(`输入不存在：${args.inPath}`);
   const buf = readFileSync(args.inPath);
   const zip = parseZip(buf);
   const isIpa = zip.entries.some((e) => /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.name));
@@ -2099,6 +2185,14 @@ function printInspect(report, asJson) {
 
 function printReport(report) {
   const L = [];
+  if (report.noop) {
+    L.push(`[rename-package] 幂等：${report.platform} 已是 ${report.to}——零改动`);
+    L.push(`  ${report.in}`);
+    if (report.out) L.push(`  已写出（逐字节等于输入）：${report.out}`);
+    else L.push('  （只分析，未写文件）');
+    process.stdout.write(`${L.join('\n')}\n`);
+    return;
+  }
   if (report.renamed === false) {
     L.push(`[rename-package] 默认关（未指定 --rename-package）——零改动透传`);
     L.push(`  ${report.platform}  ${report.in}`);
@@ -2113,6 +2207,7 @@ function printReport(report) {
     L.push(`  改 ${c.name}: csize ${c.before.csize}→${c.after.csize} usize ${c.before.usize}→${c.after.usize}（${c.mode}）`);
   }
   L.push(`  残留：identity=${report.residuals.totals.identity} protected=${report.residuals.totals.protected} outOfScope=${report.residuals.totals.outOfScope}`);
+  for (const d of report.degraded ?? []) L.push(`  ⚠ 降级：${d.name} — ${d.detail}`);
   for (const w of report.warnings) L.push(`  ⚠ ${w}`);
   if (report.out) L.push(`  已写出：${report.out}`);
   else L.push('  （只分析，未写文件）');
