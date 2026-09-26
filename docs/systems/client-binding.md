@@ -347,6 +347,13 @@ HTTP 状态**恒为 200**，响应体走游戏服务路由族一贯的 msgpack
 - 验证码台账：`GET /api/bindings/codes?accountId=<id>`
 - 审计流水：`bind_audit` 表（写入在 `src/data/domains/account-binding.ts:188`，
   查询在 `:216`）
+- 自动化：`tools/sp_auth.test.cjs`（登录页六路由与错误码）、
+  `tools/account_binding.test.cjs`（领域函数与状态机）、
+  `tools/bind_gate.test.cjs`（闸门两态、白名单与载荷形状）、
+  `tools/bindings_api.test.cjs` 与 `tools/bot_api.test.cjs`（两个控制面）、
+  `tests/admin-bindings-ui-source.test.js`（后台绑定管理页接线）。
+  前三条在 `integration:database` 组，后三条在 `admin` 组
+  （分组表见 `tools/test-workflow/groups.cjs`，改动选测逻辑见 `tools/test-workflow/select-tests.cjs`）
 
 ## 边界与未覆盖项
 

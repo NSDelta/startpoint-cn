@@ -75,7 +75,8 @@ node client-patch/tools/rename-package.mjs \
 ```
 
 也可以让产线透传:`--rename-package --rename-to <pkg>`(缺该工具时产线明确报错,不会静默忽略)。
-iOS 侧同一工具也能改 `CFBundleIdentifier`。
+iOS 侧同一工具也能改 `CFBundleIdentifier`。回归测试:`tools/rename_package.test.cjs`(在
+`quick:runtime` 组),产线自身的回归是 `tools/build_client.test.cjs`(同组)。
 
 ## 注册验证码版客户端(自研登录页)
 
