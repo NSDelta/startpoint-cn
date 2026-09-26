@@ -15,9 +15,11 @@
  * shim 再 import，从而**不复制**解析代码，也不改动 P0 的领地。
  *
  * 用法：
- *   node p6-build.mjs [--base <swf>] [--out <swf>] [--work <目录>] [--ffdec <jar>] [--list]
- *   --list 只解析并打印靶方法的 bodyIndex，不编译不替换。
+ *   node p6-build.mjs [--base <swf>] [--out <swf>] [--work <目录>] [--ffdec <jar>] [--list] [--dump-as3]
+ *   --list     只解析并打印靶方法的 bodyIndex，不编译不替换。
+ *   --dump-as3 额外跑两次全量 `-dumpAS3` 并比对类清单 sha 与基线一致（慢：各约 1–2 分钟）。
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -94,6 +96,17 @@ function normalizeBlock(text) {
     .map((l) => l.trim())
     .filter((l) => l !== "" && !l.startsWith("debug "))
     .join("\n");
+}
+
+/** `-dumpAS3` 的类清单（写到文件并返回 sha256）；几十 MB 输出，慢，故只在 --dump-as3 时跑 */
+function dumpAs3List(swf, outFile) {
+  const r = spawnSync("java", ["-Xmx4g", "-Djava.awt.headless=true", "-jar", FFDEC_JAR, "-air", "-onerror", "abort", "-dumpAS3", swf], {
+    encoding: "buffer",
+    maxBuffer: 512 * 1024 * 1024,
+  });
+  if (r.status !== 0) throw new Error(`-dumpAS3 失败（exit ${r.status}）：${String(r.stderr).slice(0, 400)}`);
+  fs.writeFileSync(outFile, r.stdout);
+  return sha256File(outFile);
 }
 
 const main = async () => {
@@ -207,6 +220,15 @@ const main = async () => {
   }
   assert(missing === 0, `基座全部方法体在产物中仍存在（缺失 ${missing}）`);
   assert(changedOther.length === 0, `除靶方法外其它方法体逐字节不变（变了 ${changedOther.length} 个${changedOther.length ? "：" + changedOther.slice(0, 8).join(",") : ""}）`);
+
+  if (args["dump-as3"] !== undefined) {
+    step("6b 类清单 sha（-dumpAS3，可选，各跑一次全量 dump）");
+    const sha0 = dumpAs3List(BASE, path.join(WORK, "base.as3list.txt"));
+    const sha1 = dumpAs3List(OUT, path.join(WORK, "final.as3list.txt"));
+    log(`base  = ${sha0}`);
+    log(`final = ${sha1}`);
+    assert(sha0 === sha1, "AS3 类清单（含全部脚本）与基线逐行一致");
+  }
 
   // 靶方法：产物中必须能被完整回读成与注入块一致的 pcode（空体在此判死）
   const pcDir2 = path.join(WORK, "pcode_final");

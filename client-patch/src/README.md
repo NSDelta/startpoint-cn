@@ -52,10 +52,15 @@ node D:\wfcnmod\wt\p6\client-patch\src\tools\p6-build.mjs --list     # 只打印
    `java -jar ffdec.jar -air -onerror abort -replace <in.swf> <out.swf> <FQCN> <块.pcode> <bodyIndex>`
    链式回填 **原始 `base.swf`**（不传 format；块文件是 **pcode 汇编**，喂 `.as` 一律 `exit 1`
    `CharacterId does not exist`）。
-6. **强制回读校验**（只信 exit code 会翻车，见 §5 坑 1）。
+6. **强制回读校验**（只信 exit code 会翻车，见 §5 坑 1）。加 `--dump-as3` 会再跑两次全量
+   `-dumpAS3` 比对**类清单 sha 与基线一致**（慢，默认关）。
 
-产物：`D:\wfcnmod\tmp\p6\out\sp-cn-p6-pcode.swf`（29,067,411 B；base 29,052,839 B，+14,572 B）。
-报告：`D:\wfcnmod\tmp\p6\build\p6-build-report.json`。
+产物：`D:\wfcnmod\tmp\p6\out\sp-cn-p6-pcode.swf`（29,067,411 B；base 29,052,839 B，+14,572 B），
+sha256 `156EDD0CAD4956FB18683FB6FF2E5ACA787E7A3BEA02C4C80645079479191F24`
+（**两次独立构建 sha 相同 ⇒ 可复现**）。
+报告：`D:\wfcnmod\tmp\p6\build\p6-build-report.json`。实测 **30/30 断言 PASS、`ALL PASS`、exit 0**
+（含：DoABC tag 285→285、方法体 96,392→96,392、`other_bodies_changed=0`、类清单 sha
+`13d36fd8929abcb0dfc50843cfdfcbce6143c83e15f7ded6f3837b40fc6db8c9` 前后一致）。
 
 ## 4. Plan A / Plan B
 
@@ -75,6 +80,9 @@ Plan B 的代价：载体源必须**保持与原始类完全相同的成员集�
 
 1. **块文件不存在时 `-replace` 照样 `exit 0`**，并把靶方法体写成**空体**，SWF 反而**变小**
    （29,052,839 → 29,052,829 B）。⇒ 必须回读校验，禁止只看 exit code。
+   （注意「产物比 base 大」只是**启发式**：FFDec 重存时会重新压缩 DoABC tag，这里的体积变化里混着
+   压缩噪声——决定性的三条是**回读靶方法体 pcode 逐行一致**、**其它方法体 sha 全不变**、
+   **方法体总数不变**。）
 2. 路线 B **只吃 pcode 汇编块**，不吃 `.as`：喂 AS3 报 `CharacterId does not exist`（exit 1）。
 3. 块文件必须从 `trait method QName(...)` 行起、到同缩进 `end ; method` 止；**不能从
    `public function ...` 起**（FFDec 会报 `Invalid instruction name:public`）。
