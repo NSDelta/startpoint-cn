@@ -604,6 +604,107 @@ test("改名回读：UTF-8 变体 manifest 与 application.xml 的 <id> 一并�
     assert.equal(result.applicationXmlHasTo, false)
 })
 
+// ─────────── 8b. 身份残留计数器的字节级契约（isIdentByte / countIdentityResidues 未导出，全经 checkRenamedApk 观察） ───────────
+//
+// E17：`--rename-package` 后统计旧包名残留，**只有落在标识符开头的命中才算残留**；出现在更长标识符
+// 内部的（AIR 入口类 air.<旧包名>.AppEntry，前一个字节是 `.`）是受保护串。判定只看命中**左侧一个字节**
+// 是否属于 isIdentByte（0-9 A-Z a-z _ $ . -），右侧只影响样例文本的截断。
+// 下面每个用例都用一份独立的合成 manifest，避免一处命中污染另一处。
+
+/** 造一份只含 manifest 的夹具并回读；manifestUtf16=false 时走 UTF-8 变体（另一条编码分支）。 */
+async function residueProbe({ manifestText, manifestUtf16 = true }) {
+    const mod = await import(pathToFileURL(CLI).href)
+    return mod.checkRenamedApk(renameFixtureApk({ manifestText, manifestUtf16 }), { from: OLD_PKG, to: NEW_PKG })
+}
+
+test("残留计数：独立出现的旧包名（前后都不是标识符字节）必须计数，样例不被吞长", async () => {
+    const result = await residueProbe({ manifestText: `<manifest package="${OLD_PKG}"/>` })
+    // 朴素 substring 在这里也命中 —— 这是「必须计数」的正向钉子：判定收得过紧就会漏报真残留。
+    assert.equal(result.manifestHasFrom, true, "整串 substring 确实还在（但这一项不是判据）")
+    assert.equal(result.manifestFromResidues, 1)
+    assert.deepEqual(result.manifestFromResidueSamples, [OLD_PKG], "右侧紧跟 「\"」（0x22）不是标识符字节 ⇒ 样例到命中末尾为止")
+})
+
+test("残留计数：air.<旧包名>.AppEntry 单独出现时一处都不计数（前一个字节是 `.`，属于更长标识符）", async () => {
+    const entry = `air.${OLD_PKG}.AppEntry`
+    const result = await residueProbe({ manifestText: `<application android:name="${entry}"/>` })
+    assert.equal(result.manifestHasFrom, true, `整串 substring 仍在（藏在 ${entry} 内部）`)
+    assert.equal(result.manifestFromResidues, 0, "受保护串：入口类名被逐字保留是正确产物，不能判死")
+    assert.deepEqual(result.manifestFromResidueSamples, [], "不计数就不给样例")
+})
+
+test("残留计数：紧邻字母/数字/下划线/$/-/. 时按「更长标识符内部」不计数，紧邻其它字节则计数", async () => {
+    for (const prev of ["A", "z", "0", "9", "_", "$", ".", "-"]) {
+        const result = await residueProbe({ manifestText: `<m v="${prev}${OLD_PKG}"/>` })
+        assert.equal(result.manifestHasFrom, true, `prev=${JSON.stringify(prev)}：substring 确实在`)
+        assert.equal(result.manifestFromResidues, 0, `prev=${JSON.stringify(prev)} 是标识符字节 ⇒ 不得计数`)
+        assert.deepEqual(result.manifestFromResidueSamples, [], `prev=${JSON.stringify(prev)} 不计数就不给样例`)
+    }
+    for (const prev of [" ", "/", ":", ">", "@", "[", "`", "{"]) {
+        const result = await residueProbe({ manifestText: `<m v="${prev}${OLD_PKG}"/>` })
+        assert.equal(result.manifestFromResidues, 1, `prev=${JSON.stringify(prev)} 不是标识符字节 ⇒ 必须计数`)
+        assert.deepEqual(result.manifestFromResidueSamples, [OLD_PKG], `prev=${JSON.stringify(prev)}`)
+    }
+})
+
+test("残留计数：命中落在缓冲区首字节或正好收尾时都要计数（越界保护不得吞掉边界命中）", async () => {
+    const atStart = await residueProbe({ manifestText: `${OLD_PKG}/>` })      // index === 0 ⇒ left < 0 分支
+    assert.equal(atStart.manifestFromResidues, 1)
+    assert.deepEqual(atStart.manifestFromResidueSamples, [OLD_PKG])
+
+    const atEnd = await residueProbe({ manifestText: `<m v="${OLD_PKG}` })    // 命中正好顶到 buffer 末尾，右侧无字节可读
+    assert.equal(atEnd.manifestFromResidues, 1)
+    assert.deepEqual(atEnd.manifestFromResidueSamples, [OLD_PKG], "末尾没有可并入的字节 ⇒ 样例不外溢")
+})
+
+test("残留计数：同一行真残留与 AppEntry 混合时，计数 = 真残留处数（受保护串贡献 0）", async () => {
+    const manifest = `<manifest package="${OLD_PKG}">`
+        + `<provider android:authorities="${OLD_PKG}.fileprovider"/>`
+        + `<application android:name="air.${OLD_PKG}.AppEntry"/>`
+        + `</manifest>`
+    const mixed = await residueProbe({ manifestText: manifest })
+    assert.equal(mixed.manifestHasFrom, true)
+    assert.equal(mixed.manifestFromResidues, 2, "package= 1 处 + authorities 1 处；AppEntry 那处不计")
+    assert.deepEqual(mixed.manifestFromResidueSamples, [OLD_PKG, `${OLD_PKG}.fileprovider`],
+        "样例按出现顺序给出，且右侧标识符字节（.fileprovider）并入样例")
+
+    // 与上一份一一对照：把真残留减到 1 处，计数必须跟着变成 1（不是「只要有 AppEntry 就固定值」）。
+    const single = `<manifest package="${NEW_PKG}"><application android:name="air.${OLD_PKG}.AppEntry"/>`
+        + `<provider android:authorities="${OLD_PKG}.vp"/></manifest>`
+    const one = await residueProbe({ manifestText: single })
+    assert.equal(one.manifestFromResidues, 1, "1 处真残留 + 1 处 AppEntry ⇒ 1")
+    assert.deepEqual(one.manifestFromResidueSamples, [`${OLD_PKG}.vp`])
+})
+
+test("残留计数：isIdentByte 的字节集合由样例右边界暴露（0-9 A-Z a-z _ $ . - 是，其余截断）", async () => {
+    const IDENT = ["0", "9", "A", "Z", "a", "z", "_", "$", ".", "-"]
+    const NON_IDENT = [" ", "\t", "\"", "/", ":", "@", "[", "]", "^", "`", "{", "|", "}", "~",
+        "+", "=", ",", ";", "!", "?", "%", "&", "*", "(", ")", "#", "<", ">", "\\", "'"]
+    const hex = (c) => `0x${c.charCodeAt(0).toString(16)}`
+    for (const c of IDENT) {
+        const result = await residueProbe({ manifestText: `<m v="${OLD_PKG}${c}X"/>` })
+        assert.equal(result.manifestFromResidues, 1, `c=${hex(c)}（左侧是 " 不影响计数）`)
+        assert.deepEqual(result.manifestFromResidueSamples, [`${OLD_PKG}${c}X`], `c=${hex(c)} 是标识符字节 ⇒ 样例继续并入 X`)
+    }
+    for (const c of NON_IDENT) {
+        const result = await residueProbe({ manifestText: `<m v="${OLD_PKG}${c}X"/>` })
+        assert.equal(result.manifestFromResidues, 1, `c=${hex(c)}`)
+        assert.deepEqual(result.manifestFromResidueSamples, [OLD_PKG], `c=${hex(c)} 不是标识符字节 ⇒ 样例在它之前截断`)
+    }
+    // 非 ASCII 字节（UTF-8 的 0xE4…）不在集合里：标识符集合是纯 ASCII 的。
+    const nonAscii = await residueProbe({ manifestText: `<m v="${OLD_PKG}中X"/>`, manifestUtf16: false })
+    assert.equal(nonAscii.manifestFromResidues, 1)
+    assert.deepEqual(nonAscii.manifestFromResidueSamples, [OLD_PKG], "0xE4 不是标识符字节 ⇒ 截断")
+})
+
+test("残留计数：真残留超过 8 处时 count 照实累加、samples 只留前 8 条（报告样例有上限）", async () => {
+    const manifest = Array.from({ length: 9 }, () => `<x a="${OLD_PKG}"/>`).join("")
+    const result = await residueProbe({ manifestText: manifest })
+    assert.equal(result.manifestFromResidues, 9, "count 不受样例上限影响")
+    assert.equal(result.manifestFromResidueSamples.length, 8, "samples 上限 8")
+    assert.equal(result.manifestFromResidueSamples.every(sample => sample === OLD_PKG), true)
+})
+
 // ─────────── 9. 钩子合法改变 SWF 长度（长度守恒的参照 = 改写前那一刻，不是基线） ───────────
 
 const GROWING_HOOK = `export async function transformSwf(ctx) {
