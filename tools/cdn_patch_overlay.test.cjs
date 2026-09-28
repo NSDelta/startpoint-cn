@@ -9,6 +9,7 @@ require("ts-node/register/transpile-only")
 
 const { buildCdnCatalog, CatalogValidationError } = require("../src/content/cdn/catalog-builder")
 const { PatchOverlayError, scanPatchOverlay } = require("../src/content/cdn/patch-overlay")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const LAYERS = [
     ["common", "archive-common-diff", "common"],
@@ -152,6 +153,7 @@ test("manifest schema errors include patch version and relative path context", a
 })
 
 test("rejects a patch version directory replaced by a symlink after root discovery", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { paths } = createFixture(t)
     writePackage(paths, {
         baseVersion: "1.4.54",
@@ -286,6 +288,7 @@ test("rejects missing and cyclic content dependencies", async t => {
 })
 
 test("rejects directory, target, size, and symlink violations after manifest activation", async t => {
+    if (!requireCapability(t, "symlink")) return
     await t.test("directory", async t => {
         const { paths } = createFixture(t)
         writePackage(paths, {

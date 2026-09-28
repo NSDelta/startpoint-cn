@@ -22,6 +22,7 @@ const {
     PERIODIC_REWARD_TABLE_SOURCES,
 } = require("../src/content/converters/periodic-reward")
 const { LOGIN_BONUS_SOURCE } = require("../src/content/converters/login-bonus")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 const {
     hashResourcePath,
     serializeNestedOrderedMap,
@@ -1407,6 +1408,7 @@ test("lock waits, times out clearly, releases by token and identity, and leaves 
 })
 
 test("lock rejects a symlink and reports an existing legacy lock", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { paths, sandbox } = createSandbox(t, "content-sync-lock-link-")
     fs.mkdirSync(paths.contentStateDir)
     const outside = path.join(sandbox, "outside.lock")

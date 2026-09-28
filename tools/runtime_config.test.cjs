@@ -11,6 +11,7 @@ require("ts-node/register/transpile-only")
 const projectRoot = path.resolve(__dirname, "..")
 const { parseCnRuntimeConfig } = require("../src/runtime/config")
 const { resolveDisplayHost } = require("../src/runtime/network-host")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 test("runtime network defaults are loopback-only and stable", () => {
     const config = parseCnRuntimeConfig({
@@ -194,6 +195,7 @@ test("embedded runtime requires one absolute Data Volume and forbids content pat
 })
 
 test("embedded Data Volume is physically isolated from the Bundle and local CDN", t => {
+    if (!requireCapability(t, "symlink")) return
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "embedded-runtime-paths-"))
     t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
     const bundleRoot = path.join(sandbox, "bundle")

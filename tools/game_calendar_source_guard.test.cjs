@@ -157,6 +157,16 @@ const PRODUCTION_TREE_MASTER_REGEX_PATTERN = {
 
 const CALENDAR_POLICY_FILE = "time/game-calendar.ts"
 
+// Every path table in this file (RUNTIME_TARGET_FILES, RUNTIME_FILE_EXTRA_PATTERNS,
+// PRODUCTION_TREE_ALLOWLIST, CALENDAR_POLICY_FILE) is written POSIX-shaped, and the
+// violations it reports are read by humans and matched against those tables. Normalise
+// path.relative's output so the guard behaves identically on Windows, where it would
+// otherwise yield "time\game-calendar.ts" and fail to exempt the policy module it is
+// required to exempt.
+function toPosixPath(relativePath) {
+    return relativePath.split(path.sep).join("/")
+}
+
 // Deliberately empty. If the full-tree scan trips on a site, migrate the site
 // to GameCalendarPolicy (or tighten the pattern only if the site is genuinely
 // calendar-independent); never add allowlist entries.
@@ -219,7 +229,7 @@ function findViolations(relativePath, content, patterns = FORBIDDEN_PATTERNS) {
 function findTreeViolations() {
     const violations = []
     for (const filePath of listConverterSourceFiles()) {
-        const relativePath = path.relative(path.dirname(CONVERTERS_DIR), filePath)
+        const relativePath = toPosixPath(path.relative(path.dirname(CONVERTERS_DIR), filePath))
         violations.push(...findViolations(relativePath, fs.readFileSync(filePath, "utf8")))
     }
     return violations
@@ -245,7 +255,7 @@ function findRuntimeViolations() {
 function findProductionTreeViolations() {
     const violations = []
     for (const filePath of listProductionSourceFiles()) {
-        const relativePath = path.relative(SRC_ROOT, filePath)
+        const relativePath = toPosixPath(path.relative(SRC_ROOT, filePath))
         violations.push(...findViolations(
             relativePath,
             fs.readFileSync(filePath, "utf8"),

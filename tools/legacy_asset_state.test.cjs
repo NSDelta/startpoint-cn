@@ -7,6 +7,7 @@ const path = require("node:path")
 const test = require("node:test")
 
 require("ts-node/register/transpile-only")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const projectRoot = path.resolve(__dirname, "..")
 const modulePath = path.join(projectRoot, "src/routes/api/legacy-asset-state.ts")
@@ -42,6 +43,7 @@ test("legacy asset state publishes changed mods once and exposes the new version
 })
 
 test("legacy asset state never follows a metadata target symlink", t => {
+    if (!requireCapability(t, "symlink")) return
     const layout = temporaryLayout(t)
     fs.mkdirSync(layout.assetProviderDir, { recursive: true })
     fs.writeFileSync(path.join(layout.modsDir, "fixture.zip"), "changed mod")
@@ -55,6 +57,7 @@ test("legacy asset state never follows a metadata target symlink", t => {
 })
 
 test("legacy asset state rejects a symlinked asset provider directory", t => {
+    if (!requireCapability(t, "symlink")) return
     const layout = temporaryLayout(t)
     const external = path.join(layout.root, "external")
     fs.mkdirSync(path.dirname(layout.assetProviderDir), { recursive: true })

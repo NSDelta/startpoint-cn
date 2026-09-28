@@ -22,6 +22,7 @@
 const fs = require("node:fs")
 const os = require("node:os")
 const path = require("node:path")
+const { spawnSync } = require("node:child_process")
 
 const PROBE_DIRECTORY_PREFIX = "capability-probe-"
 
@@ -110,6 +111,31 @@ const CAPABILITIES = {
             }
             return true
         }),
+    },
+    zipCli: {
+        name: "the external `zip` command-line tool",
+        enable: process.platform === "win32"
+            ? "install `zip` and put it on PATH (e.g. the usr/bin directory of Git for Windows, MSYS2, or 7-Zip's zip.exe)"
+            : "install the `zip` package for this distribution",
+        probe: () => {
+            const result = spawnSync("zip", ["-v"], { encoding: "utf8" })
+            if (result.error !== undefined && result.error !== null) {
+                return `running "zip -v" failed with ${errorCode(result.error)}`
+            }
+            if (result.status !== 0) {
+                return `"zip -v" exited with status ${result.status}`
+            }
+            return true
+        },
+    },
+    oNoFollow: {
+        name: "the POSIX O_NOFOLLOW open flag",
+        enable: process.platform === "win32"
+            ? "Windows has no O_NOFOLLOW at all; run this suite on Linux/macOS to cover it"
+            : "this host should define O_NOFOLLOW; check how Node.js was built for it",
+        probe: () => (typeof fs.constants.O_NOFOLLOW === "number"
+            ? true
+            : "fs.constants.O_NOFOLLOW is not defined on this platform"),
     },
 }
 

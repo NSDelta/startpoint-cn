@@ -27,6 +27,7 @@ const {
     parseReleaseManifest,
 } = require("../src/content/sync/schema")
 const { importBundledTable } = require("../src/content/sync/bundled-importer")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 test("CDN overview reports the registry scope counts from code", () => {
     const counts = TABLE_SOURCES.reduce((result, definition) => {
@@ -802,6 +803,7 @@ test("bundled importer maps registry assets paths below a configured runtime roo
 })
 
 test("bundled importer rejects damaged JSON and symlink escapes", async t => {
+    if (!requireCapability(t, "symlink")) return
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "content-registry-"))
     const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "content-registry-outside-"))
     t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }))
@@ -865,6 +867,7 @@ test("bundled importer redacts nested absolute paths from open failures", async 
 })
 
 test("bundled importer rejects a symlink swapped in after realpath validation", async t => {
+    if (!requireCapability(t, "symlink")) return
     const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "content-registry-race-"))
     const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "content-registry-race-outside-"))
     const sourcePath = path.join(temporaryRoot, "assets", "payment_products.json")
