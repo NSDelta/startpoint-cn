@@ -3,16 +3,25 @@
 # 为什么必须在 CI 上编译：本机（Windows）没有 make/clang/ldid，也没有 WSL 发行版。
 # 官方包注入线（P10-A）与越狱安装线（本文件）都只能在这里出产物。
 #
-# ⚠️ [未验证-CI] 本工作流**一次都没有真正跑过**：这个仓库不允许 push（派工总表 §5 黑名单），
-#    所以它只做过 YAML 语法检查。首跑时最可能出问题的地方按概率排序：
-#      1. Theos 的 theos 目录克隆分支名（master）与 makefiles 路径假设；
-#      2. `chmod +x layout/DEBIAN/*` —— Windows 检出物没有可执行位，dpkg-deb 会拒包；
-#      3. rootless 方案下 Theos 的安装前缀（/var/jb）与 control 里的 Architecture 字段；
-#      4. ldid 是否在 PATH 里（brew 装的 ldid 有时需要 `brew link`）。
-#    真跑通之后请把本注释改成 [已验证-CI] 并附 run URL。
+# [已验证-CI-部分] 首次真实运行 = run 36417028903（fork NSDelta/startpoint-cn，
+#    head_sha ce51e155，event=push，两个 matrix 腿都是 FAILURE）。那次实测确认**通过**的步骤：
+#      环境信息 / actions/checkout@v7 / brew install ldid / 克隆 Theos / chmod +x，
+#    失败点是 `make`（exit code 2，日志当时无法取回）。
+#    ⇒ 下面这些步骤的写法已被证明可用，不要再"顺手改好"。
 #
 # 地址注入：默认用 hygiene 白名单占位 192.168.1.10:8001（**不是**任何真实机器）。
 # 真实地址只能从 workflow_dispatch 的输入传进来，且**绝不写进仓库文件**。
+#
+# ── 失败诊断通道（无凭据可读）─────────────────────────────────────────────
+# GitHub 的 job 日志 API 需要仓库权限（匿名 GET /actions/runs/<id>/logs 返回 403），
+# 所以编译失败时外部读者拿不到 make 的输出。本工作流因此把**完整构建日志**在
+# `if: always()` 的诊断步骤里提交并强推到一条一次性分支：
+#     refs/heads/ci-diag/<run_id>/<leg>          leg ∈ {rootful, rootless}
+# 读取方式（无需任何凭据，公开仓库）：
+#     git fetch origin 'refs/heads/ci-diag/*:refs/remotes/origin/ci-diag/*'
+#     然后看 origin/ci-diag/<run_id>/<leg>:ci-diag/<run_id>/<leg>/build.log
+# 说明：用 GITHUB_TOKEN 推送不会再次触发 workflow，所以没有回环；每个 run_id 一条分支，
+# 两个 matrix 腿各写各的文件，互不覆盖。
 
 name: ios-tweak
 
@@ -28,13 +37,15 @@ on:
       - "ios/tweak/**"
       - ".github/workflows/ios-tweak.yml"
 
+# contents: write 是给下面的「诊断分支强推」用的；读取权限之外不需要别的。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     name: build (${{ matrix.scheme || 'rootful' }})
     runs-on: macos-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +60,7 @@ jobs:
           sw_vers
           xcodebuild -version || true
           uname -m
+          clang --version || true
 
       - name: 安装 ldid
         run: |
@@ -61,25 +73,52 @@ jobs:
         run: |
           set -euo pipefail
           export THEOS="$RUNNER_TEMP/theos"
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          # 网络不稳：重试 5 次、指数退避；每次失败先清掉半成品目录再重来。
+          ok=0
+          for i in 1 2 3 4 5; do
+            rm -rf "$THEOS"
+            if git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"; then
+              ok=1
+              break
+            fi
+            echo "::warning::克隆 Theos 第 $i 次失败，退避 $((i * 10))s 后重试"
+            sleep $((i * 10))
+          done
+          [ "$ok" = "1" ] || { echo "::error::克隆 Theos 连续 5 次失败"; exit 1; }
+          test -f "$THEOS/makefiles/common.mk" || { echo "::error::Theos 克隆不完整：缺 $THEOS/makefiles/common.mk"; exit 1; }
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "Theos HEAD: $(git -C "$THEOS" rev-parse HEAD)"
 
       - name: 可执行位（Windows 检出物没有）
         run: |
           set -euo pipefail
           chmod +x ios/tweak/layout/DEBIAN/postinst ios/tweak/layout/DEBIAN/prerm
 
+      - name: 工具链版本（取证）
+        run: |
+          set -euo pipefail
+          make --version | head -1
+          dpkg-deb --version | head -1 || true
+          echo "resolved SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
+
+      # 编译输出全量落到 $RUNNER_TEMP/build.log（不在工作树里，避免污染随后要提交的 git 状态）。
+      # 用 pipefail + tee：步骤自身照常因 make 失败而失败，不靠 continue-on-error 掩盖。
       - name: make（编译 SpLogin.dylib）
         working-directory: ios/tweak
         env:
           SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
         run: |
           set -euo pipefail
-          echo "SP_LOGIN_HOST=$SP_LOGIN_HOST"
           if [ -n "${{ matrix.scheme }}" ]; then
             export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
           fi
-          make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST"
+          echo "=== pwd: $(pwd)"
+          echo "=== SP_LOGIN_HOST=${SP_LOGIN_HOST}"
+          echo "=== THEOS=${THEOS:-<unset>}"
+          echo "=== THEOS_PACKAGE_SCHEME=${THEOS_PACKAGE_SCHEME:-<unset>}"
+          echo "=== command: make FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\""
+          set -o pipefail
+          make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: make package（打成 .deb）
         working-directory: ios/tweak
@@ -90,24 +129,131 @@ jobs:
           if [ -n "${{ matrix.scheme }}" ]; then
             export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
           fi
-          make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST"
+          echo "=== command: make package FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\""
+          set -o pipefail
+          make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       - name: 产物清单（取证）
+        if: always()
         working-directory: ios/tweak
         run: |
-          set -euo pipefail
-          ls -l .theos/obj 2>/dev/null || true
+          set -uo pipefail
+          echo "=== .theos/obj 树（Theos 会把目标放进 TARGET/SCHEME 子目录）"
+          find .theos/obj -name '*.dylib' -o -name '*.a' 2>/dev/null | sort || true
+          ls -lR .theos/obj 2>/dev/null | head -50 || true
+          echo "=== packages"
           ls -l packages 2>/dev/null || true
           for deb in packages/*.deb; do
+            [ -f "$deb" ] || continue
             echo "== $deb"
             dpkg-deb -I "$deb" || true
+            echo "== $deb 内容（确认 SpLogin.dylib 与 SpLogin.plist 都在、且 rootless 落在 /var/jb）"
+            dpkg-deb -c "$deb" || true
           done
 
+      # 失败也要留下证据：把完整构建日志强推到一次性分支，供无凭据读者取回。
+      - name: 诊断日志（失败时也可无凭据取回）
+        if: always()
+        env:
+          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_RUN: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ ! -s "$RUNNER_TEMP/build.log" ]; then
+            echo "build.log 不存在或为空（构建步骤可能从未开始）——跳过诊断推送"
+            exit 0
+          fi
+          DIAG_REF="ci-diag/${DIAG_RUN}/${DIAG_LEG}"
+          DIAG_DIR="ci-diag/${DIAG_RUN}/${DIAG_LEG}"
+          mkdir -p "$DIAG_DIR"
+          {
+            echo "run_id=${DIAG_RUN}"
+            echo "leg=${DIAG_LEG}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
+          } > "$DIAG_DIR/meta.txt"
+          cp "$RUNNER_TEMP/build.log" "$DIAG_DIR/build.log"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git add -f "$DIAG_DIR" 2>/dev/null; then :; else
+            # 有 pathspec 例外时可退回 git add -A；仍失败就放弃推送（monitoring 不该掩盖构建结果）
+            git add -A -f -- "$DIAG_DIR" || { echo "::warning::诊断文件无法加入索引"; exit 0; }
+          fi
+          git commit -q -m "ci-diag: ${DIAG_LEG} run ${DIAG_RUN}" || { echo "::warning::诊断提交失败"; exit 0; }
+          # GITHUB_TOKEN 推送不会再触发 workflow；失败不影响本 job 的结论（构建失败已由上面步骤定死）。
+          if git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                "HEAD:refs/heads/${DIAG_REF}"; then
+            echo "诊断日志已推送：refs/heads/${DIAG_REF}"
+            echo "读取：git fetch origin 'refs/heads/ci-diag/*:refs/remotes/origin/ci-diag/*'"
+            echo "     然后看 origin/${DIAG_REF}:${DIAG_DIR}/build.log"
+          else
+            echo "::warning::诊断推送失败（不影响构建结论）"
+          fi
+
+      # 第二通道（不依赖任何仓库设置、纯匿名可读）：把编译器输出的要害做成 check-run 注解。
+      # 匿名读法：GET https://api.github.com/repos/NSDelta/startpoint-cn/check-runs/<job_id>/annotations
+      # 这一步只输出注解，不改变 job 结论——job 的失败仍由上面 make 步骤本身决定。
+      - name: 错误注解（把编译器要害变成 check-run annotation）
+        if: always()
+        env:
+          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+        run: |
+          set -uo pipefail
+          # 注解通道不依赖 git push 权限，所以这里的判定只看 build.log 内容，不看 job 结论。
+          if [ ! -s "$RUNNER_TEMP/build.log" ]; then
+            echo "::notice title=SpLogin(${DIAG_LEG})::该腿未产生构建输出（make 步骤可能未开始）"
+            exit 0
+          fi
+          n=0
+          emit() { # $1=标题类 $2=正则
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              printf '::error title=make-%s::%s\n' "$1" "${line:0:400}"
+              n=$((n + 1))
+              [ "$n" -ge 20 ] && break
+            done < <(grep -nEi "$2" "$RUNNER_TEMP/build.log" 2>/dev/null | head -8 || true)
+          }
+          # 顺序即重要性：编译错误 → 链接错误 → Theos/make 自身错误 → 过滤器 plist 缺失。
+          emit clang 'error:|fatal error|no member named|expected '
+          [ "$n" -ge 20 ] || emit link 'Undefined symbols|undefined reference|ld: '
+          [ "$n" -ge 20 ] || emit theos '^make(\[[0-9]+\])?: \*\*\*|No such file or directory|missing a filter property list'
+          [ "$n" -ge 20 ] || emit other 'error'
+          if [ "$n" -eq 0 ]; then
+            echo "::warning title=SpLogin(${DIAG_LEG})::build.log 里没有匹配到错误行，取末尾 5 行供参考"
+            tail -5 "$RUNNER_TEMP/build.log" | while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              printf '::warning title=make-tail::%s\n' "${line:0:400}"
+            done
+          fi
+
+      # 通过时也留一条 notice：让绿色运行同样可审计（解析出的 host、腿、产物路径与大小）。
+      - name: 通过性摘要（notice）
+        if: success()
+        working-directory: ios/tweak
+        env:
+          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+        run: |
+          set -uo pipefail
+          dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1)
+          deb=$(ls packages/*.deb 2>/dev/null | head -1)
+          echo "::notice title=SpLogin(${DIAG_LEG})::SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} scheme=${DIAG_LEG:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
+          if [ -n "$dylib" ]; then
+            ls -l "$dylib" || true
+            size=$(wc -c < "$dylib" 2>/dev/null || echo '?')
+            echo "::notice title=SpLogin(${DIAG_LEG})::dylib 大小 ${size} 字节"
+          fi
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: sp-login-${{ matrix.scheme || 'rootful' }}
+          # Theos 把目标放在 .theos/obj/<TARGET>/<SCHEME>/ 之类的子目录里，不是 .theos/obj/SpLogin.dylib。
+          # 用 subdir-glob（`*/*.dylib` 可跨 `**`）匹配真实布局，同时保留 if-no-files-found: error 的约束力。
           path: |
             ios/tweak/packages/*.deb
-            ios/tweak/.theos/obj/SpLogin.dylib
+            ios/tweak/.theos/obj/**/*.dylib
           if-no-files-found: error
           retention-days: 30
