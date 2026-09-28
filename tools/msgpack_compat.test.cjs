@@ -2,7 +2,7 @@ const assert = require("node:assert/strict")
 const fs = require("node:fs")
 const path = require("node:path")
 const test = require("node:test")
-const { pack, unpack } = require("msgpackr")
+const { pack, unpack, Packr } = require("msgpackr")
 
 require("ts-node/register/transpile-only")
 
@@ -223,7 +223,20 @@ test("fixUint32Tags stays byte-identical across payload shapes", () => {
     assertIdenticalRewrite("array32", pack(Array.from({ length: 70_000 }, (_v, i) => i)))
     const wideMap = {}
     for (let index = 0; index < 70_000; index++) wideMap[`k${index}`] = index
-    assertIdenticalRewrite("map32", pack(wideMap))
+    // `pack` writes a fixed 16-bit map header for every object, so a >65535-key object
+    // cannot express a map32 header through it (msgpackr 1.11.0 silently wrapped the
+    // count to 4464 and emitted a corrupt `0xde` map16 buffer; 1.11.14 throws). Build the
+    // map32 fixture with a packer configured to widen the header, and round-trip it, so
+    // this case really covers the `0xdf` width it claims: byte-identity alone would keep
+    // passing on a silently corrupt buffer.
+    const wideMapPackr = new Packr({ useRecords: false, variableMapSize: true, mapsAsObjects: true })
+    const wideMapWire = wideMapPackr.pack(wideMap)
+    assert.strictEqual(wideMapWire[0], 0xdf, "fixture must produce a map32 header")
+    assert.strictEqual(wideMapWire.readUInt32BE(1), 70_000, "fixture must declare all map32 entries")
+    assertIdenticalRewrite("map32", wideMapWire)
+    const wideMapRoundTrip = unpack(wideMapWire)
+    assert.strictEqual(Object.keys(wideMapRoundTrip).length, 70_000)
+    assert.strictEqual(wideMapRoundTrip.k69999, 69_999)
 
     // Empty response and empty top-level stream.
     assertIdenticalRewrite("empty-object", pack({}))
