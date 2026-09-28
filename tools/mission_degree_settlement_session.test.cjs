@@ -18,7 +18,7 @@ const previousDatabaseDirectory = process.env.WDFP_DATABASE_DIR
 process.env.DATA_DIR = databaseDirectory
 delete process.env.WDFP_DATABASE_DIR
 
-const { initializeDatabase } = require("../src/data")
+const { closeDatabase, initializeDatabase } = require("../src/data")
 const { insertAccountSync } = require("../src/data/domains/account")
 const { insertDefaultPlayerSync } = require("../src/data/domains/player")
 const { settleMissionCategories } = require("../src/lib/mission/settlement")
@@ -100,6 +100,13 @@ try {
 }
 assert.equal(readsAfterCompute, 0)
 
+// Release the database before removing the directory it lives in. Windows refuses to
+// unlink a directory that still holds an open (memory-mapped) SQLite handle while POSIX
+// tolerates it, so leaving the connection open let teardown -- not the assertions --
+// decide the exit code: cleanup() threw EPERM, process.removeListener below never ran,
+// the exit listener registered at :38 then repeated the same failing cleanup, and the
+// process died with code 7.
+closeDatabase()
 console.log("degree settlement Session routing test passed")
 cleanup()
 process.removeListener("exit", cleanup)
