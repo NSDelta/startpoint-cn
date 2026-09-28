@@ -14,7 +14,7 @@
 | --- | --- |
 | `Makefile` | Theos 工程定义；`SP_LOGIN_HOST` 在构建期注入（默认值是 hygiene 白名单占位，不是真实机器） |
 | `control` | deb 元数据（`Package: com.starpoint.splogin`，`Depends: mobilesubstrate`） |
-| `SpLogin.plist` | MobileSubstrate 过滤器（`Bundles: com.leiting.wf`）+ 运行时开关，双用途 |
+| `layout/Library/MobileSubstrate/DynamicLibraries/SpLogin.plist` | MobileSubstrate 过滤器（`Bundles: com.leiting.wf`）+ 运行时开关，双用途。**必须在 `layout/` 下**：见第 6 节 |
 | `Tweak.xm` | 入口：注册 NSURLProtocol、hook 官方登录界面、打类清单日志 |
 | `SpLoginConfig.h/.m` | 配置读取（编译期常量 > plist 覆写）+ 日志（NSLog + 落盘） |
 | `SpLoginURLProtocol.h/.m` | 把 SDK 打向 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com` 的请求改写到自建服务 |
@@ -23,10 +23,18 @@
 | `SpLoginViewController.h/.m` | 类游戏登录面板本体（状态机与 `ios/prototype/index.html` 一致） |
 | `layout/DEBIAN/postinst`、`prerm` | 安装/卸载提示（纯 echo，不改系统文件） |
 
-## 2. 构建 `[未验证]`
+## 2. 构建 `[部分已验证-CI]`
 
-本机不能做这件事；CI 工作流在 `.github/workflows/ios-tweak.yml`（**从未跑过**，只做过 YAML 语法
-检查，见报告 §7）。在你自己的 Mac 上：
+本机不能做这件事；CI 工作流在 `.github/workflows/ios-tweak.yml`。2026-02 的首次真实运行
+（fork `NSDelta/startpoint-cn` 的 run `36417028903`，`head_sha ce51e155`）结果：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 环境信息 / `actions/checkout@v7` / `brew install ldid` / 克隆 Theos / `chmod +x` | 成功 |
+| `make` | **失败**（exit code 2；当时 job 日志无法匿名取回） |
+
+所以「工作流本身跑得起来、依赖装得上」已由 CI 证实，而「源码能不能编译过」仍是未知数。
+在你自己的 Mac 上：
 
 ```sh
 brew install ldid
