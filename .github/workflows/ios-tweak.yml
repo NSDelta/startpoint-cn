@@ -136,6 +136,8 @@ jobs:
       - name: 产物清单（取证）
         if: always()
         working-directory: ios/tweak
+        env:
+          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
         run: |
           set -uo pipefail
           echo "=== .theos/obj 树（Theos 会把目标放进 TARGET/SCHEME 子目录）"
@@ -149,6 +151,10 @@ jobs:
             dpkg-deb -I "$deb" || true
             echo "== $deb 内容（确认 SpLogin.dylib 与 SpLogin.plist 都在、且 rootless 落在 /var/jb）"
             dpkg-deb -c "$deb" || true
+            # 同一份清单再走 ::notice —— 这样「deb 里到底有没有过滤器 plist」这件事
+            # 不需要任何凭据就能从 check-run annotations 读到（step 日志仍需 admin 权限）。
+            listing=$(dpkg-deb -c "$deb" 2>/dev/null | head -40 | sed -e 's/\r$//' | paste -sd'|' - || true)
+            [ -n "$listing" ] && printf '::notice title=deb(%s)::%s\n' "$DIAG_LEG" "$listing"
           done
 
       # 失败也要留下证据：把完整构建日志强推到一次性分支，供无凭据读者取回。

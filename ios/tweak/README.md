@@ -25,15 +25,17 @@
 
 ## 2. 构建 `[部分已验证-CI]`
 
-本机不能做这件事；CI 工作流在 `.github/workflows/ios-tweak.yml`。2026-02 的首次真实运行
-（fork `NSDelta/startpoint-cn` 的 run `36417028903`，`head_sha ce51e155`）结果：
+本机不能做这件事；CI 工作流在 `.github/workflows/ios-tweak.yml`。真实运行记录（fork
+`NSDelta/startpoint-cn`，均 `event=push`）：
 
-| 步骤 | 结果 |
-| --- | --- |
-| 环境信息 / `actions/checkout@v7` / `brew install ldid` / 克隆 Theos / `chmod +x` | 成功 |
-| `make` | **失败**（exit code 2；当时 job 日志无法匿名取回） |
+| run | `head_sha` | 结果 |
+| --- | --- | --- |
+| `36417028903` | `ce51e155` | `make` **失败**（exit code 2；当时 job 日志无法匿名取回，只知道第一步断在 `make`） |
+| `36420791202` | `637b1839` | 编译**全过**，链接期 `ld: symbol(s) not found` / `NOTE: found '_SPLoginLog' … missing 'extern "C"'` |
+| `36421222764` | `0c33c9a4` | 链接已修好，编译期 `SpLoginConfig.h:45` `-Werror,-Wnullability-completeness` |
+| `36421542559` | `38766025` | **全部成功**：`make` + `make package` 两条腿（rootful / rootless）均绿 |
 
-所以「工作流本身跑得起来、依赖装得上」已由 CI 证实，而「源码能不能编译过」仍是未知数。
+所以「工作流本身跑得起来、依赖装得上、源码能编译、deb 能打出来」现在都已被 CI 证实。
 在你自己的 Mac 上：
 
 ```sh
@@ -46,8 +48,16 @@ make package FINALPACKAGE=1 SP_LOGIN_HOST=<你的服务器 IP>:8001             
 make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  # 无根越狱（Dopamine）
 ```
 
-产物：`packages/com.starpoint.splogin_0.1.0_iphoneos-arm.deb`（rootless 方案下 Theos 会把安装
-前缀自动改成 `/var/jb`）。`SpLogin.dylib` 在 `.theos/obj/` 下。
+产物（两条腿的 arch 名不同，CI run `36421542559` 实测）：
+
+| 方案 | `.deb` | `dm.pl` 报的包标识 |
+| --- | --- | --- |
+| 传统越狱 | `packages/com.starpoint.splogin_0.1.0_iphoneos-arm.deb` | `com.starpoint.splogin:iphoneos-arm` |
+| `THEOS_PACKAGE_SCHEME=rootless` | `packages/com.starpoint.splogin_0.1.0_iphoneos-arm64.deb` | `com.starpoint.splogin:iphoneos-arm64` |
+
+注意 rootless 那条**不是** `iphoneos-arm`：Theos 的 rootless 方案会把 arch 换成 `iphoneos-arm64`
+（安装前缀同时自动改成 `/var/jb`）。`SpLogin.dylib` 在 `.theos/obj/` 下，实测 124560 字节。
+链接期会有一条无害的 `ld: warning: -multiply_defined is obsolete`（Theos 的默认 LDFLAGS 带来）。
 
 **不要**把 `192.168.x.x` 写进任何仓库文件：`scripts/check-hygiene.sh` 会拦（唯一白名单是
 `192.168.1.10`，也就是本目录里的占位值）。真实地址只走命令行/CI 输入。
