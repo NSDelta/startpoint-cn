@@ -185,9 +185,37 @@ function requireCapability(t, capability) {
     return false
 }
 
+/**
+ * Whole-file guard for suites written as plain scripts instead of node:test files,
+ * which have no `t` to skip on and whose assertions run at module scope.
+ *
+ * Prints the repo's whole-file skip line and returns false; the caller must then stop
+ * with `process.exit(0)`. The runner classifies that combination as SKIPPED rather than
+ * passed or failed (tools/test-workflow/run.cjs:154-173), which is the same convention
+ * tools/gacha_odds_export.test.cjs:15 already uses for an absent external input.
+ *
+ * @param {string} label Suite label used in the skip line.
+ * @param {() => true | string} check Returns true when the input is present, else the
+ *     reason it is missing.
+ * @param {string} enable How to make the input available.
+ * @returns {boolean} True when the caller should continue with its assertions.
+ */
+function requireExternalInput(label, check, enable) {
+    let verdict
+    try {
+        verdict = check()
+    } catch (error) {
+        verdict = `the probe threw ${errorCode(error)}`
+    }
+    if (verdict === true) return true
+    console.log(`${label} tests skipped: capability unavailable: ${verdict}. To enable: ${enable}.`)
+    return false
+}
+
 module.exports = {
     capabilityNames,
     probe,
     requireCapability,
+    requireExternalInput,
     skipMessage,
 }
