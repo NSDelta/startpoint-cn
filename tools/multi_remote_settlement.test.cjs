@@ -573,6 +573,7 @@ const { characterExpCaps } = require("../src/lib/character")
 const { computeRealTimeStamina, getRankDegree } = require("../src/lib/stamina")
 const { registerBattleRoutes } = require("../src/multi/http/battle")
 const cnLoadRoutes = require("../src/routes/cn/load").default
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 process.once("exit", () => {
     closeDatabase()
@@ -1423,6 +1424,7 @@ test("production /finish rejects client add_mana above the client int32 field", 
 })
 
 test("production /finish settles through a real HubClient session rotation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const hub = createRotatingHub(t)
     const created = await hub.coordinator.createRoom({
         requestId: "production-finish-rotation",

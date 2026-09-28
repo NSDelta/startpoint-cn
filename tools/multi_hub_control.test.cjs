@@ -32,6 +32,7 @@ const {
     updateRoomState,
 } = require("../src/multi/room/manager")
 const { sessionManager } = require("../src/multi/state/SessionManager")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const compatibility = Object.freeze({
     multiProtocolVersion: MULTI_PROTOCOL_VERSION,
@@ -285,6 +286,7 @@ function fetchThroughHub(app) {
 }
 
 test("registers two independent credentials and exposes only the control route families", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const first = await register(target.app, target.first.token)
     const second = await register(target.app, target.second.token)
@@ -302,6 +304,7 @@ test("registers two independent credentials and exposes only the control route f
 })
 
 test("TCP unavailability blocks registration and existing control operations", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let tcpAvailable = true
     const target = fixture(t, {
         getTcpEndpoint: () => tcpAvailable ? { host: "hub.internal", port: 8003 } : null,
@@ -331,6 +334,7 @@ test("TCP unavailability blocks registration and existing control operations", a
 })
 
 test("control server exposes only the exact route methods", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const registration = await register(target.app, target.first.token)
     const methods = ["OPTIONS", "PUT", "PATCH", "DELETE"]
@@ -382,6 +386,7 @@ test("control server exposes only the exact route methods", async t => {
 })
 
 test("records only token authentication rejections behind a uniform registration response", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const missing = await target.app.inject({
         method: "POST",
@@ -456,6 +461,7 @@ test("records only token authentication rejections behind a uniform registration
 })
 
 test("expires sessions fail closed and revocation invalidates only matching credentials", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const first = await register(target.app, target.first.token)
     const second = await register(target.app, target.second.token)
@@ -492,6 +498,7 @@ test("expires sessions fail closed and revocation invalidates only matching cred
 })
 
 test("active node sessions remain valid past their original expiry and expire after idle TTL", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const registration = await register(target.app, target.first.token)
     const nodeSessionId = registration.json().nodeSessionId
@@ -507,6 +514,7 @@ test("active node sessions remain valid past their original expiry and expire af
 })
 
 test("revoking a shared credential invalidates all of its sessions but not a peer credential", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const firstNode = await register(target.app, target.first.token)
     const secondNode = await register(target.app, target.first.token)
@@ -529,6 +537,7 @@ test("revoking a shared credential invalidates all of its sessions but not a pee
 })
 
 test("delegates every room and battle operation with the authenticated node identity", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const registration = await register(target.app, target.first.token)
     const participant = participantInput(registration, 202).participant
@@ -572,6 +581,7 @@ test("delegates every room and battle operation with the authenticated node iden
 })
 
 test("issues node-scoped admissions and removes them when the node session expires", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const registration = await register(target.app, target.first.token)
     const participant = participantInput(registration, 303).participant
@@ -594,6 +604,7 @@ test("issues node-scoped admissions and removes them when the node session expir
 })
 
 test("Host Hub admission round-trip enforces and releases ROOM_FULL", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { getOccupiedMemberCount: () => 2 })
     const registration = await register(target.app, target.first.token)
     const issueAdmission = (viewerId, idempotencyKey) => target.app.inject({
@@ -623,6 +634,7 @@ test("Host Hub admission round-trip enforces and releases ROOM_FULL", async t =>
 })
 
 test("requires bounded ASCII idempotency keys and isolates cached writes by node session and TTL", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { idempotencyTtlMs: 100 })
     const firstNode = await register(target.app, target.first.token)
     const payload = {
@@ -676,6 +688,7 @@ test("requires bounded ASCII idempotency keys and isolates cached writes by node
 })
 
 test("lost create response rebuilds live state after expired-session teardown", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, {
         coordinatorFactory: createTrackedEmbeddedCoordinator,
         sessionTtlMs: 100,
@@ -762,6 +775,7 @@ test("lost create response rebuilds live state after expired-session teardown", 
 })
 
 test("pending write capacity returns bounded unavailable without evicting the replay", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { idempotencyMaxEntries: 1 })
     const registration = await register(target.app, target.first.token)
     const coordinatorResult = deferred()
@@ -815,6 +829,7 @@ test("pending write capacity returns bounded unavailable without evicting the re
 })
 
 test("returns bounded coordinator errors without paths, credentials or stack traces", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const registration = await register(target.app, target.first.token)
     target.coordinator.results.set("searchRoom", { ok: false, error: "INCOMPATIBLE_ROOM" })
@@ -877,6 +892,7 @@ test("returns bounded coordinator errors without paths, credentials or stack tra
 })
 
 test("HubClient reads bounded authoritative diagnostics through the existing control plane", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const client = new HubClient({
         hubUrl: new URL("http://hub.example/"),
@@ -900,6 +916,7 @@ test("HubClient reads bounded authoritative diagnostics through the existing con
 })
 
 test("concurrent HubClient control calls share one registration", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const delegate = fetchThroughHub(target.app)
     const registrationCaptured = deferred()
@@ -938,6 +955,7 @@ test("concurrent HubClient control calls share one registration", async t => {
 })
 
 test("HubClient records authentication rejection only for registration 401", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const client = new HubClient({
         hubUrl: new URL("http://hub.example/"),
@@ -970,6 +988,7 @@ test("HubClient leaves authentication state unchanged on registration network fa
 })
 
 test("HubClient preserves authentication rejection across registration network outages", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const delegate = fetchThroughHub(target.app)
     let registrationAttempts = 0
@@ -1010,6 +1029,7 @@ test("HubClient preserves authentication rejection across registration network o
 })
 
 test("HubClient clears authentication rejection after a valid registration", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const delegate = fetchThroughHub(target.app)
     let rejectNextRegistration = true
@@ -1046,6 +1066,7 @@ test("HubClient clears authentication rejection after a valid registration", asy
 })
 
 test("explicit control status degrades a client when Host TCP stops", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let tcpAvailable = true
     const target = fixture(t, {
         getTcpEndpoint: () => tcpAvailable ? { host: "hub.internal", port: 8003 } : null,
@@ -1068,6 +1089,7 @@ test("explicit control status degrades a client when Host TCP stops", async t =>
 })
 
 test("existing-session status polling applies authoritative TCP unavailability", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let tcpAvailable = true
     const target = fixture(t, {
         getTcpEndpoint: () => tcpAvailable ? { host: "hub.internal", port: 8003 } : null,
@@ -1089,6 +1111,7 @@ test("existing-session status polling applies authoritative TCP unavailability",
 })
 
 test("a delayed old-session 401 cannot clear a refreshed HubClient session", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     const delegate = fetchThroughHub(target.app)
     const oldUnauthorizedCaptured = deferred()
@@ -1134,6 +1157,7 @@ test("a delayed old-session 401 cannot clear a refreshed HubClient session", asy
 })
 
 test("an older TCP status response cannot override a newer degradation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let tcpAvailable = true
     let delayNextStatus = false
     const firstStatusCaptured = deferred()
@@ -1173,6 +1197,7 @@ test("an older TCP status response cannot override a newer degradation", async t
 })
 
 test("an older room response cannot override a newer TCP degradation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let tcpAvailable = true
     let delayNextRoomStatus = false
     const roomResponseCaptured = deferred()
@@ -1215,6 +1240,7 @@ test("an older room response cannot override a newer TCP degradation", async t =
 })
 
 test("HubClient diagnostics use only an existing session and never change availability", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     let failStatus = false
     let statusRequests = 0
@@ -1282,6 +1308,7 @@ test("control status parser accepts legacy core fields and discards malformed di
 })
 
 test("control status selects diagnostic fields and drops provider extras", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, {
         getDiagnostics: () => ({
             activeRooms: 1,
@@ -1454,6 +1481,7 @@ test("status counting does not revalidate unrelated node credentials", () => {
 })
 
 test("real RemoteCoordinator retains finalized facts across room reset and session rotation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { coordinatorFactory: createTrackedEmbeddedCoordinator })
     const hostClient = new HubClient({
         hubUrl: new URL("http://hub.example/"),
@@ -1574,6 +1602,7 @@ test("real RemoteCoordinator retains finalized facts across room reset and sessi
 })
 
 test("real RemoteCoordinator removes an aborted guest before host finalization", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { coordinatorFactory: createTrackedEmbeddedCoordinator })
     const hostClient = new HubClient({
         hubUrl: new URL("http://hub.example/"),
@@ -1669,6 +1698,7 @@ test("real RemoteCoordinator removes an aborted guest before host finalization",
 })
 
 test("real RemoteCoordinator releases after a finalized host loses its guest", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { coordinatorFactory: createTrackedEmbeddedCoordinator })
     const hostClient = new HubClient({
         hubUrl: new URL("http://hub.example/"),
@@ -1759,6 +1789,7 @@ test("real RemoteCoordinator releases after a finalized host loses its guest", a
 })
 
 test("lost remote guest abort converges after its active session becomes idle", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, {
         coordinatorFactory: createTrackedEmbeddedCoordinator,
         sessionTtlMs: 100,
@@ -1859,6 +1890,7 @@ test("lost remote guest abort converges after its active session becomes idle", 
 })
 
 test("real RemoteCoordinator treats repeated host abort as idempotent", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t, { coordinatorFactory: createTrackedEmbeddedCoordinator })
     const remote = new RemoteMultiCoordinator(new HubClient({
         hubUrl: new URL("http://hub.example/"),
