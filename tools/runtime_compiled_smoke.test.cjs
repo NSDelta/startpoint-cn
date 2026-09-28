@@ -14,6 +14,7 @@ const {
     forceKillProcessTree,
     signalProcessTree,
 } = require("./test-workflow/benchmark.cjs")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const projectRoot = path.resolve(__dirname, "..")
 const { loadServerReleaseContract } = require("./server-bundle/release-contract.cjs")
@@ -185,10 +186,12 @@ async function cleanupRuntimeSmoke({ child, dataDir, output, ports, processTree 
 buildCompiledRuntime()
 
 test("[socket] official CN wrapper reports ready and releases resources on SIGTERM", {
-    // Node cannot provide reliable POSIX-style child signal semantics on Windows.
-    skip: process.platform === "win32" ? "Node signal forwarding smoke is POSIX-only" : false,
     timeout: 90_000,
 }, async t => {
+    // Gate on the probed capability rather than the platform: this asserts that the
+    // wrapper's SIGTERM handler runs, which a host that cannot deliver signals at all
+    // can never exercise -- and which a Windows host with a POSIX layer still could.
+    if (!requireCapability(t, "posixSignals")) return
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cn-runtime-smoke-"))
     const [httpPort, tcpPort] = await reserveLoopbackPorts(2)
     let stdout = ""
@@ -386,6 +389,9 @@ test("compiled lifecycle order and metadata fallback survive an isolated bundle"
 test("verified Server Bundle publishes its manifest identity through health", {
     timeout: 90_000,
 }, async t => {
+    // The closing assertion requires the bundle to shut down gracefully (exit code 0)
+    // in response to SIGTERM, which needs the host to deliver the signal to a handler.
+    if (!requireCapability(t, "posixSignals")) return
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "embedded-bundle-smoke-"))
     const bundleRoot = path.join(sandbox, "bundle")
     const dataDir = path.join(sandbox, "data")

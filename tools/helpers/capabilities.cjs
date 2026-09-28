@@ -112,6 +112,32 @@ const CAPABILITIES = {
             return true
         }),
     },
+    posixSignals: {
+        name: "POSIX signal delivery (a child's SIGTERM handler running)",
+        enable: process.platform === "win32"
+            ? "Windows has no POSIX signals: it terminates the target process instead of delivering SIGTERM, so a graceful-shutdown handler never runs; run this suite on Linux/macOS to cover it"
+            : "this host should deliver POSIX signals; check the container init and the process signal mask",
+        probe: () => {
+            // A process that installs a SIGTERM handler, signals itself, and proves the
+            // signal was delivered by exiting 0 from that handler (9 if it never ran).
+            const script = [
+                "process.on('SIGTERM', () => process.exit(0))",
+                "process.kill(process.pid, 'SIGTERM')",
+                "setTimeout(() => process.exit(9), 5000)",
+            ].join("; ")
+            const result = spawnSync(process.execPath, ["-e", script], {
+                encoding: "utf8",
+                timeout: 15_000,
+            })
+            if (result.error !== undefined && result.error !== null) {
+                return `running the SIGTERM probe failed with ${errorCode(result.error)}`
+            }
+            if (result.status !== 0) {
+                return "SIGTERM never reached the child's handler (the process was terminated instead)"
+            }
+            return true
+        },
+    },
     zipCli: {
         name: "the external `zip` command-line tool",
         enable: process.platform === "win32"
