@@ -200,8 +200,8 @@ jobs:
           fi
           # 这里的推送**不能**依赖 ${GITHUB_TOKEN} 环境变量：它不是 Actions 的默认环境变量，
           # 在 set -u 下展开未定义变量会让 bash 立刻以 unbound variable 退出（实测该步骤变红、
-          # 远端一个 ci-diag ref 都没有）。改用 ${{ github.token }}，由 Actions 在求值期注入。
-          # 读取权限由顶部 permissions: contents: write 提供，两者缺一不可。
+          # 远端一个 ci-diag ref 都没有）。改用 ${{ secrets.GITHUB_TOKEN }}，由 Actions 在
+          # 求值期注入。读取权限由顶部 permissions: contents: write 提供，两者缺一不可。
           if git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
                 "HEAD:refs/heads/${DIAG_REF}" 2>&1; then
             echo "诊断日志已推送：refs/heads/${DIAG_REF}"
@@ -227,7 +227,9 @@ jobs:
           set -uo pipefail
           # 同 ci-diag：诊断通道不得改变 job 结论，也不能静默退出。
           OUT_REF="ci-out/${DIAG_RUN}/${DIAG_LEG}"
-          OUT_DIR="ci-out/${DIAG_RUN}/${DIAG_LEG}"
+          # 注意：本步骤 working-directory 是 ios/tweak，所以必须用绝对路径锚定到仓库根，
+          # 否则产物会落在 ios/tweak/ci-out/... （第一版实测就是这样，路径别扭且难清理）。
+          OUT_DIR="${GITHUB_WORKSPACE}/ci-out/${DIAG_RUN}/${DIAG_LEG}"
           mkdir -p "$OUT_DIR"
           dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
           deb=""
