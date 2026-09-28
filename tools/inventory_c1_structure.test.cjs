@@ -28,7 +28,10 @@ test("activated Inventory plans are imported only by reviewed production adapter
         if (planModuleFiles.has(file)) continue
         const source = fs.readFileSync(file, "utf8")
         if ([...planSymbols, ...planModules].some(token => source.includes(token))) {
-            violations.push(path.relative(projectRoot, file))
+            // The reviewed adapter list below is written POSIX-shaped, while path.relative
+            // yields backslash-separated paths on Windows. Normalise so the guard reports
+            // the same shape on every host.
+            violations.push(path.relative(projectRoot, file).split(path.sep).join("/"))
         }
     }
     assert.deepEqual(violations, [

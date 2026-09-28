@@ -93,7 +93,10 @@ test("C3 Inventory imports match the reviewed writer migration inventory", () =>
                 && !absolute.startsWith(inventoryRoot + path.sep)) {
                 const contents = fs.readFileSync(absolute, "utf8")
                 if (/lib\/inventory|\.\/inventory|\.\.\/inventory/.test(contents)) {
-                    importedOutsideInventory.push(path.relative(projectRoot, absolute))
+                    // The expected lists below are POSIX-shaped, while path.relative yields
+                    // backslash-separated paths on Windows. Normalise so the guard reports
+                    // the same shape on every host.
+                    importedOutsideInventory.push(path.relative(projectRoot, absolute).split(path.sep).join("/"))
                 }
             }
         }
@@ -359,7 +362,7 @@ test("production Item direct SQL stays inside the final persistence whitelist", 
             if (entry.isDirectory()) visit(absolute)
             else if (entry.isFile() && entry.name.endsWith(".ts")
                 && directMutation.test(fs.readFileSync(absolute, "utf8"))) {
-                directSqlFiles.push(path.relative(projectRoot, absolute))
+                directSqlFiles.push(path.relative(projectRoot, absolute).split(path.sep).join("/"))
             }
         }
     }
@@ -390,7 +393,7 @@ test("capped positive grants expose one reviewed overflow disposition path", () 
             if (entry.isDirectory()) visit(absolute)
             else if (entry.isFile() && entry.name.endsWith(".ts")) {
                 const contents = fs.readFileSync(absolute, "utf8")
-                const relative = path.relative(projectRoot, absolute)
+                const relative = path.relative(projectRoot, absolute).split(path.sep).join("/")
                 if (/\.grantWithCapacity\(/.test(contents)
                     && relative !== "src/lib/inventory/batch-context.ts") {
                     cappedFiles.push(relative)
