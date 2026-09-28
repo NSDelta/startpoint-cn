@@ -154,8 +154,16 @@ jobs:
             # 同一份清单再走 ::notice —— 这样「deb 里到底有没有过滤器 plist」这件事
             # 不需要任何凭据就能从 check-run annotations 读到（step 日志仍需 admin 权限）。
             listing=$(dpkg-deb -c "$deb" 2>/dev/null | head -40 | sed -e 's/\r$//' | paste -sd'|' - || true)
-            [ -n "$listing" ] && printf '::notice title=deb(%s)::%s\n' "$DIAG_LEG" "$listing"
+            # 注意：这里**不能**写成 `[ -n "$listing" ] && printf ...`。当 listing 为空时
+            # 该短路表达式返回 1，而它又是 for 循环体的最后一条命令 ⇒ 循环返回 1 ⇒ 在
+            # set -uo pipefail 下整步失败。实测 run 36424802642 两条腿都在本步变红，
+            # 而编译与打包其实都是成功的（结论被取证步骤误伤）。用 if 显式收尾成 0。
+            if [ -n "$listing" ]; then
+              printf '::notice title=deb(%s)::%s\n' "$DIAG_LEG" "$listing"
+            fi
           done
+          # 本步是取证步骤，无论上面命中与否都不得改变 job 结论。
+          exit 0
 
       # 失败也要留下证据：把完整构建日志强推到一次性分支，供无凭据读者取回。
       - name: 诊断日志（失败时也可无凭据取回）
@@ -281,6 +289,8 @@ jobs:
           else
             echo "::warning title=ci-out-push::产物分支推送失败（fork 可能未授予 Actions 写权限）；产物仍可从 Actions artifact 页面手动下载"
           fi
+          # 同「产物清单」：本步是诊断/出仓通道，任何分支都不得改变 job 结论。
+          exit 0
 
       # 第二通道（不依赖任何仓库设置、纯匿名可读）：把编译器输出的要害做成 check-run 注解。
       # 匿名读法：GET https://api.github.com/repos/NSDelta/startpoint-cn/check-runs/<job_id>/annotations
