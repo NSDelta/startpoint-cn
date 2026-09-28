@@ -7,6 +7,7 @@ const os = require("node:os")
 const path = require("node:path")
 const test = require("node:test")
 const { spawnSync } = require("node:child_process")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 let smoke
 try {
@@ -109,6 +110,7 @@ test("smoke 参数必须显式提供 CDN 父目录与临时 content root", () =>
 })
 
 test("smoke 路径拒绝与 project、database、CDN 的物理重叠", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeLayout(t)
     const resolved = smoke.resolveSmokePaths(fixture)
     assert.equal(resolved.env.CDN_DIR, fs.realpathSync(fixture.cdnRoot))
@@ -1061,6 +1063,7 @@ test("结构化环境快照变化会阻止通过且摘要不含具体文件路�
 })
 
 test("来源快照检测已 dirty tracked 文件在 smoke 期间继续变化", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const tracked = path.join(fixture.projectRoot, "tracked.txt")
     fs.writeFileSync(tracked, "dirty-before\n")
@@ -1073,6 +1076,7 @@ test("来源快照检测已 dirty tracked 文件在 smoke 期间继续变化", t
 })
 
 test("来源快照分别检测 staged 内容在 smoke 期间变化", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const tracked = path.join(fixture.projectRoot, "tracked.txt")
     fs.writeFileSync(tracked, "staged-before\n")
@@ -1086,6 +1090,7 @@ test("来源快照分别检测 staged 内容在 smoke 期间变化", t => {
 })
 
 test("来源快照检测已有 untracked 文件在 smoke 期间内容变化", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const untracked = path.join(fixture.projectRoot, "notes.txt")
     fs.writeFileSync(untracked, "before\n")
@@ -1097,6 +1102,7 @@ test("来源快照检测已有 untracked 文件在 smoke 期间内容变化", t 
 })
 
 test("来源文件摘要使用分块读取而非一次性 readFileSync", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     fs.writeFileSync(path.join(fixture.projectRoot, "notes.bin"), Buffer.alloc(256 * 1024, 7))
     const originalReadFileSync = fs.readFileSync
@@ -1126,6 +1132,7 @@ test("Git 快照超过 64MiB 时返回稳定错误", () => {
 })
 
 test("Git untracked 嵌套仓库目录项被明确拒绝", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const nested = path.join(fixture.projectRoot, "vendor-repository")
     fs.mkdirSync(nested)
@@ -1139,6 +1146,7 @@ test("Git untracked 嵌套仓库目录项被明确拒绝", t => {
 })
 
 test("来源快照覆盖 seed catalog 文件的创建与修改", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const pending = path.join(fixture.projectRoot, "assets", "gacha-seed-catalog", "normal.json")
     const missing = smoke.captureEnvironment(fixture.paths)
@@ -1155,6 +1163,7 @@ test("来源快照覆盖 seed catalog 文件的创建与修改", t => {
 })
 
 test("来源快照检测 database 文件创建和内容修改", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const database = path.join(fixture.projectRoot, ".database", "players.sqlite")
     const beforeModify = smoke.captureEnvironment(fixture.paths)
@@ -1171,6 +1180,7 @@ test("来源快照检测 database 文件创建和内容修改", t => {
 })
 
 test("来源快照检测 EntityLists 内容变化", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     const entityList = path.join(
         fixture.cdnRoot,
@@ -1186,6 +1196,7 @@ test("来源快照检测 EntityLists 内容变化", t => {
 })
 
 test("来源快照检测小写 entities 官方布局的内容变化", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeSourceLayout(t)
     fs.renameSync(
         path.join(fixture.cdnRoot, "cn", "EntityLists"),
@@ -1205,6 +1216,7 @@ test("来源快照检测小写 entities 官方布局的内容变化", t => {
 })
 
 test("archive-* symlink 或非目录不会被静默跳过", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     await t.test("symlink", () => {
         const fixture = makeSourceLayout(t)
         fs.symlinkSync(
@@ -1227,6 +1239,7 @@ test("archive-* symlink 或非目录不会被静默跳过", async t => {
 })
 
 test("operation 与来源变化同时失败时来源变化为主错误并保留 operation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeLayout(t)
     const operationError = new Error("operation failed")
     let captures = 0
@@ -1263,6 +1276,7 @@ test("operation 与来源变化同时失败时来源变化为主错误并保留 
 })
 
 test("operation 与 after 快照读取同时失败时保留两侧诊断", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeLayout(t)
     const operationError = new Error("operation failed")
     let captures = 0
@@ -1305,6 +1319,7 @@ test("operation 与 after 快照读取同时失败时保留两侧诊断", async 
 })
 
 test("smoke workflow 在隔离目录执行 force sync 并前后核对来源快照", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const fixture = makeLayout(t)
     const calls = []
     const summary = await smoke.runContentSyncSmoke(fixture, {
