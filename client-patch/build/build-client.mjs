@@ -243,6 +243,46 @@ export function countIn(buffer, needle) {
  * UTF-16LE，也兼容 UTF-8 变体）与 `assets/META-INF/AIR/application.xml` 的 `<id>`。
  * 返回纯数据，由调用方决定断言阈值。
  */
+/** 标识符字符（点/下划线/`$`/`-` 也算，用于判断命中是否落在标识符开头）。 */
+function isIdentByte(byte) {
+    return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a)
+        || byte === 0x5f || byte === 0x24 || byte === 0x2e || byte === 0x2d
+}
+
+/**
+ * 旧包名的「身份残留」计数：只数**落在标识符开头**的命中。
+ *
+ * 为什么不能直接 `buffer.includes(from)`：AIR 的 AndroidManifest.xml 里必然有
+ * `air.com.leiting.wf.AppEntry`（AppEntry 是 AIR 的入口类名，改名工具按规矩**逐字保留**，
+ * 它内部含 `com.leiting.wf` 但前面还有 `air` 这一段）。朴素的 substring 计数会把这条
+ * **正确**的产物判死 —— 实测 `--rename-package` 端到端就是这么被卡在 exit 2 的。
+ *
+ * 保留 `from` 出现在**标识符开头**（如 `com.leiting.wf`、`com.leiting.wf.fileprovider`）才
+ * 是真的没改干净；出现在更长标识符内部（`air.com.leiting.wf.AppEntry`）属于受保护串。
+ */
+function countIdentityResidues(buffer, from) {
+    let count = 0
+    const samples = []
+    for (const encoding of ["utf16le", "utf8"]) {
+        const needle = Buffer.from(from, encoding)
+        const step = encoding === "utf16le" ? 2 : 1
+        let index = buffer.indexOf(needle)
+        while (index !== -1) {
+            const left = index - step
+            if (left < 0 || !isIdentByte(buffer[left])) {
+                count += 1
+                if (samples.length < 8) {
+                    let end = index + needle.length
+                    while (end + step <= buffer.length && isIdentByte(buffer[end])) end += step
+                    samples.push(buffer.subarray(index, end).toString(encoding))
+                }
+            }
+            index = buffer.indexOf(needle, index + step)
+        }
+    }
+    return { count, samples }
+}
+
 export function checkRenamedApk(apkBuffer, { from = null, to }) {
     const entries = readZipEntries(apkBuffer)
     const manifestEntry = entries.find(entry => entry.name === "AndroidManifest.xml")
@@ -252,12 +292,16 @@ export function checkRenamedApk(apkBuffer, { from = null, to }) {
     const manifest = manifestEntry ? readEntryData(manifestEntry) : null
     const applicationXml = applicationEntry ? readEntryData(applicationEntry).toString("utf8") : null
 
+    const residues = manifest && from ? countIdentityResidues(manifest, from) : { count: 0, samples: [] }
+
     return {
         entryCount: entries.length,
         hasManifest: Boolean(manifestEntry),
         hasApplicationXml: Boolean(applicationEntry),
         manifestHasTo: manifest ? hasEither(manifest, to) : false,
         manifestHasFrom: manifest && from ? hasEither(manifest, from) : false,
+        manifestFromResidues: residues.count,
+        manifestFromResidueSamples: residues.samples,
         applicationXmlHasTo: applicationXml ? applicationXml.includes(`<id>${to}</id>`) : false,
         applicationXmlHasFrom: applicationXml && from ? applicationXml.includes(`<id>${from}</id>`) : false,
     }
@@ -655,6 +699,10 @@ async function main() {
     // ── [4] 端点确保 ──
     hr("[4] 端点确保（把 API 基址改到 --host:--port）")
     const midFingerprint = state.hookActive && !dryRun ? siteFingerprint(logical) : state.fingerprintBefore
+    // 「长度守恒」的参照必须取**改写前那一刻**的长度，不能取 unwrapped.logical.length：
+    // applyApiBaseRewrite 是就地成对改写（33 B → 33 B），而 --as3-hook 本来就有权改变 SWF 总长
+    // （P6 的登录页 pcode 块让逻辑 SWF +14,572 B）。拿 base 的长度当基准会把**正确**的产物判死。
+    const logicalLenBeforeRewrite = logical.length
     let rewrote = false
     if (state.hookActive && midFingerprint.pairOccurrences === 0 && midFingerprint.hostCount === 0) {
         // 钩子自己已经把常量改掉了 ⇒ 本阶段只做断言，不再二次改写。
@@ -682,8 +730,19 @@ async function main() {
     }
 
     if (rewrote) {
-        assertions.check("成对改写长度守恒（33 B）", logical.length === unwrapped.logical.length,
-            `${unwrapped.logical.length} → ${logical.length} B`)
+        assertions.check(`成对改写长度守恒（${state.rewrite.totalBytes} B）`, logical.length === logicalLenBeforeRewrite,
+            `${logicalLenBeforeRewrite} → ${logical.length} B（就地写入，本次改写不吃也不吐字节）`
+            + (state.hookActive && logicalLenBeforeRewrite !== unwrapped.logical.length
+                ? `；AS3 钩子另行贡献 ${logicalLenBeforeRewrite - unwrapped.logical.length} B（合法，改动面由钩子自证）` : ""))
+        // 改写只允许落在计划窗口内：越界 = 打到了别的池条目，是静默损坏的最典型形态。
+        const win = state.rewrite.offset === null || state.rewrite.offset === undefined
+            ? null
+            : [state.rewrite.offset, state.rewrite.offset + state.rewrite.totalBytes]
+        const outOfWindow = win === null
+            ? []
+            : (state.rewrite.diffRanges || []).filter(([start, end]) => start < win[0] || end > win[1])
+        assertions.check("改写只落在计划窗口内（不越界打到别的常量）", outOfWindow.length === 0,
+            win === null ? "无计划窗口（未改写）" : `窗口 ${hexRanges([win], 2)}，越界 ${outOfWindow.length} 段`)
         assertions.check("改写字节数 = 计划范围", (state.rewrite.diffRanges || []).length > 0,
             hexRanges(state.rewrite.diffRanges, 4))
         // 防「派生件静默丢补丁」：字节没变却一路 PASS，是这类产线最危险的失效模式。
@@ -806,8 +865,10 @@ async function main() {
             state.rename.probe = probe
             assertions.check("改名后 AndroidManifest.xml 的 package 已是目标包名", probe.manifestHasTo,
                 `to=${renameTo} entryCount=${probe.entryCount}`)
-            assertions.check("改名后 AndroidManifest.xml 无旧包名残留", !probe.manifestHasFrom,
-                `from=${state.rename.from || BASELINE_PACKAGE_NAME}`)
+            assertions.check("改名后 AndroidManifest.xml 无旧包名残留", probe.manifestFromResidues === 0,
+                `from=${state.rename.from || BASELINE_PACKAGE_NAME}｜身份残留(标识符开头)=${probe.manifestFromResidues} 处`
+                + `；更长标识符内部的命中不计（受保护串，如 air.com.leiting.wf.AppEntry）`
+                + (probe.manifestFromResidueSamples.length > 0 ? `｜残留样例：${probe.manifestFromResidueSamples.join(" ")}` : ""))
             assertions.check("改名后 assets/META-INF/AIR/application.xml 的 <id> 已是目标包名",
                 !probe.hasApplicationXml || probe.applicationXmlHasTo,
                 probe.hasApplicationXml ? `<id>${renameTo}</id>` : "基线无该 entry（跳过）")

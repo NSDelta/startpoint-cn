@@ -223,21 +223,122 @@ FFDec 的已知坑（产线已经替你做掉一半，钩子里仍要注意）�
 > **为什么默认不做 AS3 回编译**：AS3 整类回编译的可行性结论（P0）还没出，而且它对 FFDec 版本敏感 ——
 > 版本不同，重写出来的 ABC 就不同。所以本产线把它做成钩子：等 P0 有结论再插进来，主线不受影响。
 
+### 6.1 端到端实跑（已跑通，命令可照抄）
+
+仓库里带了一个**零依赖、不装 AS3 编译器**的钩子：`client-patch/build/as3-hook-p6-pcode.mjs`。
+它直接吃 P6 交付的现成 pcode 块（`D:\wfcnmod\交付片段\p6\blocks\`，可用环境变量 `SP_CN_P6_BLOCKS_DIR` 改），
+只负责「拿块 → 串行 `-replace` → 五条回读断言」。实测命令（`cmd /c` 执行，见下「踩坑」为何不能直接 `> file`）：
+
+```cmd
+node client-patch\build\build-client.mjs ^
+  --base  apkipa\V1.8.1.apk ^
+  --host  172.16.10.105 --port 8001 ^
+  --out   out\sp-cn-181-p6login-unsigned.apk ^
+  --ffdec D:\wfcnmod\server\work\tools\ffdec.jar --allow-ffdec-version-mismatch ^
+  --as3-hook client-patch\build\as3-hook-p6-pcode.mjs ^
+  --zipalign  D:\starview-windows\starview-windows\build-tools\zipalign.exe ^
+  --apksigner D:\starview-windows\starview-windows\build-tools\apksigner.bat ^
+  --work D:\wfcnmod\tmp\p7b\work --keep-work
+```
+
+实测结果：`exit=0`，route `as3-hook+abc-pair`，产物 `sp-cn-181-p6login-unsigned.apk` 138,758,191 B。
+逻辑 SWF 29,052,839 → 29,067,411 B（**+14,572 B**），sha256
+`156edd0cad4956fb18683fb6ff2e5aca787e7a3bea02c4c80645079479191f24` —— 与 P6 参考产物**逐字节相同**。
+
+**三条决定性判据**（必须全部回读校验，缺一条都不算过）：
+
+| # | 判据 | 实测 |
+|---|---|---|
+| ① | 5 个方法体的 pcode **逐行一致**（归一化：trim + 去空行 + 去 `debugline`） | 392/2396/727/1573/148 行全等，首处不同 = 无；且每条都不是空体 |
+| ② | **其它方法体 sha 全不变**（`other_bodies_changed = 0`） | 逐体比对 96,392 个，变化的**恰好是** 5 个靶体 `boot_ffc6#7265/7266/7267/7268/7287` |
+| ③ | 方法体总数与 DoABC tag 数不变 | 96,392 → 96,392；DoABC 285 → 285；类指纹 `classListDigest` 不变 |
+
+codeLength 对照：`7265:118→1760, 7266:130→5057, 7267:100→3212, 7268:9→827, 7287:1→241`。
+
+> ⚠️ **「产物比 base 大」不是判据**。`-replace` 会把整份 DoABC tag 重新压缩，体积变化只是启发式报警。
+> ⚠️ **`-replace` 在输入块文件不存在时仍 `exit 0`**，并把靶方法体写成**空体**（`code / end ; code`，SWF 反而变小）
+> —— 所以必须逐条回读，**空体判 FAIL**。适配器对缺块直接抛错、并对每个体检查 `code…end ; code` 之间确有指令行。
+> ⚠️ 路线 B **吃 `.pcode` 不吃 `.as`**：喂 `.as` 会 `exit 1`（`Replacing: xxx.as` + `CharacterId does not exist`）。
+> ⚠️ 自研 ABC 解析器的调用**次序不能颠倒**：`findAbcTags(swf)` 返回的 `abc` 是**原始** DoABC 载荷
+> （`u32 flags` + NUL 结尾的 name + ABC 数据），必须**先 `parseAbc(tag.abc)` 再 `findMethodBody`**；
+> 且 `findMethodBody` 返回 `{ok:true,bodyIndex,…}` / `{ok:false,reason}`（**不是 null**）。
+> ⚠️ 「方法体总数」= **全部 285 个 DoABC tag 的 `abc.bodies.length` 之和**，不是某一个 tag 的。
+> ⚠️ FFDec 版本敏感：P6 参考产物是用 **26.3.0** 出的，而本仓库 `REQUIRED_FFDEC_VERSION` 钉的是 **24.0.1**。
+> 要复现上面那个 sha256 就必须用 26.3.0 并显式加 `--allow-ffdec-version-mismatch`；换版本产物必然不同（合法，但基线跟着变）。
+> ⚠️ **`pwsh` / `powershell` 在本环境不能作为子进程拉起**，批处理/Wrapper 必须用 `cmd /c xxx.cmd`；
+> 且 PowerShell 的 `>` 重定向写出 **UTF-16LE+BOM**（Node 的 UTF-8 输出会变乱码）——用 `cmd /c … > file` 才保字节。
+
 ---
 
 ## 7. 包名改写（`--rename-package`）
 
-`--rename-package` 默认**关闭**。打开时本脚本**只做透传**，改名的逻辑在 P12 交付的
-`client-patch/tools/rename-package.mjs` 里（要同步改 AXML 的 `package`、`assets/META-INF/AIR/application.xml`
+`--rename-package` 默认**关闭**。打开时本脚本**只做透传**，改名的逻辑在
+`client-patch/tools/rename-package.mjs`（同步改 AXML 的 `package`、`assets/META-INF/AIR/application.xml`
 的 `<id>`、以及所有 `${applicationId}` 派生的 provider/authority/permission）。
 
-该脚本**还没交付**时，本产线会明确报错并**不做事**：
-
-```
-ERROR --rename-package 需要 P12 交付的 client-patch/tools/rename-package.mjs，但该文件不存在（P12 未交付）
-```
-
 它**不会静默忽略**这个开关 —— 静默忽略会让人以为包名改了，装上去才发现盖掉了官方包。
+本轮硬前提全部**实测读取**，不靠记忆、不做全局替换：
+
+* `.ipa` + `--rename-package` ⇒ **显式 fail** 并指向 P10-A 的 `patch-ipa.mjs`
+  （iOS 的 bundle id 改写必须先从 IPA 实测读出 app id，且要保护计费 SKU 与 keychain access group）；
+* 缺 `rename-package.mjs`、`--rename-to` 非法、或 `--rename-to` 等于基线包名 `com.leiting.wf`
+  ⇒ 都是**显式 fail 且不产生任何文件**（后者会走工具的 noop 短路，改不出共存包）。
+
+### 7.1 端到端实跑（Android，已跑通）
+
+直接对**已出好的产物**改名（`--in` 只读，`--out` 另写，退出码 0 含幂等 noop）：
+
+```cmd
+node client-patch\tools\rename-package.mjs ^
+  --in  D:\wfcnmod\wt\p7\out\sp-cn-181-unsigned.apk ^
+  --out D:\wfcnmod\tmp\p7b\out\sp-cn-181-coexist-unsigned.apk ^
+  --rename-to cn.starpoint.a --json
+```
+
+实测：`ok=true`、`from=com.leiting.wf → cn.starpoint.a`、`equalLength=true`、
+`residuals = { identity:0, protected:84, outOfScope(SKU):9 }`；
+138,753,351 B → 138,753,755 B，条目数 4177 → 4177。
+
+要让**产线**自己串起来（`[5.5]` 段在 `[5] 回封` 之后、`[6] zipalign` 之前），加两个旗标即可：
+
+```cmd
+node client-patch\build\build-client.mjs --base apkipa\V1.8.1.apk --host 172.16.10.105 --port 8001 ^
+  --out out\sp-cn-181-coexist-unsigned.apk --rename-package --rename-to cn.starpoint.a ^
+  --zipalign <zipalign.exe> --apksigner <apksigner.bat> --work <纯 ASCII 目录> --keep-work
+```
+
+实测（叠加 `--as3-hook` 的完整形态）：`exit=0`，route `as3-hook+abc-pair+rename`，
+产物 `sp-cn-181-p6login-coexist-unsigned.apk` sha256 `2557264f…5c8f`。
+
+### 7.2 判据：改了包名，且**一处计费 SKU 都没动**
+
+`build-client.mjs` 的 `[5.5]` 不看工具自述与 exit code，自己回读产物断言 7 条（工具 exit 0 且写出产物、
+AXML `package` = 新包名、AXML 无旧包名**身份残留**、`application.xml` 的 `<id>` = 新包名且无旧 `<id>`、
+条目数不变、确实不是 noop）。改名段的独立复算方式：
+
+| 判据 | 做法 | 实测 |
+|---|---|---|
+| 只改了「包名身份」 | 把输入的**身份命中**逐一 `from→to` 归一化后，与输出**逐字节比** | 变化的只有 4 条 entry（`resources.arsc` 1 处、`AndroidManifest.xml` 5 处、`application.xml` `<id>` 1 处 + authority 1 处、`classes.dex` 1 处）；其余 4173 条逐字节相同 |
+| **计费 SKU 一处没动** | 主 SWF entry（`assets/worldflipper_android_release.swf`）**逐字节不变** | sha256 前后相同 ⇒ 其内 9 个 `com.leiting.wf.stonepack_*` / `weekly_set_1` 多重集不变 |
+| 受保护串存活 | 产物里残留的含旧包名的标识符必须都是「更长标识符内部的命中」 | 只剩 `air.com.leiting.wf.AppEntry`（标识符开头=false） |
+
+> ⚠️ **计费 SKU 的分布必须实测，不能背数字**：iOS 主二进制的 91 处 `com.leiting.wf` 是计费 SKU；
+> **Android 主 SWF 里是 9 处**（`stonepack_*` / `weekly_set_1`），另外两个 iOS 包的 app id 还不一样
+> （`苹果v15.2.ipa` = `com.kulo.wf`、`iOS-1.8.4.ipa` = `com.leiting.wf`）。⇒ 任何全局字符串替换都是错的，
+> 必须先 `--inspect --json` 实测出「身份 / 受保护 / SKU」三类再动手。
+> ⚠️ **回读不能用朴素 substring**：AIR 的 `AndroidManifest.xml` 里**必然**有 `air.com.leiting.wf.AppEntry`
+> （AppEntry 是 AIR 入口类名，工具按规矩逐字保留），它内部含 `com.leiting.wf` —— 于是
+> `manifest.includes("com.leiting.wf")` 这条断言会把**正确**产物判死（实测就是这么被卡在 exit 2 的）。
+> 正确口径是只数**落在标识符开头**的命中（`countIdentityResidues`），更长标识符内部的命中视为受保护串。
+> ⚠️ `--rename-to` **必须与 `com.leiting.wf` 等长**（默认 `cn.starpoint.a` 正好 14 字节；工具不等长会拒绝，
+> 要强行不等长得显式 `--allow-unequal-length`）。
+> ⚠️ 改名会让 v1/v2 签名**全部失效**，所以次序只能是「回封 → **改名** → zipalign → 签名」，
+> 放到签名之后就会得到一个签名已坏的包 —— `[5.5]` 的位置是刻意安排在前面的。
+> ⚠️ `android:authorities` 的 AIR 形态 `air.com.leiting.wf.fileprovider` 会被改写成
+> `cn.starpoint.a.fileprovider`（**`air.` 前缀被一起吃掉**，长度 −4），这与 AXML 里改后的
+> `${applicationId}.fileprovider` 保持一致；`air.com.leiting.wf.AppEntry` 则**不动**。
+> ⚠️ `classes.dex` 的字节 [8,32)（checksum + SHA-1 签名）在任何改动后都必须重算 ——
+> 比对时要把这 24 字节掩掉，否则会把正常重算判成「有无法解释的差异」。
 
 ---
 
