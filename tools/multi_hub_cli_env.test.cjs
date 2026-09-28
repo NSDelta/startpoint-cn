@@ -16,6 +16,7 @@ const {
     isInteractiveTerminal,
     maybeWriteMultiHubTokenEnv,
 } = require("./lib/multi-hub-env.cjs")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const projectRoot = path.resolve(__dirname, "..")
 
@@ -117,7 +118,6 @@ test("interactive create appends a missing token and tightens .env permissions",
     assert.equal(prompts.length, 1)
     assert.equal(prompts[0].defaultValue, true)
     assert.equal(fs.readFileSync(envPath, "utf8"), `KEEP=value\nMULTI_HUB_TOKEN=${"a".repeat(64)}\n`)
-    assert.equal(fs.statSync(envPath).mode & 0o777, 0o600)
 })
 
 test("interactive create does not overwrite one existing token by default", async t => {
@@ -324,7 +324,10 @@ test("parent directory fsync EIO is preserved after rename and current temp clea
 })
 
 test("only unsupported parent directory fsync errors are ignored", async t => {
-    for (const code of ["EINVAL", "ENOTSUP", "EOPNOTSUPP"]) {
+    // Windows reports an unsupported parent-directory sync as EPERM/EISDIR rather than
+    // the POSIX codes, so all five have to be tolerated; see
+    // UNSUPPORTED_DIRECTORY_SYNC_CODES in ./lib/multi-hub-env.cjs.
+    for (const code of ["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EISDIR"]) {
         const { envPath } = envFixture(t, "KEEP=value\n")
         await maybeWriteMultiHubTokenEnv({
             envPath,
@@ -335,6 +338,44 @@ test("only unsupported parent directory fsync errors are ignored", async t => {
                 throw Object.assign(new Error(`directory fsync ${code}`), { code })
             },
         })
-        assert.equal(fs.statSync(envPath).mode & 0o777, 0o600)
+        assert.equal(fs.readFileSync(envPath, "utf8"), `KEEP=value\nMULTI_HUB_TOKEN=${"a".repeat(64)}\n`)
     }
+})
+
+test("a failing temporary file fsync is not mistaken for an unsupported directory sync", async t => {
+    // UNSUPPORTED_DIRECTORY_SYNC_CODES relaxes the PARENT DIRECTORY sync only. The
+    // temporary file's own fsync is the durability barrier for the token, so the same
+    // error codes raised there must still propagate instead of being swallowed.
+    const { envPath, root } = envFixture(t, "KEEP=value\n")
+    const originalFsyncSync = fs.fsyncSync
+    const failure = Object.assign(new Error("file fsync failed"), { code: "EPERM" })
+    fs.fsyncSync = () => {
+        throw failure
+    }
+    t.after(() => {
+        fs.fsyncSync = originalFsyncSync
+    })
+
+    await assert.rejects(maybeWriteMultiHubTokenEnv({
+        envPath,
+        token: "a".repeat(64),
+        interactive: true,
+        confirm: async () => true,
+    }), error => error === failure)
+    assert.equal(fs.readFileSync(envPath, "utf8"), "KEEP=value\n")
+    assert.deepEqual(fs.readdirSync(root), [".env"])
+})
+
+test("interactive create tightens the .env file permissions to 0o600", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
+    const { envPath } = envFixture(t, "KEEP=value\n", 0o640)
+
+    await maybeWriteMultiHubTokenEnv({
+        envPath,
+        token: "a".repeat(64),
+        interactive: true,
+        confirm: async question => question.defaultValue,
+    })
+
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o600)
 })

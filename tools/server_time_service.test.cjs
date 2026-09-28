@@ -5,6 +5,8 @@ const fs = require("node:fs")
 const os = require("node:os")
 const path = require("node:path")
 
+const { probe, skipMessage } = require("./helpers/capabilities.cjs")
+
 const { getTimeOffset, setServerTimeOffset } = require("../src/utils")
 const {
   ServerTimeStore,
@@ -53,6 +55,16 @@ const tests = []
 function test(name, fn) {
   tests.push({ name, fn })
 }
+// A case that needs a host capability this machine does not provide is recorded as
+// skipped rather than silently dropped: main() prints it as `ok - <name> # SKIP <why>`,
+// so a reader of the log can tell the case never ran, and the final summary counts it.
+function skipTest(name, reason) {
+  tests.push({ name, skip: reason })
+}
+function testWithCapability(capability, name, fn) {
+  if (probe(capability) === true) test(name, fn)
+  else skipTest(name, skipMessage(capability))
+}
 
 test("exports a fixed offset that remains stable when imported later", () => {
   const { service } = freshService()
@@ -98,7 +110,6 @@ test("store accepts only the exact three canonical fields", () => {
     offsetMs: TARGET_MS - NOW_MS,
     generatedAt: "2026-08-06T03:00:00.000Z",
   })
-  assert.equal(fs.statSync(paths.filePath).mode & 0o777, 0o600)
 
   for (const value of [
     {
@@ -166,7 +177,7 @@ test("rejects invalid imports without changing the current in-memory offset", ()
   }
 })
 
-test("rejects missing, corrupt, directory, and symlink server-time files distinctly", () => {
+test("rejects missing, corrupt, and directory server-time files distinctly", () => {
   const { paths, store } = freshService()
   assert.equal(store.read(), null)
 
@@ -182,8 +193,10 @@ test("rejects missing, corrupt, directory, and symlink server-time files distinc
     assertCode(error, "INVALID_SERVER_TIME_STATE")
     return true
   })
+})
 
-  fs.rmSync(paths.filePath, { recursive: true })
+testWithCapability("symlink", "rejects a symbolic-link server-time file", () => {
+  const { paths, store } = freshService()
   const target = path.join(paths.dataDir, "real-server-time.json")
   fs.writeFileSync(target, JSON.stringify({
     mode: "system",
@@ -246,8 +259,23 @@ test("propagates parent directory fsync errors without masking them during clean
   )
 })
 
+testWithCapability("posixFileMode", "store publishes the canonical file with 0o600 permissions", () => {
+  const { paths, store } = freshService()
+
+  store.write({
+    mode: "offset",
+    offsetMs: TARGET_MS - NOW_MS,
+    generatedAt: "2026-08-06T03:00:00.000Z",
+  })
+
+  assert.equal(fs.statSync(paths.filePath).mode & 0o777, 0o600)
+})
+
 test("ignores only unsupported parent directory fsync errors", () => {
-  for (const code of ["EINVAL", "ENOTSUP", "EOPNOTSUPP"]) {
+  // Windows reports an unsupported parent-directory sync as EPERM/EISDIR rather than the
+  // POSIX codes, so all five have to be tolerated; see UNSUPPORTED_DIRECTORY_SYNC_CODES
+  // in ../src/runtime/server-time/store.ts.
+  for (const code of ["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EISDIR"]) {
     const paths = makePaths()
     let calls = 0
     const store = makeStore(paths, {
@@ -312,7 +340,7 @@ test("rejects structurally invalid legacy active account state", () => {
   })
 })
 
-test("rejects a symbolic-link legacy active account file", () => {
+testWithCapability("symlink", "rejects a symbolic-link legacy active account file", () => {
   const { paths, service } = freshService()
   const target = path.join(paths.dataDir, "legacy-active-account.json")
   fs.writeFileSync(target, JSON.stringify({ timeOffset: 1.5 }))
@@ -364,7 +392,13 @@ test("does not treat an invalid legacy offset as a valid migration", () => {
 
 async function main() {
   let passed = 0
+  let skipped = 0
   for (const current of tests) {
+    if (current.skip !== undefined) {
+      skipped += 1
+      console.log(`ok - ${current.name} # SKIP ${current.skip}`)
+      continue
+    }
     try {
       await current.fn()
       passed += 1
@@ -377,7 +411,7 @@ async function main() {
       setServerTimeOffset(ORIGINAL_TIME_OFFSET)
     }
   }
-  console.log(`${passed}/${tests.length} tests passed`)
+  console.log(`${passed}/${tests.length} tests passed${skipped === 0 ? "" : `, ${skipped} skipped`}`)
 }
 
 main().catch(() => process.exitCode = 1)
