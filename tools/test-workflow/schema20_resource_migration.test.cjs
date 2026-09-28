@@ -93,4 +93,9 @@ const activeQuestDdl = migrated.prepare(`
 `).get().sql
 assert.match(activeQuestDdl, /coordinator_origin[\s\S]*CHECK\s*\([\s\S]*'remote'[\s\S]*'local'/)
 
+// Release the migrated database before the exit handler removes its temporary home.
+// POSIX lets a directory containing open files be unlinked, but Windows refuses with
+// EPERM, so without this the teardown (not any assertion) decides the exit code.
+data.closeDatabase()
+
 console.log("schema20 resource migration tests passed")

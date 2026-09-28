@@ -74,5 +74,7 @@ test("Android runtime config is unaffected by iOS configuration", () => {
 
 test("cn-server forwards the enabled iOS runtime config to the SDK routes", () => {
     const source = fs.readFileSync(path.join(projectRoot, "src", "cn-server.ts"), "utf8")
-    assert.match(source, /register\(iosLeitingPlugin,\s*\{\s*ios:\s*config\.iosCompat\s*\}\)/)
+    // The registration also carries other options (e.g. notice.provideCode), so allow the
+    // options object to hold more than `ios` — bounded so it cannot match a distant call.
+    assert.match(source, /register\(\s*iosLeitingPlugin\s*,\s*\{[\s\S]{0,400}?\bios:\s*config\.iosCompat\b/)
 })

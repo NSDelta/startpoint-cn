@@ -14,6 +14,7 @@ require("ts-node/register/transpile-only")
 const { buildCdnCatalog, CatalogValidationError } = require("../src/content/cdn/catalog-builder")
 const { createArchiveSourceManifest } = require("../src/content/cdn/archive-sources")
 const { ArchiveIndex } = require("../src/content/sync/archive-index")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 const {
     materializeContentCatalogInput,
     scanContentTarget,
@@ -227,6 +228,7 @@ test("materialization rejects a stable patch archive whose digest differs from m
 })
 
 test("materialization rejects a patch manifest changed after target scan", async t => {
+    if (!requireCapability(t, "symlink")) return
     const mutations = {
         deleted(manifestPath) {
             fs.unlinkSync(manifestPath)
@@ -452,6 +454,7 @@ test("scanner records unknown files but rejects zip-like invalid names", async t
 })
 
 test("scanner rejects archive and EntityLists symlinks that escape cdnRoot", async t => {
+    if (!requireCapability(t, "symlink")) return
     const first = createScannerFixture(t)
     const outsideArchive = path.join(first.sandbox, "outside.zip")
     fs.writeFileSync(outsideArchive, "outside")
@@ -603,6 +606,7 @@ function createArchiveFixture(t, options = {}) {
 }
 
 test("ArchiveIndex builds from central directories and applies full then diff archive order", async t => {
+    if (!requireCapability(t, "zipCli")) return
     const { catalog, cdnRoot } = createArchiveFixture(t, { asZip: true })
     let bodyReads = 0
     let openCalls = 0
@@ -654,6 +658,7 @@ test("ArchiveIndex builds from central directories and applies full then diff ar
 })
 
 test("ArchiveIndex reads a manifest-selected archive from the patch root", async t => {
+    if (!requireCapability(t, "zipCli")) return
     const fixture = createArchiveFixture(t, { asZip: true })
     const patchVersion = "1.4.1"
     const relativePath = `archive-android-diff/${archiveFileName("archive-android-diff", "1.4.0", patchVersion)}`
@@ -761,6 +766,7 @@ test("ArchiveIndex ignores safe non-production entries and rejects duplicates wi
 })
 
 test("ArchiveIndex rejects archive symlink escapes, mutation during build, and corrupt ZIPs", async t => {
+    if (!requireCapability(t, "symlink")) return
     const symlinkFixture = createArchiveFixture(t)
     const targetRelativePath = `archive-common-full/${archiveFileName("archive-common-full", null, "1.4.0")}`
     const targetPath = path.join(symlinkFixture.cdnRoot, targetRelativePath)

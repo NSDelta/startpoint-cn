@@ -12,6 +12,7 @@ const {
     serializeError,
     snapshotJsonValue,
 } = require("./full_server_acceptance_safety.cjs")
+const { requireCapability } = require("../helpers/capabilities.cjs")
 
 function caseVariant(filePath) {
     for (let index = filePath.length - 1; index >= 0; index--) {
@@ -260,7 +261,10 @@ test("atomicWriteFile rejects symlink and directory targets without replacing th
     }
 })
 
-test("atomicWriteFile preserves existing modes and creates new files with mode 0600", () => {
+test("atomicWriteFile preserves existing modes and creates new files with mode 0600", t => {
+    // Asserts real POSIX permission bits (0644/0660/0600); Windows reports 0666 for
+    // every file because chmod there only toggles the read-only attribute.
+    if (!requireCapability(t, "posixFileMode")) return
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "full-server-output-mode-"))
     try {
         for (const mode of [0o644, 0o660]) {

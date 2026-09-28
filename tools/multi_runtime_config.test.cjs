@@ -22,6 +22,7 @@ const {
     AuthenticationRejectionBuffer,
 } = require("../src/multi/hub/authentication-rejections")
 const { MultiHubCredentialStore } = require("../src/multi/hub/credential-store")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 test("multiplayer defaults to the current embedded listener", () => {
     const config = parseCnRuntimeConfig({
@@ -438,6 +439,7 @@ test("host defaults to the private runtime data area and rejects tracked DATA_DI
 })
 
 test("host rejects a private data symlink that resolves into tracked project content", t => {
+    if (!requireCapability(t, "symlink")) return
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "multi-host-symlink-"))
     t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
     const temporaryProjectRoot = path.join(sandbox, "repo")
@@ -1173,6 +1175,7 @@ function admissionSnapshot(viewerId) {
 }
 
 test("host TCP accepts only its explicit internal identity across credential revocation", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-host-internal-identity-"))
     const credentialsPath = path.join(root, "credentials.json")
     const store = new MultiHubCredentialStore({ credentialsPath })
@@ -1292,6 +1295,7 @@ test("host TCP accepts only its explicit internal identity across credential rev
 })
 
 test("real host hot-loads credentials and serves only the trusted control API", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-host-empty-"))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const credentialsPath = path.join(root, "credentials.json")

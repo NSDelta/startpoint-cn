@@ -14,6 +14,14 @@ const UNSUPPORTED_DIRECTORY_SYNC_CODES = new Set([
     "EINVAL",
     "ENOTSUP",
     "EOPNOTSUPP",
+    // Windows reports an unsupported parent-directory fsync as EPERM/EISDIR, not
+    // EINVAL/ENOTSUP/EOPNOTSUPP, so both spellings belong here. Unlike the temp-file
+    // fsync elsewhere in this store, the directory handle cannot be opened writable
+    // portably (POSIX rejects O_RDWR on a directory with EISDIR), so the sync is
+    // skipped rather than attempted. The tolerance stays scoped to this step: a failed
+    // create/fchmod/rename still propagates and still blocks the in-memory offset.
+    "EPERM",
+    "EISDIR",
 ])
 
 export interface ServerTimeStoreOptions {

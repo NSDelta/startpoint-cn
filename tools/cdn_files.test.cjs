@@ -12,6 +12,7 @@ require("ts-node/register/transpile-only")
 const Fastify = require("fastify")
 const cdnFilesPlugin = require("../src/routes/cn/cdnFiles").default
 const { parseHttpByteRange } = require("../src/routes/cn/httpRange")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const SHA256 = "a".repeat(64)
 
@@ -198,6 +199,7 @@ test("parseHttpByteRange rejects invalid and unsatisfiable ranges", () => {
 })
 
 test("serves complete responses with byte metadata", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, observer, zipBytes } = await createFixture(t)
 
     const response = await app.inject({
@@ -212,6 +214,7 @@ test("serves complete responses with byte metadata", async t => {
 })
 
 test("serves full, HEAD, and Range responses with the file Last-Modified date", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, cdnRoot, observer } = await createFixture(t)
     const filePath = path.join(cdnRoot, "objects", "ordinary.bin")
     const expected = new Date(fs.statSync(filePath).mtimeMs).toUTCString()
@@ -237,6 +240,7 @@ test("serves full, HEAD, and Range responses with the file Last-Modified date", 
 })
 
 test("does not serve Last-Modified for missing paths", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app } = await createFixture(t)
 
     const response = await app.inject({ method: "GET", url: "/patch/cn/objects/absent.bin" })
@@ -245,6 +249,7 @@ test("does not serve Last-Modified for missing paths", async t => {
 })
 
 test("serves manifest-selected patch ZIPs with GET, HEAD, and Range", async t => {
+    if (!requireCapability(t, "symlink")) return
     const relativePath = "archive-common-diff/p55.zip"
     const bytes = Buffer.from("0123456789")
     const { app, observer } = await createFixture(t, {
@@ -276,6 +281,7 @@ test("serves manifest-selected patch ZIPs with GET, HEAD, and Range", async t =>
 })
 
 test("HEAD validates CDN and patch files without creating or reading streams", async t => {
+    if (!requireCapability(t, "symlink")) return
     const reads = { createReadStreamCalls: 0, bytes: 0 }
     const { app, observer } = await createFixture(t, {
         fileSystemFactory: () => ({
@@ -357,6 +363,7 @@ test("HEAD validates CDN and patch files without creating or reading streams", a
 })
 
 test("serves closed, open, suffix, and truncated ranges", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, observer } = await createFixture(t)
     const cases = [
         ["bytes=2-5", "2345", "bytes 2-5/10"],
@@ -381,6 +388,7 @@ test("serves closed, open, suffix, and truncated ranges", async t => {
 })
 
 test("serves saturated decimal ranges and rejects oversized Range headers", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, observer } = await createFixture(t)
     const cases = [
         ["bytes=0-9007199254740992", 206, "0123456789", "bytes 0-9/10"],
@@ -403,6 +411,7 @@ test("serves saturated decimal ranges and rejects oversized Range headers", asyn
 })
 
 test("returns empty 416 responses for invalid, unsatisfiable, and empty-file ranges", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, observer } = await createFixture(t)
     for (const range of [
         "bytes=99-100",
@@ -436,6 +445,7 @@ test("returns empty 416 responses for invalid, unsatisfiable, and empty-file ran
 })
 
 test("keeps ZIP allowlist, ordinary files, patch upload, and path boundaries", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { app, contentStateDir, observer } = await createFixture(t)
 
     const ordinary = await app.inject({ method: "GET", url: "/patch/cn/objects/ordinary.bin" })
@@ -472,6 +482,7 @@ test("keeps ZIP allowlist, ordinary files, patch upload, and path boundaries", a
 })
 
 test("rejects a Catalog ZIP reached through an intermediate directory symlink", async t => {
+    if (!requireCapability(t, "symlink")) return
     const targetBody = "middle-secret"
     const { app, observer } = await createFixture(t, {
         setup: ({ cdnRoot }) => {
@@ -489,6 +500,7 @@ test("rejects a Catalog ZIP reached through an intermediate directory symlink", 
 })
 
 test("rejects a Catalog ZIP path replaced by a symlink after route registration", async t => {
+    if (!requireCapability(t, "symlink")) return
     const targetBody = "extra"
     const { app, cdnRoot, observer } = await createFixture(t)
     const archivePath = path.join(cdnRoot, "archive-common-full", "base.zip")
@@ -505,6 +517,7 @@ test("rejects a Catalog ZIP path replaced by a symlink after route registration"
 })
 
 test("rejects a same-size Catalog ZIP replaced after route registration", async t => {
+    if (!requireCapability(t, "symlink")) return
     const replacementBody = "abcdefghij"
     const { app, cdnRoot, observer } = await createFixture(t)
     const archivePath = path.join(cdnRoot, "archive-common-full", "base.zip")
@@ -528,6 +541,7 @@ test("rejects a same-size Catalog ZIP replaced after route registration", async 
 })
 
 test("rejects a Catalog ZIP replaced while its opened handle is validated", async t => {
+    if (!requireCapability(t, "symlink")) return
     const replacementBody = "abcdefghij"
     let swapped = false
     const { app, observer } = await createFixture(t, {
@@ -563,6 +577,7 @@ test("rejects a Catalog ZIP replaced while its opened handle is validated", asyn
 })
 
 test("rejects a non-ZIP intermediate directory swapped during open validation", async t => {
+    if (!requireCapability(t, "symlink")) return
     const targetBody = "outside-secret"
     let swapped = false
     const { app, observer } = await createFixture(t, {
@@ -596,6 +611,7 @@ test("rejects a non-ZIP intermediate directory swapped during open validation", 
 })
 
 test("releases the FileHandle after a real socket client aborts the response", async t => {
+    if (!requireCapability(t, "symlink")) return
     let serverRequest
     let serverReply
     const { app, observer } = await createFixture(t, {
@@ -672,6 +688,7 @@ test("releases the FileHandle after a real socket client aborts the response", a
 })
 
 test("closes a real socket when the read stream fails after headers are sent", async t => {
+    if (!requireCapability(t, "symlink")) return
     const injectedError = new Error("injected post-header stream failure")
     let interruptedStream
     let serverReply
@@ -761,6 +778,7 @@ test("closes a real socket when the read stream fails after headers are sent", a
 })
 
 test("releases the FileHandle when the read stream is destroyed with an error", async t => {
+    if (!requireCapability(t, "symlink")) return
     const injectedError = new Error("injected read stream failure")
     let interruptedStream
     const { app, observer } = await createFixture(t, {

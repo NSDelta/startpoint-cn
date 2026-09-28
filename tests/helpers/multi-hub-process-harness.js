@@ -514,7 +514,14 @@ class MultiHubProcessHarness {
         for (const definition of TABLE_SOURCES) {
             const destination = path.join(this.runtimeRoot, definition.tableName)
             fs.mkdirSync(path.dirname(destination), { recursive: true })
-            fs.copyFileSync(path.join(projectRoot, definition.bundledPath), destination)
+            // `path.relative` cannot express a path across two Windows volumes, so a
+            // registry fixture whose sources live in a temp directory on another drive
+            // yields an absolute bundledPath; joining that onto projectRoot would build
+            // "D:\repo\C:\..." and fail. Accept either form.
+            const source = path.isAbsolute(definition.bundledPath)
+                ? definition.bundledPath
+                : path.join(projectRoot, definition.bundledPath)
+            fs.copyFileSync(source, destination)
         }
         const catalogRelativePath = "cdn/catalog-cn-1.4.54.json"
         const catalogDestination = path.join(this.runtimeRoot, catalogRelativePath)

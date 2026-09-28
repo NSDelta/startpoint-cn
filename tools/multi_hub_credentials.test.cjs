@@ -18,6 +18,7 @@ const {
     acquireMultiHubCredentialLock,
     withMultiHubCredentialLock,
 } = require("../src/multi/hub/credential-lock")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 function fixture(t, options = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-hub-credentials-"))
@@ -118,6 +119,7 @@ async function runConcurrentCredentialOperations(root, credentialsPath, operatio
 }
 
 test("create returns plaintext once while the private table stores only its digest", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     const issued = store.create("node-b")
 
@@ -149,6 +151,7 @@ test("create returns plaintext once while the private table stores only its dige
 })
 
 test("credential lock is a private sibling and times out while its owner is active", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, root } = fixture(t)
     const lock = acquireMultiHubCredentialLock(credentialsPath, {
         timeoutMs: 20,
@@ -171,6 +174,7 @@ test("credential lock is a private sibling and times out while its owner is acti
 })
 
 test("credential lock waits for an owner record being published", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath } = fixture(t)
     const lockPath = `${credentialsPath}.lock`
     fs.mkdirSync(path.dirname(lockPath), { recursive: true })
@@ -198,6 +202,7 @@ test("credential lock waits for an owner record being published", t => {
 })
 
 test("credential lock recovers a stale dead owner without deleting its successor", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath } = fixture(t)
     const stale = acquireMultiHubCredentialLock(credentialsPath, {
         now: () => 1_000,
@@ -223,6 +228,7 @@ test("credential lock recovers a stale dead owner without deleting its successor
 })
 
 test("credential lock releases its own file when the operation throws", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath } = fixture(t)
     const failure = new Error("operation failed")
 
@@ -234,6 +240,7 @@ test("credential lock releases its own file when the operation throws", t => {
 })
 
 test("independent credentials revoke separately and repeated revoke is idempotent", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let clock = Date.parse("2026-08-05T00:00:00.000Z")
     const { credentialsPath, store } = fixture(t, {
         now: () => new Date(clock),
@@ -256,6 +263,7 @@ test("independent credentials revoke separately and repeated revoke is idempoten
 })
 
 test("new tables use 0600 and updates preserve existing permissions", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     store.create("node-a")
     assert.equal(fs.statSync(credentialsPath).mode & 0o777, 0o600)
@@ -266,6 +274,7 @@ test("new tables use 0600 and updates preserve existing permissions", t => {
 })
 
 test("atomic replacement failure preserves the previous credential table", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const target = fixture(t)
     target.store.create("node-a")
     const original = fs.readFileSync(target.credentialsPath)
@@ -333,6 +342,7 @@ test("strict loading rejects malformed, ambiguous, and unsupported tables", t =>
 })
 
 test("credential labels and revocation require exact non-empty values", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { store } = fixture(t)
     for (const label of [
         "",
@@ -357,6 +367,7 @@ test("credential labels and revocation require exact non-empty values", t => {
 })
 
 test("a generated token collision is rejected without changing the table", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     let sequence = 0
     const token = "a".repeat(64)
     const { credentialsPath, store } = fixture(t, {
@@ -374,6 +385,7 @@ test("a generated token collision is rejected without changing the table", t => 
 })
 
 test("concurrent create processes preserve both credentials", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, root } = fixture(t)
 
     await runConcurrentCredentialOperations(root, credentialsPath, [
@@ -388,6 +400,7 @@ test("concurrent create processes preserve both credentials", async t => {
 })
 
 test("concurrent revoke processes preserve both revocations", async t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, root, store } = fixture(t)
     const first = store.create("node-a")
     const second = store.create("node-b")
@@ -404,6 +417,7 @@ test("concurrent revoke processes preserve both revocations", async t => {
 })
 
 test("management CLI uses only the injected private table and never reprints secrets", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-hub-cli-"))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const credentialsPath = path.join(root, "credentials.json")
@@ -453,6 +467,7 @@ test("management CLI uses only the injected private table and never reprints sec
 })
 
 test("credential reloader skips unchanged files and atomically adopts valid snapshots", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     const first = store.create("node-a")
     let reads = 0
@@ -482,6 +497,7 @@ test("credential reloader skips unchanged files and atomically adopts valid snap
 })
 
 test("credential reloader retains the previous snapshot after malformed changes", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     const issued = store.create("node-a")
     const warnings = []
@@ -503,6 +519,7 @@ test("credential reloader retains the previous snapshot after malformed changes"
 })
 
 test("credential reloader distinguishes initial missing state from a deleted valid snapshot", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     const warnings = []
     const reloader = new CredentialReloader({
@@ -559,6 +576,7 @@ test("credential reloader treats a previously loaded empty table as a valid snap
 })
 
 test("credential reloader starts empty, hot-loads creation and preserves peers on revoke", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, store } = fixture(t)
     const reloader = new CredentialReloader({
         credentialsPath,

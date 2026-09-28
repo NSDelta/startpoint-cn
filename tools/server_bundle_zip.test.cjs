@@ -13,6 +13,7 @@ const zipPath = path.join(__dirname, "server-bundle/zip.cjs")
 const { collectBundleEntries, crc32, writeStoredZip } = require(zipPath)
 const { canonicalJsonBuffer } = require("./server-bundle/canonical-json.cjs")
 const { loadServerReleaseContract } = require("./server-bundle/release-contract.cjs")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const releaseContract = loadServerReleaseContract(path.resolve(__dirname, ".."))
 
@@ -312,6 +313,7 @@ test("rejects a differing same-name archive without replacing it", t => {
 })
 
 test("rejects an existing archive modified in place during byte comparison", t => {
+    if (!requireCapability(t, "oNoFollow")) return
     const fixture = createPackFixture(t)
     const { packServerBundle } = require(packPath)
     packServerBundle({ bundleRoot: fixture.bundleRoot, outputDirectory: fixture.outputDirectory })
@@ -709,6 +711,7 @@ test("rejects a disk manifest replaced after verification", t => {
 })
 
 test("rejects a source parent replaced by a symlink after collection", t => {
+    if (!requireCapability(t, "symlink")) return
     const fixture = createFixture(t, { "out/server.js": "same bytes\n" })
     const entries = collectBundleEntries({ bundleRoot: fixture.bundleRoot })
     const externalRoot = path.join(fixture.sandbox, "external")
@@ -724,6 +727,7 @@ test("rejects a source parent replaced by a symlink after collection", t => {
 })
 
 test("rejects non-ordinary bundle inputs", async t => {
+    if (!requireCapability(t, "symlink")) return
     await t.test("missing and non-directory roots", () => {
         const fixture = createFixture(t)
         const plainFile = write(fixture.sandbox, "plain", "x")
@@ -770,6 +774,7 @@ test("refuses unsafe and conflicting destinations", t => {
 })
 
 test("publishes through a real parent resolved from a directory symlink", t => {
+    if (!requireCapability(t, "symlink")) return
     const fixture = createFixture(t, { "file.txt": "payload" })
     const entries = collectBundleEntries({ bundleRoot: fixture.bundleRoot })
     const realParent = path.join(fixture.sandbox, "real-output")

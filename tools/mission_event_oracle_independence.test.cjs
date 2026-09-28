@@ -8,6 +8,7 @@ const { createHash } = require("node:crypto")
 const fs = require("node:fs")
 const path = require("node:path")
 const test = require("node:test")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const SOURCE_COMMIT = "d594854070718d12c3dab4a31901d5647c4bf1e9"
 const fixturePath = path.join(
@@ -52,7 +53,8 @@ test("Event migration oracle is fixed to the independently generated pre-Session
     assert.deepEqual(Object.keys(fixture.settlement).sort(), ["first", "repeated"])
 })
 
-test("Event migration oracle exactly matches a fresh d594854 generator run", { timeout: 30_000 }, () => {
+test("Event migration oracle exactly matches a fresh d594854 generator run", { timeout: 30_000 }, t => {
+    if (!requireCapability(t, "symlink")) return
     const result = spawnSync(process.execPath, [
         path.join(__dirname, "generate_mission_event_legacy_fixture.cjs"),
     ], {

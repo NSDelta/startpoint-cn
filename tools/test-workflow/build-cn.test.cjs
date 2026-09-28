@@ -49,12 +49,21 @@ function createHarness(statuses, {
     }
 }
 
+// runCnBuild resolves dependencies.projectRoot through path.resolve
+// (tools/test-workflow/build-cn.cjs:77), so the harness's "/project" becomes a
+// drive-absolute path on Windows ("D:\project"). Derive the expected paths the same way
+// rather than hard-coding POSIX literals that only hold on Linux/macOS.
+const fixtureRoot = path.resolve("/project")
+// stderr must not leak the project root; match the resolved form too, because a bare
+// /\/project/ cannot detect a Windows-shaped leak.
+const projectPathPattern = new RegExp(fixtureRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+
 function expectedCall(entry, args = []) {
     return {
         args: [entry, ...args],
         executable: "/runtime/node",
         options: {
-            cwd: "/project",
+            cwd: fixtureRoot,
             shell: false,
             stdio: "inherit",
         },
@@ -62,18 +71,18 @@ function expectedCall(entry, args = []) {
 }
 
 const tscCall = expectedCall("--max-old-space-size=4096", [
-    "/project/node_modules/typescript/bin/tsc",
+    path.join(fixtureRoot, "node_modules/typescript/bin/tsc"),
     "-p",
-    "/project/tsconfig.cn.json",
+    path.join(fixtureRoot, "tsconfig.cn.json"),
 ])
-const verifierCall = expectedCall("/project/tools/test-workflow/verify-cn-build.cjs", [
-    "/project/out",
+const verifierCall = expectedCall(path.join(fixtureRoot, "tools/test-workflow/verify-cn-build.cjs"), [
+    path.join(fixtureRoot, "out"),
 ])
 const adminCall = {
     args: ["run", "build:admin"],
     executable: "/runtime/npm",
     options: {
-        cwd: "/project",
+        cwd: fixtureRoot,
         shell: false,
         stdio: "inherit",
     },
@@ -84,7 +93,7 @@ function expectedAdminCall({ executable = "/runtime/npm", shell = false } = {}) 
         args: ["run", "build:admin"],
         executable,
         options: {
-            cwd: "/project",
+            cwd: fixtureRoot,
             shell,
             stdio: "inherit",
         },
@@ -108,8 +117,8 @@ test("首次 verifier 失败时仅删除独立 build info 并完整重跑", () =
     assert.equal(runCnBuild(harness.dependencies), 0)
     assert.deepEqual(harness.calls, [adminCall, tscCall, verifierCall, tscCall, verifierCall])
     assert.deepEqual(harness.cleaned, ["cleaned", "cleaned"])
-    assert.deepEqual(harness.removed, ["/project/out/.tsbuildinfo-cn"])
-    assert.doesNotMatch(harness.stderr.join(""), /\/project/)
+    assert.deepEqual(harness.removed, [path.join(fixtureRoot, "out/.tsbuildinfo-cn")])
+    assert.doesNotMatch(harness.stderr.join(""), projectPathPattern)
 })
 
 test("admin 构建失败时不运行 tsc、verifier 或恢复轮次", () => {
@@ -181,7 +190,7 @@ test("恢复后的 verifier 仍失败时返回非零", () => {
 
     assert.notEqual(runCnBuild(harness.dependencies), 0)
     assert.deepEqual(harness.calls, [adminCall, tscCall, verifierCall, tscCall, verifierCall])
-    assert.deepEqual(harness.removed, ["/project/out/.tsbuildinfo-cn"])
+    assert.deepEqual(harness.removed, [path.join(fixtureRoot, "out/.tsbuildinfo-cn")])
 })
 
 test("默认项目根路径由 orchestrator 位置决定", () => {

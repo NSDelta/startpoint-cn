@@ -10,6 +10,13 @@ const UNSUPPORTED_DIRECTORY_SYNC_CODES = new Set([
     "EINVAL",
     "ENOTSUP",
     "EOPNOTSUPP",
+    // Windows reports an unsupported parent-directory fsync as EPERM/EISDIR, not
+    // EINVAL/ENOTSUP/EOPNOTSUPP. The directory handle cannot be opened writable
+    // portably (POSIX rejects O_RDWR on a directory with EISDIR), so the sync of the
+    // parent directory is skipped rather than attempted. The temp-file fsync above is
+    // unaffected: it holds a writable "wx" descriptor and still fails loudly.
+    "EPERM",
+    "EISDIR",
 ])
 
 class MultiHubEnvError extends Error {

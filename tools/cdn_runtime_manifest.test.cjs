@@ -16,6 +16,7 @@ const {
     validateCdnRuntimeFiles,
 } = require("../src/content/cdn/runtime-manifest")
 const { buildCdnCatalog } = require("../src/content/cdn/catalog-builder")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 const {
     executeManifestCli,
     ManifestCliError,
@@ -186,7 +187,10 @@ test("runtime validation reports stable relative-path errors for missing, wrong-
         await assert.rejects(
             validateCdnRuntimeFiles(manifest, cdnRoot, {
                 stat: async filePath => {
-                    const relativePath = path.relative(cdnRoot, filePath)
+                    // The manifest stores POSIX-shaped relative paths, while path.relative
+                    // yields backslash-separated ones on Windows. Normalise so the injected
+                    // stat resolves the same entry the validator asked about on every host.
+                    const relativePath = path.relative(cdnRoot, filePath).split(path.sep).join("/")
                     const metadata = relativePath === entityPath
                         ? manifest.entityLists
                         : manifest.catalogInput.archives.find(item => item.relativePath === relativePath)
@@ -297,6 +301,7 @@ test("manifest CLI refuses output inside the CDN or runtime directory", async ()
 })
 
 test("manifest CLI refuses output through an ancestor symlink into the CDN before scanning", async t => {
+    if (!requireCapability(t, "symlink")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cdn-manifest-ancestor-link-"))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
 
@@ -336,6 +341,7 @@ test("manifest CLI refuses output through an ancestor symlink into the CDN befor
 })
 
 test("manifest CLI refuses a symlink output file into runtime before scanning", async t => {
+    if (!requireCapability(t, "symlink")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cdn-manifest-output-link-"))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
 

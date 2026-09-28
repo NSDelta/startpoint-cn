@@ -19,6 +19,7 @@ const {
     MultiHubCredentialStore,
 } = require("../src/multi/hub/credential-store")
 const { CredentialReloader } = require("../src/multi/hub/credential-reloader")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 function authenticationFixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-hub-authentication-"))
@@ -42,6 +43,7 @@ function authenticationFixture(t) {
 }
 
 test("credential reloader classifies malformed, unknown, revoked, and active tokens", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { active, reloader, revoked } = authenticationFixture(t)
 
     assert.deepEqual(reloader.authenticateDetailed(null), {
@@ -73,6 +75,7 @@ test("credential reloader classifies malformed, unknown, revoked, and active tok
 })
 
 test("legacy authenticate keeps returning only active credentials", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { active, reloader, revoked } = authenticationFixture(t)
 
     assert.equal(reloader.authenticate("short"), null)
@@ -82,6 +85,7 @@ test("legacy authenticate keeps returning only active credentials", t => {
 })
 
 test("authentication rejection event type requires credential IDs only for revoked", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-hub-authentication-types-"))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const sourcePath = path.join(root, "contract.ts")
@@ -125,6 +129,7 @@ void unknownWithId
 })
 
 test("unknown and revoked authentication scan every credential digest", t => {
+    if (!requireCapability(t, "posixFileMode")) return
     const { credentialsPath, reloader, revoked } = authenticationFixture(t)
     const persisted = JSON.parse(fs.readFileSync(credentialsPath, "utf8"))
     assert.equal(persisted.credentials[0].credentialId, revoked.credentialId)

@@ -4,6 +4,8 @@ const assert = require("node:assert/strict")
 const fs = require("node:fs")
 const path = require("node:path")
 
+const { requireExternalInput } = require("./helpers/capabilities.cjs")
+
 require("ts-node/register/transpile-only")
 
 const utils = require("../src/utils")
@@ -25,6 +27,23 @@ const workspaceRoot = fs.existsSync(path.join(candidateWorkspace, "wf-2.1.125-cn
     : linkedGitDirectory === null
         ? candidateWorkspace
         : path.dirname(path.resolve(linkedGitDirectory, "../../.."))
+
+// The final assertion cross-checks PlayerLogic.as from the decompiled client, which is
+// not part of this repository and cannot be produced by any build step in it. Gate on
+// the file actually being present rather than failing as though the product were broken.
+const clientPlayerLogicPath = path.join(
+    workspaceRoot,
+    "wf-2.1.125-cn-decompiled/scripts/scripts/pinball/common/data/player/PlayerLogic.as",
+)
+if (!requireExternalInput(
+    "time semantics",
+    () => (fs.existsSync(clientPlayerLogicPath)
+        ? true
+        : `the decompiled client tree is absent (expected ${clientPlayerLogicPath})`),
+    "obtain the wf-2.1.125-cn-decompiled client tree and place it beside the main checkout",
+)) {
+    process.exit(0)
+}
 
 try {
     utils.setServerTimeOffset(offsetMs)
@@ -67,13 +86,7 @@ try {
     )
     assert.match(playerSource, /calculatePooledExpAtRealTime\(/)
 
-    const clientSource = fs.readFileSync(
-        path.join(
-            workspaceRoot,
-            "wf-2.1.125-cn-decompiled/scripts/scripts/pinball/common/data/player/PlayerLogic.as",
-        ),
-        "utf8",
-    )
+    const clientSource = fs.readFileSync(clientPlayerLogicPath, "utf8")
     assert.match(clientSource, /get_currentPooledExp[\s\S]*?timeProvider\.getTime\(\)/)
     assert.match(clientSource, /pooled_exp_gain_time/)
 

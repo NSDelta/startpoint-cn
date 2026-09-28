@@ -8,6 +8,7 @@ const path = require("node:path")
 const { spawnSync } = require("node:child_process")
 const test = require("node:test")
 const { loadServerReleaseContract } = require("./server-bundle/release-contract.cjs")
+const { requireCapability } = require("./helpers/capabilities.cjs")
 
 const projectRoot = path.resolve(__dirname, "..")
 const releaseContract = loadServerReleaseContract(projectRoot)
@@ -288,6 +289,7 @@ test("requires a complete admin build and excludes legacy pages", t => {
 })
 
 test("builder rejects unsafe input trees, input-contained output, and unowned output", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { buildServerBundle } = loadImplementations()
 
     await t.test("symlink", t => {
@@ -547,6 +549,7 @@ test("verifier rejects malicious, duplicate, and unstably ordered manifest paths
 })
 
 test("verifier rejects symlinks and non-canonical or shape-invalid manifests", async t => {
+    if (!requireCapability(t, "symlink")) return
     const { verifyServerBundle } = loadImplementations()
 
     await t.test("symlink", t => {
