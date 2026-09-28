@@ -540,3 +540,91 @@ test("夹具自检：假 APK 能被自家 ZIP 引擎读回，v1 签名件识别�
     const argv = mod.parseArgv(["--base", "a.apk", "--host=1.2.3.4", "--dry-run", "--rename-package"])
     assert.deepEqual(argv, { base: "a.apk", host: "1.2.3.4", "dry-run": true, "rename-package": true })
 })
+
+// ─────────── 8. 改名回读的两条边界（P7c 端到端实跑逼出来的断言 bug，静态读代码发现不了） ───────────
+
+const OLD_PKG = "com.leiting.wf"
+const NEW_PKG = "cn.starpoint.a"
+
+/**
+ * 造一个只含 manifest（可指定 UTF-16LE）+ 可选 application.xml 的最小 APK。
+ * AIR 的真实形态是 manifest 里**必然**带 `air.<旧包名>.AppEntry`（入口类名，改名工具按规矩逐字保留），
+ * 所以回读逻辑必须能区分「标识符开头」与「更长标识符内部」两种命中。
+ */
+function renameFixtureApk({ manifestText, manifestUtf16 = true, applicationXml = null }) {
+    const add = (name, data, entries) => entries.push({
+        name, method: 8, flags: 0, mtime: 0x6000, mdate: 0x5000,
+        crc: fx.zip.crc32(data), csize: deflateRawSync(data, { level: 9 }).length, usize: data.length,
+        versionMadeBy: 0x14, externalAttr: 0, raw: deflateRawSync(data, { level: 9 }),
+    })
+    const entries = []
+    add("AndroidManifest.xml", Buffer.from(manifestText, manifestUtf16 ? "utf16le" : "utf8"), entries)
+    if (applicationXml !== null) add("assets/META-INF/AIR/application.xml", Buffer.from(applicationXml, "utf8"), entries)
+    return fx.zip.writeZipEntries(entries)
+}
+
+test("改名回读：air.<旧包名>.AppEntry 是受保护串，不算身份残留（朴素 substring 会误杀正确产物）", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+    const manifest = `<manifest package="${NEW_PKG}">`
+        + `<provider android:authorities="${NEW_PKG}.fileprovider"/>`
+        + `<application android:name="air.${OLD_PKG}.AppEntry"/>`
+        + `</manifest>`
+    const result = mod.checkRenamedApk(renameFixtureApk({ manifestText: manifest }), { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(result.hasManifest, true)
+    assert.equal(result.manifestHasTo, true)
+    // 陷阱本身也钉住：朴素 substring 必然命中 AppEntry 内部那一段 —— 这正是旧断言判死正确产物的原因。
+    assert.equal(result.manifestHasFrom, true, "整串 substring 仍会出现（AppEntry 内部），所以不能直接拿它当判据")
+    assert.equal(result.manifestFromResidues, 0, "但「落在标识符开头」的残留必须为 0")
+    assert.deepEqual(result.manifestFromResidueSamples, [])
+})
+
+test("改名回读：真正没改干净的旧包名（落在标识符开头）必须被抓到并给出样例", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+    const manifest = `<manifest package="${NEW_PKG}">`
+        + `<provider android:authorities="${OLD_PKG}.fileprovider"/>`
+        + `<application android:name="air.${OLD_PKG}.AppEntry"/>`
+        + `</manifest>`
+    const result = mod.checkRenamedApk(renameFixtureApk({ manifestText: manifest }), { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(result.manifestFromResidues, 1, "只有真残留被计数，AppEntry 不计")
+    assert.deepEqual(result.manifestFromResidueSamples, [`${OLD_PKG}.fileprovider`])
+})
+
+test("改名回读：UTF-8 变体 manifest 与 application.xml 的 <id> 一并核对", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+    const apk = renameFixtureApk({
+        manifestText: `<manifest package="${OLD_PKG}"/>`,
+        manifestUtf16: false,
+        applicationXml: `<application><id>${OLD_PKG}</id></application>`,
+    })
+    const result = mod.checkRenamedApk(apk, { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(result.hasApplicationXml, true)
+    assert.equal(result.manifestFromResidues, 1, "package=\" 后面的命中落在标识符开头 ⇒ 计数")
+    assert.equal(result.manifestHasTo, false)
+    assert.equal(result.applicationXmlHasFrom, true)
+    assert.equal(result.applicationXmlHasTo, false)
+})
+
+// ─────────── 9. 钩子合法改变 SWF 长度（长度守恒的参照 = 改写前那一刻，不是基线） ───────────
+
+const GROWING_HOOK = `export async function transformSwf(ctx) {
+    const grown = Buffer.concat([ctx.logicalSwf, Buffer.alloc(1024, 0)])
+    grown.writeUInt32LE(grown.length, 4)   // SWF 头的 fileLength 一并改对，做成「合法」的长度变化
+    return { swf: grown, notes: ["growing-hook：尾部追加 1024 B（模拟 P6 登录页 pcode 块 +14,572 B）"] }
+}
+`
+
+test("AS3 钩子合法改变 SWF 长度时必须被接受（拿基线长度当参照会把真干活的钩子判死）", () => {
+    const hook = path.join(fx.dir, "growing-hook.mjs")
+    fs.writeFileSync(hook, GROWING_HOOK)
+    const target = out("growing.apk")
+    const result = run(baseArgs("growing", ["--ffdec", tools.jar, "--java", tools.java, "--as3-hook", hook]))
+    assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`)
+    const report = readReport(target)
+    assert.equal(report.ok, true)
+    assert.equal(report.assertions.failed, 0)
+    assert.match(report.route, /as3-hook/)
+    assert.equal(report.swf.logicalBytesAfter - report.swf.logicalBytesBefore, 1024)
+    const lenAssertion = report.assertions.list.find(item => String(item.name).includes("成对改写长度守恒"))
+    assert.equal(lenAssertion.ok, true, JSON.stringify(lenAssertion))
+    assert.match(String(lenAssertion.detail), /AS3 钩子另行贡献 1024 B/)
+})
