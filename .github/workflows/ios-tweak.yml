@@ -213,6 +213,73 @@ jobs:
             echo "::warning title=diag-push::诊断分支推送失败（fork 可能未授予 Actions 写权限）；本腿日志仍可从 check-run 注解通道读取"
           fi
 
+      # 第三通道：把**产物本身**推成一次性分支。Actions artifact 的下载接口需要凭据
+      # （匿名 GET /actions/artifacts/<id>/zip 是 401/403），而这条通道让任何人在公开仓库上
+      # 无凭据就能取到 deb/dylib —— 真机验证靠它。
+      - name: 产物出仓（无需凭据即可取回 deb/dylib）
+        if: always()
+        working-directory: ios/tweak
+        env:
+          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_RUN: ${{ github.run_id }}
+          RESOLVED_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+        run: |
+          set -uo pipefail
+          # 同 ci-diag：诊断通道不得改变 job 结论，也不能静默退出。
+          OUT_REF="ci-out/${DIAG_RUN}/${DIAG_LEG}"
+          OUT_DIR="ci-out/${DIAG_RUN}/${DIAG_LEG}"
+          mkdir -p "$OUT_DIR"
+          dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
+          deb=""
+          for f in packages/*.deb; do [ -f "$f" ] && deb="$f" && break; done
+          dylib_bytes=0; dylib_sha="(none)"
+          deb_bytes=0;   deb_sha="(none)"
+          [ -n "$dylib" ] && dylib_bytes=$(wc -c < "$dylib") && dylib_sha=$(shasum -a 256 "$dylib" | cut -d' ' -f1)
+          [ -n "$deb" ]   && deb_bytes=$(wc -c < "$deb")     && deb_sha=$(shasum -a 256 "$deb" | cut -d' ' -f1)
+          {
+            echo "run_id=${DIAG_RUN}"
+            echo "leg=${DIAG_LEG}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "SP_LOGIN_HOST=${RESOLVED_HOST}"
+            echo "dylib=${dylib:-（没有产物）}"
+            echo "dylib_bytes=${dylib_bytes}"
+            echo "dylib_sha256=${dylib_sha}"
+            echo "deb=${deb:-（没有产物）}"
+            echo "deb_bytes=${deb_bytes}"
+            echo "deb_sha256=${deb_sha}"
+          } > "$OUT_DIR/meta.txt"
+          if [ -n "$dylib" ]; then cp "$dylib" "$OUT_DIR/SpLogin.dylib"; fi
+          if [ -n "$deb" ];   then cp "$deb"   "$OUT_DIR/"; fi
+          printf '::notice title=ci-out(%s)::dylib=%s bytes dylib_sha256=%s; deb=%s bytes deb_sha256=%s\n' \
+            "$DIAG_LEG" "$dylib_bytes" "$dylib_sha" "$deb_bytes" "$deb_sha"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 逐文件 git add -f：.deb/.dylib 很可能被 .gitignore 吞掉，目录级 add 会整体失败。
+          staged=0
+          for f in "$OUT_DIR/meta.txt" "$OUT_DIR/SpLogin.dylib" "$OUT_DIR"/*.deb; do
+            [ -f "$f" ] || continue
+            if git add -f -- "$f"; then staged=$((staged + 1)); else echo "::warning::产物无法加入索引：$f"; fi
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::warning title=ci-out::没有任何产物可推送（构建可能从未产出 dylib/deb）"
+            exit 0
+          fi
+          if ! git commit -q -m "ci-out: ${DIAG_LEG} run ${DIAG_RUN}"; then
+            echo "::warning::产物提交失败（可能索引为空）"
+            git status --short | head -20
+            exit 0
+          fi
+          if git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+                "HEAD:refs/heads/${OUT_REF}" 2>&1; then
+            echo "产物已推送：refs/heads/${OUT_REF}"
+            echo "读取：git fetch origin 'refs/heads/ci-out/*:refs/remotes/origin/ci-out/*'"
+            echo "     然后看 origin/${OUT_REF}:${OUT_DIR}/"
+          else
+            echo "::warning title=ci-out-push::产物分支推送失败（fork 可能未授予 Actions 写权限）；产物仍可从 Actions artifact 页面手动下载"
+          fi
+
       # 第二通道（不依赖任何仓库设置、纯匿名可读）：把编译器输出的要害做成 check-run 注解。
       # 匿名读法：GET https://api.github.com/repos/NSDelta/startpoint-cn/check-runs/<job_id>/annotations
       # 这一步只输出注解，不改变 job 结论——job 的失败仍由上面 make 步骤本身决定。
