@@ -628,3 +628,20 @@ test("AS3 钩子合法改变 SWF 长度时必须被接受（拿基线长度当�
     assert.equal(lenAssertion.ok, true, JSON.stringify(lenAssertion))
     assert.match(String(lenAssertion.detail), /AS3 钩子另行贡献 1024 B/)
 })
+
+// ─────────── 10. Windows 批处理工具（apksigner.bat）必须真能跑起来 ───────────
+
+test("Windows 上 .bat 工具真的被调用（自己拼引号喂 spawn 会让 cmd 报「不是内部或外部命令」）", {
+    skip: process.platform === "win32" ? false : "仅 Windows 有 cmd.exe 批处理语义",
+}, async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+    // 目录名故意带空格：这正是朴素拼引号会炸的形态。
+    const batDir = path.join(fx.dir, "bat dir")
+    fs.mkdirSync(batDir, { recursive: true })
+    const bat = path.join(batDir, "fake-apksigner.bat")
+    fs.writeFileSync(bat, "@echo off\r\necho BAT-OK %*\r\nexit /b 0\r\n")
+    const result = mod.runTool(bat, ["sign", "--ks-pass", "env:SOME_VAR", "out.apk"])
+    assert.equal(result.ok, true, `stderr=${result.stderr}`)
+    assert.equal(result.status, 0)
+    assert.match(result.stdout, /BAT-OK sign --ks-pass env:SOME_VAR out\.apk/)
+})

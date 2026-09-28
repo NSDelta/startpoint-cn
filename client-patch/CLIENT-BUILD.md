@@ -267,6 +267,12 @@ codeLength 对照：`7265:118→1760, 7266:130→5057, 7267:100→3212, 7268:9�
 > 要复现上面那个 sha256 就必须用 26.3.0 并显式加 `--allow-ffdec-version-mismatch`；换版本产物必然不同（合法，但基线跟着变）。
 > ⚠️ **`pwsh` / `powershell` 在本环境不能作为子进程拉起**，批处理/Wrapper 必须用 `cmd /c xxx.cmd`；
 > 且 PowerShell 的 `>` 重定向写出 **UTF-16LE+BOM**（Node 的 UTF-8 输出会变乱码）——用 `cmd /c … > file` 才保字节。
+> ⚠️ **Windows 批处理工具（`apksigner.bat`）不能自己拼好引号再喂 `spawnSync`**：Node 在 Windows 上会把
+> 「含引号的参数」重新转义成 `\"…\"` 并整体再包一层引号，而 `cmd.exe` 不认 `\` 是转义符 ⇒ 它把**整条命令行
+> 当成一个程序名**，报 `'"D:\…\apksigner.bat sign …"' 不是内部或外部命令`（退出码 1，看起来像签名失败）。
+> `runTool` 现在对 `.bat`/`.cmd` 改走 `shell: true`，由 Node 走标准的 `cmd.exe /d /s /c "<line>"`；单测用
+> **目录名故意带空格的 `.bat` 桩**钉住这条。*此前所有端到端实跑都是「未签名」的（没给 `--ks`），
+> 所以这个坑直到集成者首次**真签名**才暴露 —— 又一次「只有真跑才会暴露」的同类教训。*
 
 ---
 

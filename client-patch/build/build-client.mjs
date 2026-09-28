@@ -387,16 +387,24 @@ export function runTool(toolPath, args, { cwd = process.cwd(), allowFailure = fa
     const lower = toolPath.toLowerCase()
     let command = toolPath
     let argv = args
+    let shell = false
     if (/\.(mjs|js)$/.test(lower)) {
         // 测试/桩用：允许把工具位置指向一个 JS 脚本，由 node 执行（单测注入假 zipalign/apksigner）。
         command = process.execPath
         argv = [toolPath, ...args]
     } else if (process.platform === "win32" && /\.(bat|cmd)$/.test(lower)) {
-        const line = [toolPath, ...args].map(quoteForShell).join(" ")
-        command = process.env.ComSpec || "cmd.exe"
-        argv = ["/d", "/s", "/c", `"${line}"`]
+        // 批处理必须交给 cmd.exe，但**不能**自己拼 `"line"` 再丢给 spawn：
+        // Node 在 Windows 上会把「含引号的参数」重新转义成 \"…\" 并整体加引号，而 cmd.exe 不认 `\` 是转义符
+        // ⇒ cmd 把整条命令行当成一个程序名，报 `'"D:\…\apksigner.bat sign …"' 不是内部或外部命令`。
+        // （P7c 之后集成者首次**真签名**实跑就死在这里；此前所有实跑都是未签名的，所以没暴露。）
+        // 交给 `shell: true`，由 Node 走标准的 `cmd.exe /d /s /c "<line>"`，我们不再自己加外层引号。
+        command = [toolPath, ...args].map(quoteForShell).join(" ")
+        argv = []
+        shell = true
     }
-    const result = spawnSync(command, argv, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, windowsHide: true })
+    const result = spawnSync(command, argv, {
+        cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, windowsHide: true, shell,
+    })
     const ok = result.status === 0
     if (!ok && !allowFailure) {
         const detail = String(result.stderr || result.stdout || result.error?.message || "").trim()
