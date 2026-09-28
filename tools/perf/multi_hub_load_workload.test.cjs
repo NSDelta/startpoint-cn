@@ -564,7 +564,14 @@ test("harness cleanup timeout returns a rejected gate without waiting forever", 
 test("harness cleanup timeout consumes a late rejection", async () => {
     const observed = { harnesses: [], cleaned: [], runtimeHarnesses: [], batches: [] }
     const dependencies = fakeDependencies(observed)
-    const startedAt = performance.now()
+    // Race the two clocks instead of budgeting wall time. The peer rejects 20 ms
+    // after close() is called; the workload's cleanup timeout is 5 ms. If cleanup
+    // waits for the rejection it resumes at or after the rejection, and if it
+    // honours its own timeout it resumes well before. Comparing the two observed
+    // instants needs no margin because both are timers on the same event loop, so
+    // load shifts them together rather than closing the gap between them.
+    let lateRejectionAt = 0
+    let cleanupProbeAt = 0
     const report = await workload.runMultiHubLoadWorkload({
         profile: SMOKE_MULTI_PROFILE,
         ...dependencies,
@@ -573,7 +580,10 @@ test("harness cleanup timeout consumes a late rejection", async () => {
             const peer = {
                 close() {
                     return new Promise((_, reject) => setTimeout(
-                        () => reject(new Error("late-viewer-device-raw")),
+                        () => {
+                            lateRejectionAt = performance.now()
+                            reject(new Error("late-viewer-device-raw"))
+                        },
                         20,
                     ))
                 },
@@ -588,18 +598,29 @@ test("harness cleanup timeout consumes a late rejection", async () => {
             observed.harnesses.push(harness)
             return harness
         },
-        cleanupProbe: async () => ({
-            activePeers: 0,
-            activeProcesses: 0,
-            portsReleased: true,
-            remainingRooms: 0,
-            temporaryRootExists: false,
-        }),
+        // Reached only after runCleanupWithinTimeout has settled, so this instant
+        // marks where the workload stopped waiting for the harness cleanup.
+        cleanupProbe: async () => {
+            cleanupProbeAt = performance.now()
+            return {
+                activePeers: 0,
+                activeProcesses: 0,
+                portsReleased: true,
+                remainingRooms: 0,
+                temporaryRootExists: false,
+            }
+        },
     })
-    assert.ok(performance.now() - startedAt < 15, "cleanup must return at its outer timeout")
     assert.equal(report.gate.admitted, false)
     assert.ok(report.steps[0].errors.includes("scenario step cleanup failed"))
+    // Let the peer's late rejection land before comparing the two instants.
     await new Promise(resolve => setTimeout(resolve, 30))
+    assert.ok(lateRejectionAt > 0, "the peer's late rejection must have fired")
+    assert.ok(
+        cleanupProbeAt < lateRejectionAt,
+        `cleanup must return at its 5 ms outer timeout instead of waiting for the peer's 20 ms rejection `
+            + `(cleanup resumed at ${cleanupProbeAt.toFixed(2)}ms, rejection fired at ${lateRejectionAt.toFixed(2)}ms)`,
+    )
 })
 
 test("cleanupTimeoutMs must be a positive safe integer", async () => {
