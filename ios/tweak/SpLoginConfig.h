@@ -33,16 +33,22 @@ NS_ASSUME_NONNULL_BEGIN
 NS_ASSUME_NONNULL_END
 
 // SPLoginLog 是 C 函数，必须用 extern "C" 声明。
-// Theos 把 .xm/.m 当 **C++** 编译（clang++），没有这个包裹时定义处（SpLoginConfig.m）
-// 会按 C++ 规则改名，而 Tweak.xm 侧按 C 链接名引用，于是链接期报：
+// Theos 把 .xm 先预处理成 **.mm（Objective-C++）** 再用 clang++ 编，.m 也按 C++ 编。
+// 没有这个包裹时定义处（SpLoginConfig.m）按 C++ 规则改名，而 Tweak.xm 侧按 C 链接名
+// 引用，于是链接期报（run 36420791202 的 ld 原文）：
 //   ld: symbol(s) not found for architecture arm64
 //   NOTE: found '_SPLoginLog' in SpLoginConfig.m.*.o, declaration possibly missing 'extern "C"'
+//
+// 注意 format 必须**显式**写 _Nonnull：本块在 NS_ASSUME_NONNULL_END 之后，区域外
+// 缺 nullability 的指针参数在 -Werror,-Wnullability-completeness 下是硬错误
+// （run 36421222764 的 C 侧编译错误就是这么来的）。显式标注与 pragma 区域解耦，
+// 将来这块挪到哪儿都不会复发。
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /// 统一日志：NSLog + 可选落盘（真机没有 Mac 时靠日志文件取证）
-void SPLoginLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+void SPLoginLog(NSString * _Nonnull format, ...) NS_FORMAT_FUNCTION(1, 2);
 
 #ifdef __cplusplus
 }
