@@ -476,6 +476,11 @@ test("signal handlers retain the active run captured at signal time", async () =
     const calls = []
     const removeHandlers = installSignalHandlers(state, {
         processTarget,
+        // This case covers the POSIX escalation contract: signal the tree with SIGTERM,
+        // then schedule a force kill against the run captured at signal time. On win32
+        // signalProcessTree already issues a forced `taskkill /PID <pgid> /T /F`, so the
+        // implementation deliberately has nothing left to escalate to.
+        platform: "linux",
         scheduleForceKill(run) {
             calls.push(["force", run.processGroupId])
             return Promise.resolve()

@@ -122,9 +122,15 @@ test("patch check CLI emits one JSON result and sanitizes failures", async () =>
     stdout = ""
     stderr = ""
     exitCodes.length = 0
+    // The CLI normalises projectRoot with path.resolve before redacting it, so the
+    // fixture's message has to embed that same resolved root: a bare POSIX literal
+    // never matches on Windows and the <PROJECT_ROOT> label would be lost.
+    const failedRoot = path.resolve("/project")
     const failed = await runPatchCheckCli([], {
-        projectRoot: "/project",
-        runCheck: async () => { throw new Error(`invalid /project/private/archive.zip`) },
+        projectRoot: failedRoot,
+        runCheck: async () => {
+            throw new Error(`invalid ${path.join(failedRoot, "private", "archive.zip")}`)
+        },
         stdout: { write: value => { stdout += value } },
         stderr: { write: value => { stderr += value } },
         setExitCode: code => { exitCodes.push(code) },

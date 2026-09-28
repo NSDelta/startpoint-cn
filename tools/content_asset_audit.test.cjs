@@ -343,8 +343,11 @@ test("asset audit CLI accepts one source root and a stable output format", () =>
         "--runtime-root", "/bundle/assets",
         "--format", "json",
     ], "/project"), {
-        sourceRoot: "/content/source/orderedmap",
-        runtimeRoot: "/bundle/assets",
+        // The parser normalises every absolute root, so the expectation has to go
+        // through path.resolve as well: on Windows the POSIX literal
+        // "/content/source/orderedmap" resolves to a drive-qualified backslash path.
+        sourceRoot: path.resolve("/content/source/orderedmap"),
+        runtimeRoot: path.resolve("/bundle/assets"),
         format: "json",
     })
     for (const argv of [
