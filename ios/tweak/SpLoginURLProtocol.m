@@ -4,6 +4,9 @@
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"
 
+// dispatch_once / dispatch_once_t：显式引入，不依赖 Foundation 的传递包含。
+#import <dispatch/dispatch.h>
+
 static NSString *const SpLoginHandledKey = @"SpLoginHandledByURLProtocol";
 
 /// 官方 SDK 域名后缀（唯一依据 = P10-A 的 patch-ipa.mjs:41 正则）。

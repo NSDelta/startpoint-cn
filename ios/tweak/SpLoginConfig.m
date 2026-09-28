@@ -2,6 +2,10 @@
 
 #import "SpLoginConfig.h"
 
+// dispatch_once / dispatch_once_t（sharedConfig 的单例初始化）：显式引入，不依赖
+// Foundation 的传递包含（SDK 收紧头文件时才暴露）。
+#import <dispatch/dispatch.h>
+
 #import <stdio.h>
 #import <string.h>
 
