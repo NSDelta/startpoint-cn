@@ -30,7 +30,20 @@ NS_ASSUME_NONNULL_BEGIN
 
 @end
 
+NS_ASSUME_NONNULL_END
+
+// SPLoginLog 是 C 函数，必须用 extern "C" 声明。
+// Theos 把 .xm/.m 当 **C++** 编译（clang++），没有这个包裹时定义处（SpLoginConfig.m）
+// 会按 C++ 规则改名，而 Tweak.xm 侧按 C 链接名引用，于是链接期报：
+//   ld: symbol(s) not found for architecture arm64
+//   NOTE: found '_SPLoginLog' in SpLoginConfig.m.*.o, declaration possibly missing 'extern "C"'
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /// 统一日志：NSLog + 可选落盘（真机没有 Mac 时靠日志文件取证）
 void SPLoginLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
-NS_ASSUME_NONNULL_END
+#ifdef __cplusplus
+}
+#endif
