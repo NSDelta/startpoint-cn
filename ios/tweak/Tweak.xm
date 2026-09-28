@@ -19,6 +19,9 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+// dispatch_after / dispatch_once 与 NSEC_PER_SEC：UIKit 目前会传递引入，但显式引入可
+// 避免将来 SDK 收紧头文件时本文件被孤立地打断（零成本）。
+#import <dispatch/dispatch.h>
 
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"

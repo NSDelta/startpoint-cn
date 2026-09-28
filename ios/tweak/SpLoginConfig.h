@@ -13,9 +13,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (instancetype)sharedConfig;
 
 /// "host:port"（不含 scheme）
-@property (nonatomic, readonly) NSString *hostPort;
+@property (nonatomic, copy, readonly) NSString *hostPort;
 /// "http://host:port"
-@property (nonatomic, readonly) NSString *apiBaseURLString;
+@property (nonatomic, copy, readonly) NSString *apiBaseURLString;
 /// 是否接管官方 SDK 登录界面（plist: SPLoginUITakeover，默认 YES）
 @property (nonatomic, readonly) BOOL uiTakeover;
 /// 是否跳过官方隐私弹窗（plist: SPLoginSkipPrivacyDialogs，默认 NO）
@@ -26,7 +26,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// 主动弹出的延迟秒数（plist: SPLoginAutoPresentDelay，默认 2.0）
 @property (nonatomic, readonly) NSTimeInterval autoPresentDelay;
 /// 越狱根：rootless = "/var/jb"，传统 = ""
-@property (nonatomic, readonly) NSString *jailbreakRoot;
+@property (nonatomic, copy, readonly) NSString *jailbreakRoot;
 
 @end
 

@@ -9,6 +9,8 @@
 //   success      已绑定成功：回到游戏点「点击开始」
 
 #import <UIKit/UIKit.h>
+// CALayer（field.layer.cornerRadius / .borderWidth / .borderColor）需要显式引入。
+#import <QuartzCore/QuartzCore.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
