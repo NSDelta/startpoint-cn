@@ -192,14 +192,17 @@ jobs:
             git status --short | head -20
             exit 0
           fi
-          # GITHUB_TOKEN 推送不会再触发 workflow；失败不影响本 job 的结论。
-          if git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          # 这里的推送**不能**依赖 ${GITHUB_TOKEN} 环境变量：它不是 Actions 的默认环境变量，
+          # 在 set -u 下展开未定义变量会让 bash 立刻以 unbound variable 退出（实测该步骤变红、
+          # 远端一个 ci-diag ref 都没有）。改用 ${{ github.token }}，由 Actions 在求值期注入。
+          # 读取权限由顶部 permissions: contents: write 提供，两者缺一不可。
+          if git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
                 "HEAD:refs/heads/${DIAG_REF}" 2>&1; then
             echo "诊断日志已推送：refs/heads/${DIAG_REF}"
             echo "读取：git fetch origin 'refs/heads/ci-diag/*:refs/remotes/origin/ci-diag/*'"
             echo "     然后看 origin/${DIAG_REF}:${DIAG_DIR}/build.log"
           else
-            # 最常见原因：fork 的 Actions 权限是只读，GITHUB_TOKEN 无 contents:write。
+            # 最常见原因：fork 的 Actions 权限是只读，token 无 contents:write。
             # 明确喊出来，否则读者只会看到“分支不存在”而不知为何。
             echo "::warning title=diag-push::诊断分支推送失败（fork 可能未授予 Actions 写权限）；本腿日志仍可从 check-run 注解通道读取"
           fi
@@ -219,6 +222,28 @@ jobs:
             exit 0
           fi
           echo "::notice title=build.log(${DIAG_LEG})::共 $(wc -l < "$RUNNER_TEMP/build.log") 行 / $(wc -c < "$RUNNER_TEMP/build.log") 字节"
+          # ── 零权限全文通道：整份 build.log 按每 30 行一条 ::notice 发出 ──────────────
+          # notice 不占「每个步骤最多 10 条 error/warning 注解」的额度，所以整份日志走 notice，
+          # 不会把真错误挤出配额。这条通道**不需要任何 token、push 权限或仓库设置**，
+          # 即使通道 A（ci-diag 分支）被 fork 的只读权限挡死，ld 原文照样匿名可读。
+          total_lines=$(wc -l < "$RUNNER_TEMP/build.log")
+          max_lines=750   # 25 块 × 30 行；小日志就是全文
+          [ "$total_lines" -le "$max_lines" ] || echo "::warning title=build.log(${DIAG_LEG})::日志共 ${total_lines} 行，只发前 ${max_lines} 行（其余靠通道 A）"
+          if [ "$total_lines" -le "$max_lines" ]; then emit_to=$total_lines; else emit_to=$max_lines; fi
+          start=1
+          chunk=0
+          while [ "$start" -le "$emit_to" ]; do
+            end=$((start + 29))
+            [ "$end" -gt "$emit_to" ] && end=$emit_to
+            chunk=$((chunk + 1))
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              printf '::notice title=make-log(%s)-%02d::%s\n' "${DIAG_LEG}" "$chunk" "${line:0:400}"
+            done < <(sed -n "${start},${end}p" "$RUNNER_TEMP/build.log")
+            start=$((end + 1))
+          done
+          echo "::notice title=make-log(${DIAG_LEG})::全文通道已发 ${chunk} 块"
+          # ── 分类要点（error 级，占每步 10 条额度）：只报要害，不铺原文 ──────────────
           n=0
           # 只报 "匹配到的那一行" 会漏掉 clang 的真错误：多行 note 的末尾是
           # "N errors generated."，而真正的 error: 行在它前面几行。所以匹配后再带上下文窗口。
@@ -227,29 +252,28 @@ jobs:
             hits=$(grep -nEi "$2" "$RUNNER_TEMP/build.log" 2>/dev/null | cut -d: -f1 | head -3 || true)
             [ -n "$hits" ] || return 0
             for ln in $hits; do
-              [ "$n" -ge 20 ] && break
+              [ "$n" -ge 8 ] && break
               from=$(( ln > ctx ? ln - ctx : 1 ))
               to=$(( ln + ctx ))
               while IFS= read -r line; do
                 [ -n "$line" ] || continue
-                printf '::error title=%s(%s)::%s\n' "$1" "${DIAG_LEG}" "${line:0:400}"
                 n=$((n + 1))
-                [ "$n" -ge 20 ] && break
+                printf '::error title=%s-%02d(%s)::%s\n' "$1" "$n" "${DIAG_LEG}" "${line:0:400}"
+                [ "$n" -ge 8 ] && break
               done < <(sed -n "${from},${to}p" "$RUNNER_TEMP/build.log")
             done
+            # 关键：函数必须以 0 结尾。[ "$n" -ge 20 ] && break 在 n<20 时为假（退出码 1），
+            # 会让 emit 返回 1；而调用点写成 `[ cond ] || emit ...` 时，脚本最后一条命令
+            # 非零即整个步骤 exit 1（实测该步骤因此变红、注解反而变少）。
+            return 0
           }
           # 顺序即重要性：编译器硬错误 → 链接错误 → Theos/make 自身错误。
           emit clang-error 'error:|fatal error|no member named|no visible @interface|expected ' 6
-          [ "$n" -ge 20 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8
-          [ "$n" -ge 20 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4
-          if [ "$n" -eq 0 ]; then
-            # 一个都没匹配到也要留下可供判断的原文，否则这一趟 CI 等于白跑。
-            echo "::warning title=build.log(${DIAG_LEG})::未匹配到已知错误模式，附末尾 30 行原文"
-            tail -30 "$RUNNER_TEMP/build.log" | while IFS= read -r line; do
-              [ -n "$line" ] || continue
-              printf '::warning title=make-tail(%s)::%s\n' "${DIAG_LEG}" "${line:0:400}"
-            done
-          fi
+          [ "$n" -ge 8 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8
+          [ "$n" -ge 8 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4
+          echo "::notice title=SpLogin(${DIAG_LEG})::分类注解 ${n} 条；全文见上面 make-log 分块"
+          # 显式 exit 0：这一步是诊断，绝不能让自身状态影响 job 结论（失败由 make 步骤定死）。
+          exit 0
 
       # 通过时也留一条 notice：让绿色运行同样可审计（解析出的 host、腿、产物路径与大小）。
       - name: 通过性摘要（notice）
