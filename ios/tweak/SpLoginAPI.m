@@ -14,6 +14,14 @@
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"
 
+// memcmp 需要显式声明：clang 16+（Xcode 15/16）把隐式函数声明当**错误**而非警告，
+// 少这一行会在 CI 上直接把 SpLoginAPI.m 的编译打断。
+#import <string.h>
+
+// dispatch_once / dispatch_once_t / dispatch_async / dispatch_get_main_queue：
+// 同样显式引入，不依赖 Foundation 的传递包含。
+#import <dispatch/dispatch.h>
+
 static NSString *const SpLoginTokenKey = @"SpLoginToken";
 static NSString *const SpLoginDeviceIdKey = @"SpLoginDeviceId";
 

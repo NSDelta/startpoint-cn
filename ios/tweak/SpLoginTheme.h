@@ -12,6 +12,9 @@
 //   bg-assets/color222222_round4_shadow8           → 深色底（loading.ui）
 
 #import <UIKit/UIKit.h>
+// UIView.layer 的类型 CALayer 由 QuartzCore 引入。UIKit 不再保证传递引入它，
+// 缺了它 button.layer.cornerRadius 等成员访问在 CI 上是硬错误。
+#import <QuartzCore/QuartzCore.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
