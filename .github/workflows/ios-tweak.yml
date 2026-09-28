@@ -159,10 +159,8 @@ jobs:
           DIAG_RUN: ${{ github.run_id }}
         run: |
           set -uo pipefail
-          if [ ! -s "$RUNNER_TEMP/build.log" ]; then
-            echo "build.log 不存在或为空（构建步骤可能从未开始）——跳过诊断推送"
-            exit 0
-          fi
+          # 这一步是诊断通道，不得改变 job 结论（构建失败已由上面的 make 步骤定死），
+          # 但**每一次失败都必须说出原因**——静默 exit 0 会让 "全文日志 + 注解" 两条通道同时失联。
           DIAG_REF="ci-diag/${DIAG_RUN}/${DIAG_LEG}"
           DIAG_DIR="ci-diag/${DIAG_RUN}/${DIAG_LEG}"
           mkdir -p "$DIAG_DIR"
@@ -174,23 +172,36 @@ jobs:
             echo "ref=${GITHUB_REF}"
             echo "runner_os=${RUNNER_OS}"
             echo "SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
+            echo "toolchain=$(make --version 2>&1 | head -1)"
+            echo "build_log_bytes=$(wc -c < "$RUNNER_TEMP/build.log" 2>/dev/null || echo 0)"
           } > "$DIAG_DIR/meta.txt"
-          cp "$RUNNER_TEMP/build.log" "$DIAG_DIR/build.log"
+          if [ -s "$RUNNER_TEMP/build.log" ]; then
+            cp "$RUNNER_TEMP/build.log" "$DIAG_DIR/build.log"
+          else
+            echo "build.log 不存在或为空（构建步骤可能从未开始）——仍推送 meta.txt 以留下痕迹" \
+              > "$DIAG_DIR/build.log"
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git add -f "$DIAG_DIR" 2>/dev/null; then :; else
-            # 有 pathspec 例外时可退回 git add -A；仍失败就放弃推送（monitoring 不该掩盖构建结果）
-            git add -A -f -- "$DIAG_DIR" || { echo "::warning::诊断文件无法加入索引"; exit 0; }
+          # 逐文件 git add -f：目录级 add 遇到被忽略的路径会整体失败，逐文件更可靠。
+          for f in "$DIAG_DIR/meta.txt" "$DIAG_DIR/build.log"; do
+            git add -f -- "$f" || echo "::warning::诊断文件无法加入索引：$f"
+          done
+          if ! git commit -q -m "ci-diag: ${DIAG_LEG} run ${DIAG_RUN}"; then
+            echo "::warning::诊断提交失败（可能索引为空）"
+            git status --short | head -20
+            exit 0
           fi
-          git commit -q -m "ci-diag: ${DIAG_LEG} run ${DIAG_RUN}" || { echo "::warning::诊断提交失败"; exit 0; }
-          # GITHUB_TOKEN 推送不会再触发 workflow；失败不影响本 job 的结论（构建失败已由上面步骤定死）。
+          # GITHUB_TOKEN 推送不会再触发 workflow；失败不影响本 job 的结论。
           if git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-                "HEAD:refs/heads/${DIAG_REF}"; then
+                "HEAD:refs/heads/${DIAG_REF}" 2>&1; then
             echo "诊断日志已推送：refs/heads/${DIAG_REF}"
             echo "读取：git fetch origin 'refs/heads/ci-diag/*:refs/remotes/origin/ci-diag/*'"
             echo "     然后看 origin/${DIAG_REF}:${DIAG_DIR}/build.log"
           else
-            echo "::warning::诊断推送失败（不影响构建结论）"
+            # 最常见原因：fork 的 Actions 权限是只读，GITHUB_TOKEN 无 contents:write。
+            # 明确喊出来，否则读者只会看到“分支不存在”而不知为何。
+            echo "::warning title=diag-push::诊断分支推送失败（fork 可能未授予 Actions 写权限）；本腿日志仍可从 check-run 注解通道读取"
           fi
 
       # 第二通道（不依赖任何仓库设置、纯匿名可读）：把编译器输出的要害做成 check-run 注解。
@@ -207,25 +218,36 @@ jobs:
             echo "::notice title=SpLogin(${DIAG_LEG})::该腿未产生构建输出（make 步骤可能未开始）"
             exit 0
           fi
+          echo "::notice title=build.log(${DIAG_LEG})::共 $(wc -l < "$RUNNER_TEMP/build.log") 行 / $(wc -c < "$RUNNER_TEMP/build.log") 字节"
           n=0
-          emit() { # $1=标题类 $2=正则
-            while IFS= read -r line; do
-              [ -n "$line" ] || continue
-              printf '::error title=make-%s::%s\n' "$1" "${line:0:400}"
-              n=$((n + 1))
+          # 只报 "匹配到的那一行" 会漏掉 clang 的真错误：多行 note 的末尾是
+          # "N errors generated."，而真正的 error: 行在它前面几行。所以匹配后再带上下文窗口。
+          emit() { # $1=类别名  $2=正则  [$3=每处上下文行数，默认 5]
+            local ctx="${3:-5}" hits ln from to
+            hits=$(grep -nEi "$2" "$RUNNER_TEMP/build.log" 2>/dev/null | cut -d: -f1 | head -3 || true)
+            [ -n "$hits" ] || return 0
+            for ln in $hits; do
               [ "$n" -ge 20 ] && break
-            done < <(grep -nEi "$2" "$RUNNER_TEMP/build.log" 2>/dev/null | head -8 || true)
+              from=$(( ln > ctx ? ln - ctx : 1 ))
+              to=$(( ln + ctx ))
+              while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                printf '::error title=%s(%s)::%s\n' "$1" "${DIAG_LEG}" "${line:0:400}"
+                n=$((n + 1))
+                [ "$n" -ge 20 ] && break
+              done < <(sed -n "${from},${to}p" "$RUNNER_TEMP/build.log")
+            done
           }
-          # 顺序即重要性：编译错误 → 链接错误 → Theos/make 自身错误 → 过滤器 plist 缺失。
-          emit clang 'error:|fatal error|no member named|expected '
-          [ "$n" -ge 20 ] || emit link 'Undefined symbols|undefined reference|ld: '
-          [ "$n" -ge 20 ] || emit theos '^make(\[[0-9]+\])?: \*\*\*|No such file or directory|missing a filter property list'
-          [ "$n" -ge 20 ] || emit other 'error'
+          # 顺序即重要性：编译器硬错误 → 链接错误 → Theos/make 自身错误。
+          emit clang-error 'error:|fatal error|no member named|no visible @interface|expected ' 6
+          [ "$n" -ge 20 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8
+          [ "$n" -ge 20 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4
           if [ "$n" -eq 0 ]; then
-            echo "::warning title=SpLogin(${DIAG_LEG})::build.log 里没有匹配到错误行，取末尾 5 行供参考"
-            tail -5 "$RUNNER_TEMP/build.log" | while IFS= read -r line; do
+            # 一个都没匹配到也要留下可供判断的原文，否则这一趟 CI 等于白跑。
+            echo "::warning title=build.log(${DIAG_LEG})::未匹配到已知错误模式，附末尾 30 行原文"
+            tail -30 "$RUNNER_TEMP/build.log" | while IFS= read -r line; do
               [ -n "$line" ] || continue
-              printf '::warning title=make-tail::%s\n' "${line:0:400}"
+              printf '::warning title=make-tail(%s)::%s\n' "${DIAG_LEG}" "${line:0:400}"
             done
           fi
 
@@ -246,14 +268,26 @@ jobs:
             echo "::notice title=SpLogin(${DIAG_LEG})::dylib 大小 ${size} 字节"
           fi
 
+      # 产物上传拆成两步，理由是实测教训：把 packages/*.deb 与 .theos/obj/**/*.dylib 写在
+      # 同一个 path 里时，只要**第一个 glob 无匹配**（构建失败即如此），upload-artifact 会以
+      # "No files were found with the provided path" 直接失败，dylib 与 build.log 全都传不上去。
+      # 诊断日志必须独立上传且在 always() 下运行——它是失败时唯一的原文出口。
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sp-login-buildlog-${{ matrix.scheme || 'rootful' }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 30
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: sp-login-${{ matrix.scheme || 'rootful' }}
           # Theos 把目标放在 .theos/obj/<TARGET>/<SCHEME>/ 之类的子目录里，不是 .theos/obj/SpLogin.dylib。
-          # 用 subdir-glob（`*/*.dylib` 可跨 `**`）匹配真实布局，同时保留 if-no-files-found: error 的约束力。
+          # 用 subdir-glob 匹配真实布局；无匹配时只 warn 而不 error，否则失败运行连诊断日志都传不出来。
           path: |
             ios/tweak/packages/*.deb
             ios/tweak/.theos/obj/**/*.dylib
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
