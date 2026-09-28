@@ -15,6 +15,7 @@ const {
 const projectRoot = path.resolve(__dirname, "../..")
 const workloadPath = path.join(__dirname, "multi_hub_load_workload.cjs")
 const { startOwnedProcess } = require("./multi_hub_load_process_fixture.cjs")
+const { requireCapability } = require("../helpers/capabilities.cjs")
 const workload = require(workloadPath)
 const scenariosModule = require("./multi_hub_load_scenarios.cjs")
 const {
@@ -701,7 +702,9 @@ test("runCli rejects symlink and hard-link output targets without emitting JSON"
     }
 })
 
-test("runCli preserves output and removes its temporary file when rename fails", async () => {
+test("runCli preserves output and removes its temporary file when rename fails", async t => {
+    // The preserved file's mode is asserted below; Windows reports 0666 for everything.
+    if (!requireCapability(t, "posixFileMode")) return
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "multi-workload-output-rename-"))
     const output = path.join(directory, "report.json")
     fs.writeFileSync(output, "original", { mode: 0o640 })

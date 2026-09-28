@@ -5,6 +5,7 @@ const test = require("node:test")
 
 const { parseArgs, runHubBaseline } = require("./hub_baseline.cjs")
 const { assertSameEndpoint } = require("./hub_baseline_helpers.cjs")
+const { requireCapability } = require("../helpers/capabilities.cjs")
 
 test("validates Hub baseline arguments", () => {
     assert.deepEqual(parseArgs([
@@ -35,7 +36,10 @@ test("rejects mismatched Host and Client TCP endpoints", () => {
     ), /different TCP endpoints/)
 })
 
-test("runs one remote room through Host, Client, and Hub", { timeout: 120_000 }, async () => {
+test("runs one remote room through Host, Client, and Hub", { timeout: 120_000 }, async t => {
+    // Every remote room needs a provisioned credential, and the credential lock
+    // refuses any lock file whose mode is not exactly 0600.
+    if (!requireCapability(t, "posixFileMode")) return
     const result = await runHubBaseline({ rooms: 1, timeoutMs: 5_000 })
 
     assert.deepEqual(result.workload, {
@@ -61,7 +65,9 @@ test("runs one remote room through Host, Client, and Hub", { timeout: 120_000 },
     assert.equal(result.summary.remainingRooms, 0)
 })
 
-test("cleans multiple remote rooms after abrupt Client disconnects", { timeout: 120_000 }, async () => {
+test("cleans multiple remote rooms after abrupt Client disconnects", { timeout: 120_000 }, async t => {
+    // Same credential lock dependency as the single-room case above.
+    if (!requireCapability(t, "posixFileMode")) return
     const result = await runHubBaseline({
         faultMode: "client-disconnect",
         rooms: 2,
