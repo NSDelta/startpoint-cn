@@ -32,6 +32,7 @@ export interface RuntimeDataPathApi {
 export interface DataVolumeFileSystem {
     constants: Pick<typeof fs.constants, "COPYFILE_EXCL" | "R_OK" | "W_OK">;
     accessSync(path: fs.PathLike, mode?: number): void;
+    chmodSync(path: fs.PathLike, mode: fs.Mode): void;
     closeSync(fd: number): void;
     copyFileSync(source: fs.PathLike, destination: fs.PathLike, mode?: number): void;
     existsSync(path: fs.PathLike): boolean;
@@ -175,7 +176,25 @@ function removeLegacyStateFile(
 }
 
 function flushFile(file: string, fileSystem: DataVolumeFileSystem): void {
-    const descriptor = fileSystem.openSync(file, "r");
+    // Windows implements fsync as FlushFileBuffers, which requires a handle with write
+    // access; a read-only handle fails with EPERM. Open read-write so the durability
+    // barrier this function exists for actually happens on Windows too, instead of
+    // silently degrading to no flush.
+    //
+    // The file is the temporary copy this process owns, but copyFileSync reproduces the
+    // SOURCE file's mode, so a legacy state file that was made read-only (a manual
+    // chmod, or a file copied off read-only media) yields a read-only copy. Falling back
+    // to a read-only handle would keep the old POSIX behaviour of flushing such a copy
+    // and would lose the barrier on Windows, where that handle fails too. Make the copy
+    // writable instead: it is ours, nothing else can observe it under its temporary
+    // name, and the rename that publishes it does not depend on its mode.
+    let descriptor: number;
+    try {
+        descriptor = fileSystem.openSync(file, "r+");
+    } catch {
+        fileSystem.chmodSync(file, 0o600);
+        descriptor = fileSystem.openSync(file, "r+");
+    }
     try {
         fileSystem.fsyncSync(descriptor);
     } finally {
