@@ -32,6 +32,20 @@ NS_ASSUME_NONNULL_BEGIN
 /// 由 SpLoginOverlay 在键盘 frame 变化时调用；只对面板卡片做平移，不碰业务状态。
 - (void)adjustForKeyboardTop:(CGFloat)keyboardTopY;
 
+/// 「本地已有验证码/令牌 ⇒ 接着轮询绑定状态」这条续跑的**显式入口**。
+///
+/// 为什么需要它：覆盖窗口版是用 `addChildViewController:` 把本 VC 容器化的，**刻意不做
+/// appearance 过渡**（`beginAppearanceTransition:`/`endAppearanceTransition:`）——一旦做了，
+/// 隐藏面板时会连带触发 `viewDidDisappear:` → `stopTimers`，而「面板隐藏期间轮询/倒计时继续跑」
+/// 是覆盖窗口版的**有意取舍**。代价是 `viewDidAppear:` 在覆盖窗口这条路径上**永远不触发**，
+/// 于是它里面那段「本地有令牌就续轮询」在冷启动时不会跑（用户必须手点一次主按钮）。
+/// 所以把那段逻辑抽成本方法，由 SpLoginOverlay 在把面板挂进容器时显式调一次。
+///
+/// 语义与旧 `viewDidAppear:` 那段**完全一致**（同一段代码），差别只是多一层幂等：
+///   · 本地没有令牌（`SpLoginAPI.sharedAPI.token.length == 0`）⇒ 什么都不做，不发请求、不弹面板；
+///   · 已经有轮询在跑（`pollTimer` 有效）⇒ 直接跳过，重复挂载/看门狗重挂不会叠加定时器。
+- (void)sp_resumeFromStoredTokenIfNeeded;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -27,7 +27,7 @@
 | `SpLoginURLProtocol.h/.m` | 把 SDK 打向 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com` 的请求改写到自建服务 |
 | `SpLoginAPI.h/.m` | `/sp-auth/*` 客户端（契约见分工文档 §3.2）+ 从出站请求体里嗅探 `device_id` |
 | `SpLoginTheme.h/.m` | 官方样式 token 的 Objective-C 投影（与 P6 Android 页共用同一份 token） |
-| `SpLoginViewController.h/.m` | 类游戏登录面板本体（状态机与 `ios/prototype/index.html` 一致）；由覆盖窗口当子 VC 承载，不再自己弹自己 |
+| `SpLoginViewController.h/.m` | 类游戏登录面板本体（状态机与 `ios/prototype/index.html` 一致）；由覆盖窗口当子 VC 承载，不再自己弹自己。**续轮询入口** `sp_resumeFromStoredTokenIfNeeded` 见第 5 节 |
 | `layout/DEBIAN/postinst`、`prerm` | 安装/卸载提示（纯 echo，不改系统文件） |
 
 ## 2. 构建 `[部分已验证-CI]`
@@ -141,6 +141,24 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
   （`addChildViewController:` 正式容器化），**不再走 `presentViewController:`**；业务逻辑
   （验证码申请、`/sp-auth/bind-status` 轮询、`SpLoginAPI`、`SpLoginTheme`）一行没改。打开面板时
   会把悬浮球 `bringSubviewToFront:`（否则全屏遮罩会盖住球，关不掉）；点面板外的遮罩空白也会关。
+- **续轮询：`sp_resumeFromStoredTokenIfNeeded`（为什么不做 appearance 过渡）**：
+  `viewDidAppear:` 里原本有一段「本地已有令牌 ⇒ `refreshBindStatus` 接着轮询」，但
+  `addChildViewController:` + 直接 `hidden = NO` **不产生 appearance 过渡**，子 VC 根本收不到
+  `viewDidAppear:`，所以覆盖窗口这条路径冷启动时不会自己续上（得用户手点一次主按钮）。
+  修法是给 `SpLoginViewController` 加一个公开方法 `- (void)sp_resumeFromStoredTokenIfNeeded`，
+  由 `SpLoginOverlay -sp_ensurePanelControllerInRoot:` 在面板挂进容器后**显式调一次**：
+  - **本地没有令牌**（`SpLoginAPI.sharedAPI.token.length == 0`）⇒ 立刻返回：不发任何请求、不弹面板；
+  - **已经有轮询在跑**（`pollTimer` 非空且 `isValid`）⇒ 跳过：重复调用（1.5 s 首挂 /
+    `keyWindowChanged` / 5 s 看门狗 / `showPanel` / `pendingShow` 补开都汇到这一个挂载点）不会叠加定时器；
+  - 有令牌且没在跑 ⇒ 走 `startPolling`（首拍在 `SpLoginPollInterval` = 3 s 后），持续等到
+    `bound=true` 为止，而不是只查一次；
+  - 写一行可 grep 的日志（见第 5.1 节），真机上能直接看出「续了没、为什么没续」。
+
+  **为什么不干脆手动做一次 appearance 过渡**（`beginAppearanceTransition:YES` +
+  `endAppearanceTransition`）：那会连带把 `viewDidDisappear:` 也走一遍，而
+  `SpLoginViewController.m` 的 `viewDidDisappear:` 第一件事就是 `stopTimers` —— 与覆盖窗口版
+  刻意的取舍（**面板隐藏期间轮询/倒计时继续跑**，再点悬浮球原样恢复）直接冲突。所以走「业务侧
+  显式入口」而不是「借 UIKit 生命周期」，前提条件（有令牌 / 已轮询）也由本方法自己判定。
 - **常驻悬浮球**：52×52 圆角按钮（标题「登」），可拖动（限制在屏内），点击开/关面板。它是
   **不依赖任何官方 UI 钩子**的手动入口——这正是本次修复的验收点。plist `SPLoginFloatingButton`
   置 `false` 只收起这个球。
@@ -158,6 +176,11 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 - 悬浮球：`悬浮球创建（52x52，可拖动，点击开/关面板）` / `悬浮球挂到覆盖窗口 root=(WxH)`
 - 面板：`overlay panel shown (reason=..) …` / `overlay panel hidden（触摸已交还游戏）…`
 - 键盘：`overlay key<-overlay（文本输入需要键盘）` / `overlay key->host（…，key 归还游戏窗口 …）`
+- 续轮询（`sp_resumeFromStoredTokenIfNeeded`，三条互斥，正好覆盖「续了没 / 为什么不续」）：
+  - `resume: 本地已有令牌 ⇒ 续轮询 bind-status（每 3.0s 一次，最多 100 次；token 长度=64，面板挂载完成即触发）`
+  - `resume: 本地无令牌，不续轮询（等用户在面板里创建/登录）` ← 冷启动的默认路径（此时**不该**有
+    `/sp-auth/bind-status` 请求）
+  - `resume: 轮询已在跑，跳过（幂等，token 长度=64）` ← 看门狗/重挂的重复调用
 - 窗口列表每一项形如 `#0 UIWindow(lvl=0,key=1,hid=0,scene=1,414x896)`，overlay 自己带
   `,OVERLAY` 后缀；最多列 8 个，超出显示 `…(共N个)`。
 
@@ -170,6 +193,7 @@ grep -E 'overlay (install|window 创建|attach#)' "$L"   # 建没建、挂没挂
 grep -E '悬浮球' "$L"                                   # 球建了没、挂上没
 grep -E 'overlay panel (shown|hidden)' "$L"             # 面板开合
 grep -E 'overlay key' "$L"                              # 键盘借还
+grep -E 'resume:' "$L"                                  # 续轮询：续了没 / 为什么没续（第 5 节）
 grep -E 'windows=\[' "$L"                               # 那一刻扫到的窗口清单
 ```
 
@@ -182,6 +206,10 @@ grep -E 'windows=\[' "$L"                               # 那一刻扫到的窗�
 | `FAIL: 找不到可用宿主窗口` | 那一刻游戏还没建出自己的窗口（或窗口全被隐藏）。看门狗每 5 s 重试，正常应随后出现一行 `ok` |
 | `ok … ball=y` 但屏幕上没球 | 窗口建好且挂上了，但显示层级/穿透在真机上仍可能不生效——把整段日志（含 `windows=[...]`）发回来，这是下一步定位的唯一线索 |
 | `ok … panel=shown` | 面板已经被打开过（`pending` 补开或钩子触发），挂载链路是通的 |
+| `resume: 本地无令牌，不续轮询` | 正常：本机还没登记过（NSUserDefaults 里没有 token）。此时**不该**看到 `/sp-auth/bind-status` 请求 |
+| `resume: 本地已有令牌 ⇒ 续轮询 …` | 续轮询生效（本次修复的验收点）：面板挂上后每 3 s 打一次绑定状态，用户没点过任何按钮 |
+| `resume: 轮询已在跑，跳过（幂等 …）` | 正常：5 s 看门狗/重挂的重复调用被幂等闸门挡住，没有叠加定时器 |
+| 面板挂着但一直没出现任何 `resume:` | 挂载路径没走到 `sp_ensurePanelControllerInRoot:`（先看有没有 `attach#… ok`），或这版 dylib 没换上去 |
 
 **真机排查步骤**：①`grep 'overlay install'` 确认 tweak 真的加载了 → ②`grep 'attach#'` 看挂载
 结果与 `hostBy` → ③看 `windows=[...]` 里有没有游戏的普通层窗口、以及有没有带 `,OVERLAY` 的窗口
@@ -199,11 +227,16 @@ grep -E 'windows=\[' "$L"                               # 那一刻扫到的窗�
 3. **重启游戏**（不是 respring 也行——过滤器在进程启动时生效）。
 4. 看日志：`/var/jb/var/mobile/Library/Logs/SpLogin.log`（没有就退回 `NSLog`，用 Console.app 看）。
    启动时应能看到：地址、rootless 判定、`overlay install`、`overlay attach#…` 挂载结果、
-   `悬浮球创建/挂到覆盖窗口 root`、`UIViewController viewDidAppear:` 钩子结果、以及官方 SDK
-   类清单（哪些类真的存在、选择器在不在）。逐行判读方法见第 5.1 节。
+   `悬浮球创建/挂到覆盖窗口 root`、`resume:` 续轮询判定（第 5 节）、`UIViewController viewDidAppear:`
+   钩子结果、以及官方 SDK 类清单（哪些类真的存在、选择器在不在）。逐行判读方法见第 5.1 节。
 5. 逐条核对：
    - [ ] **屏幕上出现「登」悬浮球**（可拖动）——这一条**不依赖任何官方 UI 钩子**，是本次修复的
          核心验收点：它出现了就说明覆盖窗口建起来了、也挂上了
+   - [ ] **冷启动续轮询**（本次修复的第二个验收点）：先在面板里完成一次创建/登录让本地留下令牌，
+         然后**杀掉游戏重开**，不点任何按钮——日志里应出现
+         `resume: 本地已有令牌 ⇒ 续轮询 bind-status …`，且随后每 3 s 一次
+         `/sp-auth/bind-status`（`[未验证-需真机]`：覆盖窗口不产生 appearance 过渡，所以这条
+         只能靠真机日志确认，见第 5 节）
    - [ ] 点悬浮球能打开面板；点面板外空白或再点悬浮球能关掉面板，关掉后游戏触摸完全正常
    - [ ] 面板顶部出现 6 位数字，倒计时在走
    - [ ] 群内 bot 完成绑定后，面板变成「已绑定成功」

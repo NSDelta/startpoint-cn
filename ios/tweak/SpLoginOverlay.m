@@ -428,6 +428,15 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     } else if (self.panelController.view.superview != root) {
         [root addSubview:self.panelController.view];
     }
+
+    // 续轮询的显式触发点（本类**刻意不做** appearance 过渡，见文件头注释与 README 第 5 节）：
+    //   `addChildViewController:` + 直接 hidden=NO 不会让子 VC 收到 viewDidAppear:，
+    //   而「本地已有令牌 ⇒ 继续轮询 /sp-auth/bind-status」原本只写在 viewDidAppear: 里，
+    //   所以覆盖窗口这条路径冷启动时**不会**自己续上（用户得手点一次主按钮）。
+    //   改成让本 VC 提供幂等方法在这里显式调一次：没令牌 ⇒ 什么都不做（不发请求、不弹面板）；
+    //   已经有 pollTimer ⇒ 直接跳过。挂载路径（timer1.5s / keyWindowChanged / watchdog5s /
+    //   showPanel / pendingShow 补开）全部汇到这里，任意重复调用都不会叠加定时器。
+    [self.panelController sp_resumeFromStoredTokenIfNeeded];
 }
 
 - (void)sp_scrimTapped:(UITapGestureRecognizer *)gesture
