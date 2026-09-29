@@ -25,6 +25,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL autoPresent;
 /// 主动弹出的延迟秒数（plist: SPLoginAutoPresentDelay，默认 2.0）
 @property (nonatomic, readonly) NSTimeInterval autoPresentDelay;
+/// 是否显示常驻悬浮球（plist: SPLoginFloatingButton，**默认 YES = 修复后的行为**）。
+/// 悬浮球是「不依赖任何官方 UI 钩子也能打开面板」的入口；关掉只收起这个入口，
+/// 官方登录界面出现时的自动弹面板与 autoPresent 都不受影响。
+@property (nonatomic, readonly) BOOL floatingButton;
 /// 越狱根：rootless = "/var/jb"，传统 = ""
 @property (nonatomic, copy, readonly) NSString *jailbreakRoot;
 
