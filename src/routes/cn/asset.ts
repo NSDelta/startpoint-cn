@@ -12,6 +12,7 @@ import {
     type AssetProviderConfig,
 } from "../../content/cdn/asset-mode"
 import { normalizeCdnBaseUrl, serializeCdnUpdatePlan } from "../../content/cdn/protocol"
+import type { UpdatePlan } from "../../content/cdn/types"
 import type { ContentSnapshot } from "../../content/runtime/content-snapshot"
 import { getContentSnapshot } from "../../content/runtime/content-snapshot"
 import { generateDataHeaders } from "../../utils"
@@ -172,6 +173,24 @@ function sendPlannerError(
         code: error.code,
         message: "asset update plan is unavailable",
     })
+}
+
+function sendIosAssetsUnavailable(reply: FastifyReply) {
+    return reply.status(503).type("application/json").send({
+        code: "IOS_ASSETS_UNAVAILABLE",
+        message: "ios assets are unavailable",
+    })
+}
+
+/**
+ * 计划是否真的会下发归档。iOS 视图不可用时的唯一放行条件：
+ * 计划不含任何归档（客户端已在快照目标版本，full/diff 均为 null 或空归档列表）——
+ * 此时 Android 目录视图与 iOS 目录视图的结论一致（都没有归档可下），放行不会把
+ * Android platform 归档发给 iOS 客户端。
+ */
+function planDownloadsArchives(plan: UpdatePlan): boolean {
+    if (plan.full !== null && plan.full.archives.length > 0) return true
+    return plan.diff !== null && plan.diff.some(edge => edge.archives.length > 0)
 }
 
 const routes = async (fastify: FastifyInstance, options: CnAssetRouteOptions) => {
@@ -337,24 +356,48 @@ const routes = async (fastify: FastifyInstance, options: CnAssetRouteOptions) =>
             }
 
             let catalog = contentSnapshot.cdn
+            // iOS 视图不可用时的兜底：先按 Android 目录视图算计划，只为判断"这份计划是否会真的下发归档"。
+            // 空计划（客户端已在快照目标版本）对 iOS 是安全的——不含任何归档，不会把 Android platform
+            // 归档发给 iOS；含归档则维持 503，绝不降级。
+            let iosUnavailableReason: string | null = null
             if (iosEnabled && isIosAssetDevice(device)) {
                 const state = prepareIos(contentSnapshot, provider)
-                if (state.kind !== "ready") {
-                    // iOS 目录/实体表缺失：明确不可用，不给 iOS 客户端下发 Android 归档计划。
-                    return reply.status(503).type("application/json").send({
-                        code: "IOS_ASSETS_UNAVAILABLE",
-                        message: "ios assets are unavailable",
-                    })
+                if (state.kind === "ready") {
+                    catalog = state.catalog
+                } else {
+                    iosUnavailableReason = state.reason
                 }
-                catalog = state.catalog
             }
-            const plan = planCdnUpdate(catalog, {
-                currentVersion: plannerCurrentVersion,
-                targetVersion: catalog.targetVersion,
-                platform: "android",
-                assetSizeKind: "fulfill",
-                isInitial: plannerCurrentVersion === null,
-            })
+            let plan: UpdatePlan
+            try {
+                plan = planCdnUpdate(catalog, {
+                    currentVersion: plannerCurrentVersion,
+                    targetVersion: catalog.targetVersion,
+                    platform: "android",
+                    assetSizeKind: "fulfill",
+                    isInitial: plannerCurrentVersion === null,
+                })
+            } catch (error) {
+                // 计划无法判定 ⇒ 无法证明"无归档可下发"，对 iOS 维持原有的明确不可用语义（不新增 400/500）。
+                if (iosUnavailableReason !== null && error instanceof CdnPlannerError) {
+                    return sendIosAssetsUnavailable(reply)
+                }
+                throw error
+            }
+            if (iosUnavailableReason !== null) {
+                if (planDownloadsArchives(plan)) {
+                    // 计划含归档：iOS 视图不可用时绝不下发 Android platform 归档。
+                    return sendIosAssetsUnavailable(reply)
+                }
+                request.log.warn(
+                    {
+                        reason: iosUnavailableReason,
+                        currentVersion: plannerCurrentVersion,
+                        route: request.routeOptions.url ?? request.url,
+                    },
+                    "ios assets are unavailable; serving an empty asset update plan (no archives to download)",
+                )
+            }
             const data = serializeCdnUpdatePlan(plan, {
                 baseUrl: provider.baseUrl,
                 currentVersion: plannerCurrentVersion,
