@@ -110,8 +110,10 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 默认还是 `false`）至少命中一个；②那一刻 keyWindow 上已经有能 present 的 VC。任一不满足就永远不
 显示；就算显示了，AIR 重建视图层级时也会把它带走或盖住。
 
-现在改成**独立覆盖窗口**方案（`SpLoginOverlay.h/.m`；机制照抄社区里已在真机跑通的
-`wfcore/dylib/src/ui.m`）：
+现在改成**独立覆盖窗口**方案（`SpLoginOverlay.h/.m`）。⚠️ **参考边界（服主原话：「我说的是技术参考，不代表 ui 参考」）**：
+下面这套（窗口层级、保活三路、空白穿透、借还 keyWindow）只是从社区已在真机跑通的实现
+（`wfcore/dylib/src/ui.m`）移植的**机制**，**视觉与交互设计一律用我们自己的**——面板沿用本插件既有
+的 `SpLoginViewController` + `SpLoginTheme`（游戏化风格，规划见分工文档 P10-B/B2），不照搬参考实现的样式：
 
 - **独立 `UIWindow`**：`windowLevel = UIWindowLevelStatusBar + 100`，`backgroundColor = clearColor`，
   `rootViewController` 的 view 是穿透视图 `SpLoginPassView`（iOS 13+ 用 `initWithWindowScene:`
