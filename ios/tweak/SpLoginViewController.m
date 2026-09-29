@@ -97,10 +97,45 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
-    // 本地已有会话 ⇒ 直接继续轮询绑定状态（换设备/重开会话都能续上）
-    if ([SpLoginAPI sharedAPI].token.length > 0) {
-        [self refreshBindStatus];
+    // 本地已有会话 ⇒ 直接继续轮询绑定状态（换设备/重开会话都能续上）。
+    // 覆盖窗口路径不触发 appearance，所以那段逻辑抽进了 sp_resumeFromStoredTokenIfNeeded，
+    // 由 SpLoginOverlay 在挂面板时显式调一次；这里留着是给「VC 真被 present 出来」的场合兜底。
+    [self sp_resumeFromStoredTokenIfNeeded];
+}
+
+- (void)sp_resumeFromStoredTokenIfNeeded
+{
+    // 定时器要挂到当前 runloop（主线程），非主线程进来先弹回去——
+    // 与 SpLoginOverlay 里 sp_attachWithReason: / showPanel / hidePanel 的写法一致。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self sp_resumeFromStoredTokenIfNeeded];
+        });
+        return;
     }
+
+    NSString *token = [SpLoginAPI sharedAPI].token;
+    if (token.length == 0) {
+        // 没有本地令牌 ⇒ 一次请求都不发（冷启动默认状态就是这条路径）。
+        SPLoginLog(@"[SpLogin] resume: 本地无令牌，不续轮询（等用户在面板里创建/登录）");
+        return;
+    }
+
+    // 幂等闸门：已经在轮询就不再开一个。
+    // 覆盖窗口的 5s 看门狗每次重挂、scene 迁移、面板重复容器化都会走到这里；
+    // 没有这道闸门就会叠出多个 pollTimer（每个都在打 /sp-auth/bind-status）。
+    if (self.pollTimer != nil && self.pollTimer.isValid) {
+        SPLoginLog(@"[SpLogin] resume: 轮询已在跑，跳过（幂等，token 长度=%lu）",
+                   (unsigned long)token.length);
+        return;
+    }
+
+    // 起轮询（首拍在 SpLoginPollInterval=3s 后）= 旧的 viewDidAppear 里 refreshBindStatus 的效果，
+    // 但不会只查一次就停：绑定是「群内 bot 人工确认」，必须持续等到 bound=true 才有意义。
+    [self startPolling];
+    SPLoginLog(@"[SpLogin] resume: 本地已有令牌 ⇒ 续轮询 bind-status（每 %.1fs 一次，最多 %ld 次；"
+               @"token 长度=%lu，面板挂载完成即触发）",
+               SpLoginPollInterval, (long)SpLoginPollLimit, (unsigned long)token.length);
 }
 
 - (void)viewDidDisappear:(BOOL)animated
