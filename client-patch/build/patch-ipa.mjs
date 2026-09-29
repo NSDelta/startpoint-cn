@@ -47,19 +47,34 @@
 //        node patch-ipa.mjs --bin=worldflipper --host=... --port=... --out=patched.bin
 //      空格分隔形式同样支持（`--ipa in.ipa --host 192.168.x.x`）—— A1b 新增，见下方 ARGV 规范化。
 //      其它: --guard-mode=launch|all|none（默认 all；联调 SOP 用 launch）
+//            --endpoint=rewrite|none（默认 rewrite）—— **越狱线开关**，见下方「端点模式」段
+//            --sohu-block=false 关闭 sohu 外发屏蔽（六项功能补丁 ⑥，它也是"改 URL"）
 //            --agreement=false / --privacy=false 关闭协议门补丁
 //            --app=<App 名> 显式指定 Payload/<App>.app/<App>（默认自动探测）
 //            --dry-run 只算不写（不产出 IPA，回读断言不执行）
 //      旧参数 --jar= / --res= / --work= 已随 jar 一起废弃（无人使用则忽略）。
+//
+// ★ 端点模式（R27：iOS 补丁只允许一条代码路径，所以越狱线不再另写脚本）：
+//   · `--endpoint=rewrite`（默认）＝ 既有行为，一个字节都不变：改 `__cstring` 站点 + ABC 常量池。
+//   · `--endpoint=none` ＝ 越狱线：**跳过 ABC 常量池改写与全部 `__cstring` URL 站点改写**，
+//     URL 交给越狱 dylib 在运行期接管。此时 `--host/--port` **不再必需**（给了也只 warn、不改一字节）。
+//   两种模式下六项功能补丁与 `--guard-mode` 完全一致（`none` 只是不碰 URL，不是"什么都不打"）。
+//   ⚠️ `--endpoint=none` **不等于**当年那份临时脚本 `D:\wfcnmod\tmp\make-jb-ipa.mjs` 的产物：
+//     那个脚本只做 deguard（`all` 分支）+ 回写，六项功能补丁一个都没打；本开关刻意保留六项功能补丁
+//     （它们才是"去闪退 / 不弹窗"的主线），且 SOP 用 `--guard-mode=launch`（脚本走的是 `all`）。
+//     要严格做到"连 sohu 那个 URL 都不动"，再叠加 `--sohu-block=false`。
+//   `none` 模式不是靠把旧断言 `if` 掉，而是**新增正向断言**：__cstring 站点逐点与基线比对、ABC 池
+//   区域 sha256 与基线一致、官方域名出现次数 = 基线值、新端点出现次数 = 0、且"官方站点窗口 + ABC
+//   池窗口内零字节改动"（逐字节证明）。
 
 import { existsSync, readFileSync, writeFileSync, copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 // ── A1b 新增依赖（全部零外部包，只用 node 内置 + 本目录 lib/）──
 import {
-  ENDPOINT_LENGTH, OFFICIAL_SITE_REWRITEABLE, OFFICIAL_SITE_TOO_SHORT, OFFICIAL_SITE_TOTAL, PREMISE_ENDPOINT,
-  byteDiffRanges, countOccurrences, countRewriteableUrlSites, diffRanges, mergeRanges, minReplacementLength,
-  rangesEqual, scanTargets,
+  ENDPOINT_LENGTH, OFFICIAL_HOST_SUFFIXES, OFFICIAL_SITE_REWRITEABLE, OFFICIAL_SITE_TOO_SHORT, OFFICIAL_SITE_TOTAL,
+  PREMISE_ENDPOINT, byteDiffRanges, countOccurrences, countRewriteableUrlSites, diffRanges, mergeRanges,
+  minReplacementLength, rangesEqual, scanTargets,
 } from './lib/ios-endpoint.mjs';
 import { ABC_API_HOST, ABC_API_PAIR_OFFSET, ABC_API_SCHEME, applyApiBaseRewrite, findSchemeHostPair } from './lib/ios-abc.mjs';
 import { OFFICIAL_IOS_184, findMainBinaryEntry, parseMachOHeader } from './lib/ios-macho.mjs';
@@ -81,11 +96,22 @@ const args = Object.fromEntries(ARGV.map(a => {
 }));
 const HOST = args.host, PORT = args.port, OUT = args.out;
 const GUARD_MODE = args['guard-mode'] || 'all';      // launch|all|none，默认 all（处理所有 guard）
+// 端点模式：rewrite（默认＝既有行为：改 __cstring 站点 + ABC 常量池）| none（越狱线：一个 URL 都不动）
+const ENDPOINT_MODE = args.endpoint === undefined ? 'rewrite' : String(args.endpoint).toLowerCase();
+const REWRITE_ENDPOINT = ENDPOINT_MODE === 'rewrite';
+// sohu 外发屏蔽（六项功能补丁 ⑥）本身也改一个 URL；默认 true 保持既有行为，要"一个 URL 都不动"时显式 --sohu-block=false
+const PATCH_SOHU = args['sohu-block'] !== 'false' && args['sohu-block'] !== false;
 const fail = m => { console.log('ERROR ' + m); process.exit(1); };
-if (!HOST || !PORT || !OUT || (!args.ipa && !args.bin)) fail('需要 --ipa(或 --bin) --host --port --out');
+if (ENDPOINT_MODE !== 'rewrite' && ENDPOINT_MODE !== 'none') fail(`--endpoint 只接受 rewrite|none（收到 ${JSON.stringify(args.endpoint)}）`);
+if (!OUT || (!args.ipa && !args.bin)) fail('需要 --ipa(或 --bin) --out');
+if (REWRITE_ENDPOINT && (!HOST || !PORT)) fail('需要 --ipa(或 --bin) --host --port --out');
+if (!REWRITE_ENDPOINT && (HOST || PORT)) console.log(`WARN --endpoint=none：已忽略 --host/--port（${HOST || '-'}:${PORT || '-'}），本模式不改写任何 URL`);
 
 const HOST_PORT = `${HOST}:${PORT}`;                // e.g. 192.168.1.10:8001（示例值必须是 hygiene 白名单里的 192.168.1.10，勿改成真实局域网 IP）
-const TARGET = `http://${HOST_PORT}`;               // replacement scheme+authority (e.g. 26 bytes)
+const TARGET = REWRITE_ENDPOINT ? `http://${HOST_PORT}` : null;   // replacement scheme+authority (e.g. 26 bytes)；none 模式无目标端点
+// 站点直方图的"统计用 hostPort"：none 模式没有目标端点，用 ENDPOINT_LENGTH 个占位字符复算 150/137/13 的站点分类，
+// 它只进 minReplacementLength()，绝不参与任何写入；rewrite 模式下恒等于 HOST_PORT ⇒ 零行为变化。
+const STAT_HOST_PORT = (HOST && PORT) ? HOST_PORT : '0'.repeat(ENDPOINT_LENGTH);
 const HOST_RE = /https?:\/\/[A-Za-z0-9.-]+\.(?:leiting\.com|roguelike\.com|cl2009\.com)(?::\d+)?/;
 // optional whitelist: only redirect URLs whose host contains one of these substrings
 const HOSTS = args.hosts ? String(args.hosts).split(',').filter(Boolean) : null;
@@ -342,6 +368,10 @@ const FIXED_WINDOWS = [
   [0x57d834c, 0x57d834c + 4],    // --crash-longjmp 诊断写点
 ];
 
+// --endpoint=none：ABC 池一个字节都不该动 ⇒ 干脆把它从**声明窗口**里摘掉。这不是放宽而是收紧：
+// 计划窗口里没有它，任何写进 ABC 池的字节都会被下面的 stray/越界断言当场抓出来。
+const FIXED_WINDOWS_NO_ENDPOINT = FIXED_WINDOWS.filter(([start]) => start !== ABC_API_PAIR_OFFSET);
+
 /** guard 可能写入的窗口：launch 只写 0xb00c；all 模式扫 MOVZ X8,#0 后 3 词内的 store。 */
 function guardWindows(buffer, mode) {
   if (mode === 'none') return [];
@@ -354,14 +384,24 @@ function guardWindows(buffer, mode) {
   return windows;
 }
 
-/** 全部域名站点 + sohu 站点的窗口（过短站点也列进去：它们本来就不该被写，列进去反而是更强的约束）。 */
-function authorityWindows(pristine) {
-  const windows = scanTargets(pristine, { includeBare: false }).sites.map(site => [site.offset, site.offset + site.length]);
+/** 全部官方域名站点的窗口（过短站点也列进去：它们本来就不该被写，列进去反而是更强的约束）。 */
+function officialAuthorityWindows(pristine) {
+  return scanTargets(pristine, { includeBare: false }).sites.map(site => [site.offset, site.offset + site.length]);
+}
+
+/** sohu 站点的窗口（patchBlock 的写入范围）。 */
+function sohuAuthorityWindows(pristine) {
+  const windows = [];
   const text = pristine.toString('latin1');
   const re = new RegExp(BLOCK_RE.source, 'g');
   let m;
   while ((m = re.exec(text))) windows.push([m.index, m.index + m[0].length]);
   return windows;
+}
+
+/** 全部域名站点 + sohu 站点的窗口（rewrite 模式的声明窗口；顺序与内容与既有实现逐字一致）。 */
+function authorityWindows(pristine) {
+  return [...officialAuthorityWindows(pristine), ...sohuAuthorityWindows(pristine)];
 }
 
 /** 把"声明窗口内真正变化的字节"切成合并后的范围（窗口外一律不算）。 */
@@ -391,8 +431,21 @@ function assertOfficialInput(A, bin, label = '输入主二进制') {
 /** 补丁结果断言（两条路径共用；ctx 由各自分支提供）。返回 { actual, windows }。 */
 function assertPatchResults(A, ctx) {
   const { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable } = ctx;
-  A.check('URL 站点改写数 = 可改写站点数', r.patched === rewriteable,
-    `${r.patched} / ${rewriteable}（过短跳过 ${r.skipped.length} 个：${r.skipped.slice(0, 4).join(' | ') || '无'}）`);
+  if (REWRITE_ENDPOINT) {
+    A.check('URL 站点改写数 = 可改写站点数', r.patched === rewriteable,
+      `${r.patched} / ${rewriteable}（过短跳过 ${r.skipped.length} 个：${r.skipped.slice(0, 4).join(' | ') || '无'}）`);
+  } else {
+    // 正向断言 ①：不是"少写了"，而是**逐点证明一个站点都没变**（偏移 / 长度 / 文本三者全等）。
+    const sitesIn = scanTargets(pristine, { includeBare: false }).sites;
+    const sitesOut = scanTargets(buf, { includeBare: false }).sites;
+    const drift = sitesIn.filter((site, i) => {
+      const now = sitesOut[i];
+      return !now || now.offset !== site.offset || now.length !== site.length || now.text !== site.text;
+    });
+    A.check(`endpoint=none：URL 站点改写数 = 0（${OFFICIAL_SITE_TOTAL} 个站点逐点比对偏移/长度/文本，全等于基线）`,
+      r.patched === 0 && sitesOut.length === sitesIn.length && sitesOut.length === OFFICIAL_SITE_TOTAL && drift.length === 0,
+      `改写 ${r.patched} 处；逐点一致 ${sitesOut.length - drift.length}/${sitesIn.length}${drift.length ? `；漂移 ${hexRanges(drift.map(s => [s.offset, s.offset + s.length]), 3)}` : ''}`);
+  }
   A.check('基线六项 ① 实名提示 shouldShowFirstLoginTip -> NO', tip === 1,
     tip ? `${hex(0x6ae0dc)}: mov w0,#0 ; ret` : `签名 0xa9bd57f6 不匹配（${hex(pristine.readUInt32LE(0x6ae0dc))}）`);
   A.check('基线六项 ② 全新安装登录弹窗 3/3 分支 NOP', dlg === 3, `命中 ${dlg}/3`);
@@ -402,8 +455,8 @@ function assertPatchResults(A, ctx) {
   const expectAgr = (PATCH_AGREEMENT ? 1 : 0) + (PATCH_PRIVACY ? 2 : 0);
   A.check('基线六项 ⑤ 协议门（EULA + 隐私 gate）', agr === expectAgr,
     `命中 ${agr}/${expectAgr}（--agreement=${PATCH_AGREEMENT} --privacy=${PATCH_PRIVACY}）`);
-  A.check('基线六项 ⑥ sohu 外发屏蔽（等长改写为 127.0.0.1:1）', blk.blocked === 1,
-    `命中 ${blk.blocked} 处${blk.hosts.length ? '：' + blk.hosts.join(', ') : ''}`);
+  A.check('基线六项 ⑥ sohu 外发屏蔽（等长改写为 127.0.0.1:1）', blk.blocked === (PATCH_SOHU ? 1 : 0),
+    `命中 ${blk.blocked} 处${blk.hosts.length ? '：' + blk.hosts.join(', ') : ''}（--sohu-block=${PATCH_SOHU}）`);
   if (GUARD_MODE === 'launch') {
     A.check('guard-mode=launch：只 NOP 0xb00c 一处', guards === 1 && buf.readUInt32LE(0xb00c) === NOP_INS,
       `0xb00c = ${hex(buf.readUInt32LE(0xb00c))}`);
@@ -411,28 +464,80 @@ function assertPatchResults(A, ctx) {
     A.check(`guard-mode=${GUARD_MODE}：已 NOP ${guards} 处致命中止`, GUARD_MODE !== 'none' || guards === 0,
       `模式 ${GUARD_MODE}`);
   }
-  A.check(`ABC 池 ${ABC_API_SCHEME} + ${ABC_API_HOST} ⇒ ${abc.applied ? abc.apiBase : '未改写'}（${OFFICIAL.abcPairBytes} B 守恒）`,
-    abc.applied === 1 && abc.totalBytes === OFFICIAL.abcPairBytes, abc.reason);
-  const residue = countRewriteableUrlSites(buf, { hostPort: HOST_PORT });
-  A.check('补丁后：可改写旧站点残留 = 0 处', residue === 0, `残留 ${residue} 处`);
+  if (!REWRITE_ENDPOINT) {
+    // 正向断言 ⑥：none 模式下"守卫仍然生效"必须显式成立 —— 把 tmp 脚本当年那条硬校验
+    // （`if (buf.readUInt32LE(0xb00c) !== NOP) throw new Error('0xb00c 未被 NOP')`）正式收编。
+    A.check(`endpoint=none：0xb00c 启动 guard 已落 NOP（guard-mode=${GUARD_MODE}）`,
+      GUARD_MODE === 'none' ? guards === 0 : buf.readUInt32LE(0xb00c) === NOP_INS,
+      `0xb00c = ${hex(buf.readUInt32LE(0xb00c))}（期望 ${hex(NOP_INS)}）`);
+    // guard-mode=all 时旧断言是弱断言（只查 none 模式为 0），这里补一条"真的扫到并 NOP 了"的计数断言。
+    if (GUARD_MODE === 'all') A.check(`endpoint=none：guard-mode=all 实际命中 ${guards} 处致命中止（> 0 才算守卫生效）`, guards > 0, `命中 ${guards} 处`);
+  }
+  if (REWRITE_ENDPOINT) {
+    A.check(`ABC 池 ${ABC_API_SCHEME} + ${ABC_API_HOST} ⇒ ${abc.applied ? abc.apiBase : '未改写'}（${OFFICIAL.abcPairBytes} B 守恒）`,
+      abc.applied === 1 && abc.totalBytes === OFFICIAL.abcPairBytes, abc.reason);
+  } else {
+    // 正向断言 ②：ABC 常量池区域（33 B @0x5a0e14b）与基线**逐字节**相同，并且 sha256 也相同。
+    const poolIn = pristine.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes);
+    const poolOut = buf.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes);
+    const hashIn = sha256Hex(poolIn), hashOut = sha256Hex(poolOut);
+    A.check(`endpoint=none：ABC 常量池区域 sha256 = 基线值（${OFFICIAL.abcPairBytes} B @${hex(ABC_API_PAIR_OFFSET)}）`,
+      poolOut.equals(poolIn) && hashOut === hashIn && abc.applied === 0,
+      `基线 ${hashIn} / 实测 ${hashOut}；applied=${abc.applied}；原文 ${JSON.stringify(poolIn.toString('latin1'))}`);
+  }
+  const residue = countRewriteableUrlSites(buf, { hostPort: STAT_HOST_PORT });
+  if (REWRITE_ENDPOINT) {
+    A.check('补丁后：可改写旧站点残留 = 0 处', residue === 0, `残留 ${residue} 处`);
+  } else {
+    // 正向断言 ③：可改写站点残留数**原样保持** = 137，即"137 个站点一个都没被改写"的计数形式。
+    A.check(`endpoint=none：可改写旧站点残留 = 基线值 ${OFFICIAL_SITE_REWRITEABLE} 处（一个都没被改写）`,
+      residue === OFFICIAL_SITE_REWRITEABLE, `残留 ${residue} 处（基线 ${OFFICIAL_SITE_REWRITEABLE}）`);
+  }
   const premiseLeft = countOccurrences(buf, PREMISE_ENDPOINT);
   A.check(`补丁后：${PREMISE_ENDPOINT} 残留 = 0 处`, premiseLeft === 0, `残留 ${premiseLeft} 处`);
-  const postEndpoints = countOccurrences(buf, HOST_PORT);
-  A.check(`补丁后：新端点 = ${OFFICIAL.endpointOccurrencesAfter} 处（${OFFICIAL_SITE_REWRITEABLE} URL + 1 ABC）`,
-    postEndpoints === OFFICIAL.endpointOccurrencesAfter, `实测 ${postEndpoints} 处`);
+  const postEndpoints = (HOST && PORT) ? countOccurrences(buf, HOST_PORT) : 0;
+  if (REWRITE_ENDPOINT) {
+    A.check(`补丁后：新端点 = ${OFFICIAL.endpointOccurrencesAfter} 处（${OFFICIAL_SITE_REWRITEABLE} URL + 1 ABC）`,
+      postEndpoints === OFFICIAL.endpointOccurrencesAfter, `实测 ${postEndpoints} 处`);
+  } else {
+    // 正向断言 ④：输出里**新端点出现次数 = 0**（给了 --host/--port 也不许出现一次）。
+    // 正向断言 ⑤：官方域名出现次数 = 基线值（逐域名 before/after 计数，任何一处被改写都会掉数）。
+    A.check(`endpoint=none：新端点出现次数 = 0 处（${HOST && PORT ? HOST_PORT : '未提供 --host/--port'}）`,
+      postEndpoints === 0, `实测 ${postEndpoints} 处`);
+    const domains = OFFICIAL_HOST_SUFFIXES.map(suffix =>
+      ({ suffix, before: countOccurrences(pristine, suffix), after: countOccurrences(buf, suffix) }));
+    A.check('endpoint=none：官方域名出现次数 = 基线值（逐域名 before/after）', domains.every(d => d.before === d.after),
+      domains.map(d => `${d.suffix} ${d.before}->${d.after}`).join(' / '));
+    const padIn = countOccurrences(pristine, '://0'), padOut = countOccurrences(buf, '://0');
+    A.check('endpoint=none：userinfo 填充签名（http://0…@host:port）不得新增', padOut === padIn, `基线 ${padIn} 处 -> 实测 ${padOut} 处`);
+  }
   A.check(`补丁后：主二进制长度不变 = ${OFFICIAL.binBytes} B`, buf.length === OFFICIAL.binBytes, `${pristine.length} B -> ${buf.length} B`);
   const mhOut = parseMachOHeader(buf);
   A.check('补丁后：ncmds / sizeofcmds 不变（未加段、未动 LC 区）',
     mhOut.ncmds === mhIn.ncmds && mhOut.sizeofcmds === mhIn.sizeofcmds && mhOut.ncmds === OFFICIAL.ncmds && mhOut.sizeofcmds === OFFICIAL.sizeofcmds,
     `ncmds=${mhOut.ncmds} sizeofcmds=${mhOut.sizeofcmds}`);
   // 越界写入检查
-  const windows = [...FIXED_WINDOWS, ...authorityWindows(pristine), ...guardWindows(pristine, GUARD_MODE)];
+  const windows = REWRITE_ENDPOINT
+    ? [...FIXED_WINDOWS, ...authorityWindows(pristine), ...guardWindows(pristine, GUARD_MODE)]
+    : [...FIXED_WINDOWS_NO_ENDPOINT, ...(PATCH_SOHU ? sohuAuthorityWindows(pristine) : []), ...guardWindows(pristine, GUARD_MODE)];
   const actual = diffRanges(pristine, buf);
   const planned = windowDiffRanges(pristine, buf, windows);
   const stray = actual.filter(range => !planned.some(p => p[0] <= range[0] && p[1] >= range[1]));
   const changedBytes = actual.reduce((sum, [s, e]) => sum + (e - s), 0);
-  A.check('改动字节范围 = 计划范围（无越界写入）', rangesEqual(actual, planned) && stray.length === 0,
-    `${actual.length} 段 / ${changedBytes} 字节；声明窗口 ${windows.length} 个${stray.length ? `；越界段 ${hexRanges(stray, 3)}` : ''}`);
+  A.check(REWRITE_ENDPOINT ? '改动字节范围 = 计划范围（无越界写入）'
+    : 'endpoint=none：改动字节范围 = 计划范围（只含六项功能补丁 + guard；计划窗口已剔除 URL 站点与 ABC 池）',
+  rangesEqual(actual, planned) && stray.length === 0,
+  `${actual.length} 段 / ${changedBytes} 字节；声明窗口 ${windows.length} 个${stray.length ? `；越界段 ${hexRanges(stray, 3)}` : ''}`);
+  if (!REWRITE_ENDPOINT) {
+    // 正向断言 ⑦：**逐字节**证明"URL 一个字节都没动" —— 官方站点窗口 ∪ ABC 池窗口 与 实际改动范围
+    // 的交集必须为空。这里的 forbidden 是**全量**集合（不像 windows 已被刻意剔除），因此即使将来有人
+    // 误把某个站点窗口从计划里删掉，这条断言也仍然独立成立。
+    const forbidden = [...officialAuthorityWindows(pristine), [ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes]];
+    const violated = actual.filter(range => forbidden.some(([start, end]) => range[0] < end && range[1] > start));
+    A.check(`endpoint=none：官方 URL 站点窗口 ∪ ABC 池窗口共 ${forbidden.length} 个窗口内零字节改动`,
+      violated.length === 0,
+      violated.length ? `违规段 ${hexRanges(violated, 3)}` : `${changedBytes} 个改动字节全部落在功能补丁/守卫窗口内`);
+  }
   return { actual, planned, windows, changedBytes, residue, postEndpoints };
 }
 
@@ -454,12 +559,13 @@ if (args.bin) {
   const pristine = Buffer.from(buf);                // A1b：只读对照（Buffer.from(Buffer) 是拷贝，共享内存的坑不会踩）
   const A = createAssertions();
   const mhIn = assertOfficialInput(A, pristine);
-  const minLen = minReplacementLength(HOST_PORT);
+  const minLen = minReplacementLength(STAT_HOST_PORT);
   const rewriteable = scanTargets(pristine, { includeBare: false }).sites.filter(s => s.length >= minLen).length;
-  const r = patchBuffer(buf);
-  const blk = patchBlock(buf);
+  const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
+  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
   const guards = deguardBuffer(buf, GUARD_MODE);
-  const abc = applyApiBaseRewrite(buf, { hostPort: HOST_PORT });
+  const abc = REWRITE_ENDPOINT ? applyApiBaseRewrite(buf, { hostPort: HOST_PORT })
+    : { applied: 0, reason: '--endpoint=none：跳过 ABC 常量池改写', offset: null, totalBytes: 0, apiBase: null, diffRanges: [], oldBytes: null, newBytes: null };
   const tip = patchFirstLoginTip(buf);
   const dlg = patchLoginDialog(buf);
   const wel = patchWelcomeBanner(buf);
@@ -471,11 +577,12 @@ if (args.bin) {
   console.log(wel === 3 ? '  已抑制欢迎入园横幅 (LTLoginManager showWelcomeView: + 2 处，3/3)' : `  [!] 欢迎横幅补丁仅匹配 ${wel}/3 处 —— 已跳过`);
   console.log(agr===0 ? '  协议弹窗保持原样' : ('  已跳过使用许可协议' + (agr>=3 ? ' + 隐私政策弹窗' : '') + ` [${agr} 处]`));
   console.log(bid ? '  sub_100312230 -> return 0（跳过 Bundle ID 资源校验，多开安全）' : '  [!] Bundle ID 校验补丁签名不匹配 —— 已跳过');
-  console.log(abc.applied ? `  ABC 池 API 基址 -> ${abc.apiBase}（${abc.totalBytes} B 守恒 @${hex(abc.offset)}）` : `  [!] ABC 池改写未生效：${abc.reason}`);
+  console.log(abc.applied ? `  ABC 池 API 基址 -> ${abc.apiBase}（${abc.totalBytes} B 守恒 @${hex(abc.offset)}）`
+    : REWRITE_ENDPOINT ? `  [!] ABC 池改写未生效：${abc.reason}` : `  · ${abc.reason}`);
   if (args['crash-longjmp'] && buf.readUInt32LE(0x57d834c) === 0xb0005190) { buf.writeUInt32LE(0xd4200000, 0x57d834c); console.log('  [诊断] _longjmp 桩 -> BRK'); }
   const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable });
   writeFileSync(OUT, buf);
-  console.log(`已改写 ${r.patched} 个 URL 常量 -> ${TARGET}`);
+  console.log(REWRITE_ENDPOINT ? `已改写 ${r.patched} 个 URL 常量 -> ${TARGET}` : 'endpoint=none：URL 常量一处未改（交给越狱 dylib 在运行期接管）');
   console.log(`已清除 ${guards} 个故意中止 guard（0xDEADBEEF 空写入）`);
   if (r.skipped.length) console.log(`已跳过（太长，${r.skipped.length} 个）: ` + r.skipped.slice(0, 12).join(', '));
   console.log('DONE  ' + OUT);
@@ -509,12 +616,20 @@ if (args.bin) {
   console.log(`  主二进制 ${mainName}：${pristine.length} B / sha256 ${sha256Hex(pristine)}`);
 
   const mhIn = assertOfficialInput(A, pristine);
-  A.check(`目标 authority 长度 = ${ENDPOINT_LENGTH}（冻结地址 ${HOST}:${PORT} / 分工文档 §C2）`,
-    HOST_PORT.length === ENDPOINT_LENGTH, `${HOST_PORT} = ${HOST_PORT.length} 字符（期望 ${ENDPOINT_LENGTH}）`);
   const scan = scanTargets(pristine, { includeBare: false });
-  const minLen = minReplacementLength(HOST_PORT);
+  const minLen = minReplacementLength(STAT_HOST_PORT);
   const tooShortSites = scan.sites.filter(s => s.length < minLen);
   const rewriteableSites = scan.sites.filter(s => s.length >= minLen);
+  if (REWRITE_ENDPOINT) {
+    A.check(`目标 authority 长度 = ${ENDPOINT_LENGTH}（冻结地址 ${HOST}:${PORT} / 分工文档 §C2）`,
+      HOST_PORT.length === ENDPOINT_LENGTH, `${HOST_PORT} = ${HOST_PORT.length} 字符（期望 ${ENDPOINT_LENGTH}）`);
+  } else {
+    // none 模式没有目标端点，"目标 authority 长度"这条断言不适用；换成一条**只有 none 模式才成立**、
+    // 同样正向的事实：官方站点在扫描器眼里仍然全部处于"可改写原状"（一个都没被动过）。
+    A.check(`endpoint=none：无目标端点（--host/--port ${HOST || PORT ? '已给出但被忽略' : '未给出'}）⇒ ${OFFICIAL_SITE_REWRITEABLE} 个站点保持可改写原状`,
+      rewriteableSites.length === OFFICIAL_SITE_REWRITEABLE && tooShortSites.length === OFFICIAL_SITE_TOO_SHORT,
+      `可改写 ${rewriteableSites.length} / 过短 ${tooShortSites.length}（本模式不写 URL 一个字节）`);
+  }
   A.check(`官方站点统计：总 ${OFFICIAL_SITE_TOTAL} = 可改写 ${OFFICIAL_SITE_REWRITEABLE} + 过短 ${OFFICIAL_SITE_TOO_SHORT}`,
     scan.sites.length === OFFICIAL_SITE_TOTAL && rewriteableSites.length === OFFICIAL_SITE_REWRITEABLE && tooShortSites.length === OFFICIAL_SITE_TOO_SHORT,
     `实测 总 ${scan.sites.length}：可改写 ${rewriteableSites.length} / 过短 ${tooShortSites.length}（最短站点 ${Math.min(...scan.sites.map(s => s.length))} B < 目标 ${minLen} B ⇒ 跳过不缩短）`);
@@ -528,11 +643,13 @@ if (args.bin) {
   A.check('输入 0xb00c = 0xb9000109（启动 guard 签名）', pristine.readUInt32LE(0xb00c) === 0xb9000109,
     `${hex(pristine.readUInt32LE(0xb00c))}`);
 
-  progress('原地改写端点 URL + ABC 池 API 基址 + 六项功能补丁 + 解除 guard');
-  const r = patchBuffer(buf);
-  const blk = patchBlock(buf);
+  progress(REWRITE_ENDPOINT ? '原地改写端点 URL + ABC 池 API 基址 + 六项功能补丁 + 解除 guard'
+    : '（--endpoint=none）跳过端点 URL 与 ABC 池，只打六项功能补丁 + 解除 guard');
+  const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
+  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
   const guards = deguardBuffer(buf, GUARD_MODE);
-  const abc = applyApiBaseRewrite(buf, { hostPort: HOST_PORT });
+  const abc = REWRITE_ENDPOINT ? applyApiBaseRewrite(buf, { hostPort: HOST_PORT })
+    : { applied: 0, reason: '--endpoint=none：跳过 ABC 常量池改写', offset: null, totalBytes: 0, apiBase: null, diffRanges: [], oldBytes: null, newBytes: null };
   const tip = patchFirstLoginTip(buf);
   const dlg = patchLoginDialog(buf);
   const wel = patchWelcomeBanner(buf);
@@ -544,10 +661,12 @@ if (args.bin) {
   console.log(wel === 3 ? '  已抑制欢迎入园横幅 (LTLoginManager showWelcomeView: + 2 处，3/3)' : `  [!] 欢迎横幅补丁仅匹配 ${wel}/3 处 —— 已跳过`);
   console.log(agr===0 ? '  协议弹窗保持原样' : ('  已跳过使用许可协议' + (agr>=3 ? ' + 隐私政策弹窗' : '') + ` [${agr} 处]`));
   console.log(bid ? '  sub_100312230 -> return 0（跳过 Bundle ID 资源校验，多开安全）' : '  [!] Bundle ID 校验补丁签名不匹配 —— 已跳过');
-  console.log(abc.applied ? `  ABC 池 API 基址（DevConfig_gf_ios.apiServer）-> ${abc.apiBase}（${abc.totalBytes} B 守恒 @${hex(abc.offset)}）` : `  [!] ABC 池改写未生效：${abc.reason}`);
+  console.log(abc.applied ? `  ABC 池 API 基址（DevConfig_gf_ios.apiServer）-> ${abc.apiBase}（${abc.totalBytes} B 守恒 @${hex(abc.offset)}）`
+    : REWRITE_ENDPOINT ? `  [!] ABC 池改写未生效：${abc.reason}` : `  · ${abc.reason}`);
+  if (!PATCH_SOHU) console.log('  · --sohu-block=false：sohu 外发屏蔽已关闭（该外发 URL 也保持原样）');
   if (args['crash-longjmp'] && buf.readUInt32LE(0x57d834c) === 0xb0005190) { buf.writeUInt32LE(0xd4200000, 0x57d834c); console.log('  [诊断] _longjmp 桩 -> BRK'); }
   const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable: rewriteableSites.length });
-  console.log(`已改写 ${r.patched} 个 URL 常量 -> ${TARGET}`);
+  console.log(REWRITE_ENDPOINT ? `已改写 ${r.patched} 个 URL 常量 -> ${TARGET}` : 'endpoint=none：URL 常量一处未改（交给越狱 dylib 在运行期接管）');
   console.log(`已清除 ${guards} 个故意中止 guard（0xDEADBEEF 空写入）`);
   if (r.skipped.length) console.log(`已跳过（${r.skipped.length} 个不重要，太短）: ` + r.skipped.slice(0, 8).join(', '));
 
@@ -583,13 +702,34 @@ if (args.bin) {
     const outBinSha = sha256Hex(outBin);
     A.check('回读：主二进制与内存补丁结果逐字节一致（sha256）', outBinSha === sha256Hex(buf), `sha256 ${outBinSha}`);
     A.check(`回读：主二进制长度不变 = ${OFFICIAL.binBytes} B`, outBin.length === OFFICIAL.binBytes, `${outBin.length} B`);
-    const rbResidue = countRewriteableUrlSites(outBin, { hostPort: HOST_PORT });
-    A.check('回读：可改写旧站点残留 = 0 处', rbResidue === 0, `残留 ${rbResidue} 处`);
-    const rbEndpoints = countOccurrences(outBin, HOST_PORT);
-    A.check(`回读：新端点 = ${OFFICIAL.endpointOccurrencesAfter} 处`, rbEndpoints === OFFICIAL.endpointOccurrencesAfter, `实测 ${rbEndpoints} 处`);
+    const rbResidue = countRewriteableUrlSites(outBin, { hostPort: STAT_HOST_PORT });
+    const rbEndpoints = (HOST && PORT) ? countOccurrences(outBin, HOST_PORT) : 0;
+    if (REWRITE_ENDPOINT) {
+      A.check('回读：可改写旧站点残留 = 0 处', rbResidue === 0, `残留 ${rbResidue} 处`);
+      A.check(`回读：新端点 = ${OFFICIAL.endpointOccurrencesAfter} 处`, rbEndpoints === OFFICIAL.endpointOccurrencesAfter, `实测 ${rbEndpoints} 处`);
+    } else {
+      // 正向断言 ⑧/⑨：落盘后的产物同样必须"URL 一个字节都没动"（内存里对了 ≠ 盘上对了）。
+      A.check(`endpoint=none：回读可改写旧站点残留 = 基线值 ${OFFICIAL_SITE_REWRITEABLE} 处（盘上同样一个都没改）`,
+        rbResidue === OFFICIAL_SITE_REWRITEABLE, `残留 ${rbResidue} 处（基线 ${OFFICIAL_SITE_REWRITEABLE}）`);
+      A.check(`endpoint=none：回读新端点出现次数 = 0 处（${HOST && PORT ? HOST_PORT : '未提供 --host/--port'}）`,
+        rbEndpoints === 0, `实测 ${rbEndpoints} 处`);
+    }
     const rbAbc = outBin.toString('latin1', ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes);
-    A.check(`回读：ABC 池 API 基址已改写（${OFFICIAL.abcPairBytes} B 守恒）`, rbAbc === abc.newBytes, JSON.stringify(rbAbc));
+    if (REWRITE_ENDPOINT) {
+      A.check(`回读：ABC 池 API 基址已改写（${OFFICIAL.abcPairBytes} B 守恒）`, rbAbc === abc.newBytes, JSON.stringify(rbAbc));
+    } else {
+      const rbAbcBuf = outBin.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes);
+      const inAbcBuf = pristine.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes);
+      A.check('endpoint=none：回读 ABC 池区域 sha256 = 基线值（盘上 33 B 逐字节未动）',
+        rbAbcBuf.equals(inAbcBuf) && sha256Hex(rbAbcBuf) === sha256Hex(inAbcBuf),
+        `${sha256Hex(inAbcBuf)} -> ${sha256Hex(rbAbcBuf)}`);
+    }
     A.check('回读：guard NOP 已落盘', GUARD_MODE !== 'launch' || outBin.readUInt32LE(0xb00c) === NOP_INS, `0xb00c = ${hex(outBin.readUInt32LE(0xb00c))}`);
+    if (!REWRITE_ENDPOINT) {
+      A.check(`endpoint=none：回读 0xb00c = NOP（守卫在盘上生效，guard-mode=${GUARD_MODE}）`,
+        GUARD_MODE === 'none' ? outBin.readUInt32LE(0xb00c) === 0xb9000109 : outBin.readUInt32LE(0xb00c) === NOP_INS,
+        `0xb00c = ${hex(outBin.readUInt32LE(0xb00c))}`);
+    }
     const mhRb = parseMachOHeader(outBin);
     A.check('回读：ncmds / sizeofcmds 不变', mhRb.ncmds === OFFICIAL.ncmds && mhRb.sizeofcmds === OFFICIAL.sizeofcmds, `ncmds=${mhRb.ncmds} sizeofcmds=${mhRb.sizeofcmds}`);
     const attrBad = [], rawBad = [];
@@ -639,11 +779,22 @@ if (args.bin) {
       verdict: '官方包内不存在该字面量；137 处属于第三方已打过补丁的产物（其形态 http://0000000@…:7001）',
       officialSiteStats: { urlSites: scan.sites.length, rewriteable: rewriteableSites.length, tooShortSkipped: tooShortSites.length, lengthHistogram: scan.lengthHistogram },
     },
-    endpoint: { mode: 'url', to: String(HOST), port: String(PORT), toAuthority: TARGET, authorityLength: HOST_PORT.length, expectedLength: ENDPOINT_LENGTH },
-    apiBase: {
+    endpoint: REWRITE_ENDPOINT
+      ? { mode: 'url', to: String(HOST), port: String(PORT), toAuthority: TARGET, authorityLength: HOST_PORT.length, expectedLength: ENDPOINT_LENGTH }
+      : {
+        mode: 'none', reason: '--endpoint=none：不改写任何 URL 与 ABC 池（交给越狱 dylib 在运行期接管）',
+        hostPortIgnored: (HOST || PORT) ? HOST_PORT : null, urlSitesChanged: 0, sohuBlocked: PATCH_SOHU,
+        poolSha256Before: sha256Hex(pristine.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes)),
+        poolSha256After: sha256Hex(buf.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + OFFICIAL.abcPairBytes)),
+      },
+    apiBase: REWRITE_ENDPOINT ? {
       enabled: true, applied: abc.applied, schemeHost: `${ABC_API_SCHEME} + ${ABC_API_HOST}`,
       expectedOffset: hex(ABC_API_PAIR_OFFSET), offset: hex(abc.offset || 0), totalBytes: abc.totalBytes,
       newBytes: abc.newBytes, apiBaseUrl: abc.apiBase, reason: abc.reason,
+    } : {
+      enabled: false, applied: 0, schemeHost: `${ABC_API_SCHEME} + ${ABC_API_HOST}`,
+      expectedOffset: hex(ABC_API_PAIR_OFFSET), offset: null, totalBytes: 0,
+      newBytes: null, apiBaseUrl: null, reason: abc.reason,
     },
     guard: { mode: GUARD_MODE, offset: hex(0xb00c), applied: guards, expected: GUARD_MODE === 'launch' ? 1 : null },
     patches: {
@@ -662,5 +813,7 @@ if (args.bin) {
   const reportInfo = writeBuildReport(String(OUT), report);
   console.log(`  ${reportInfo.file}（${reportInfo.bytes} B，${A.passed.length} PASS / ${A.failed.length} FAIL）`);
   finishAssertions(A, { outPath: OUT, wroteOutput: !DRY_RUN });
-  console.log(`DONE  ${OUT}  (host=${HOST}:${PORT}; 重签: Sideloadly 用你的 Apple ID 安装时会重新签名补丁后的二进制)`);
+  console.log(REWRITE_ENDPOINT
+    ? `DONE  ${OUT}  (host=${HOST}:${PORT}; 重签: Sideloadly 用你的 Apple ID 安装时会重新签名补丁后的二进制)`
+    : `DONE  ${OUT}  (endpoint=none：URL 一处未改${HOST && PORT ? `，已忽略 --host/--port ${HOST}:${PORT}` : ''}${PATCH_SOHU ? '' : '，sohu 屏蔽亦已 --sohu-block=false 关闭'}; 重签: Sideloadly 用你的 Apple ID 安装时会重新签名补丁后的二进制)`);
 }
