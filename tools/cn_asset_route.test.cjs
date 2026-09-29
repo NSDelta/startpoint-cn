@@ -460,17 +460,39 @@ test("accepts missing or Android DEVICE and rejects explicit other platforms", a
     assert.equal("data" in rejected.json(), false)
 })
 
-test("accepts iOS DEVICE when iosCompat is enabled; unavailable when ios assets are missing", async t => {
+test("accepts iOS DEVICE when iosCompat is enabled; empty plan while ios assets are missing", async t => {
     const app = await createAssetApp({
         iosCompat: { enabled: true, apiHost: "10.0.0.5:8001", apiScheme: "http" },
     })
     t.after(() => app.close())
 
     for (const device of ["1", "ios"]) {
-        // 无 iOS 目录/实体表 → 明确不可用（不回落 Android，也不 400）
+        // 无 iOS 目录/实体表，但客户端已在快照目标版本 ⇒ 计划为空（无任何归档）
+        // ⇒ 放行 200 让客户端推进过素材检查；不回落 Android platform 归档，也不 400。
         const response = await postGetPath(app, { res_ver: "1.4.54", device })
-        assert.equal(response.statusCode, 503, `device=${device}`)
-        assert.equal(response.json().code, "IOS_ASSETS_UNAVAILABLE", `device=${device}`)
+        assert.equal(response.statusCode, 200, `device=${device}`)
+        const data = response.json().data
+        assert.equal(data.info.is_initial, false, `device=${device}`)
+        assert.equal(data.info.client_asset_version, "1.4.54", `device=${device}`)
+        assert.equal(data.full, null, `device=${device}`)
+        assert.equal(data.diff, null, `device=${device}`)
+        assert.equal(JSON.stringify(data).includes(".zip"), false, `device=${device}`)
+    }
+})
+
+test("keeps iOS assets unavailable when the plan would download archives", async t => {
+    const app = await createAssetApp({
+        iosCompat: { enabled: true, apiHost: "10.0.0.5:8001", apiScheme: "http" },
+    })
+    t.after(() => app.close())
+
+    // RES_VER 落后 ⇒ 增量计划含归档；无 RES_VER ⇒ initial 计划含 full 归档。
+    // 两者都必须 503，绝不把 Android platform 归档下发给 iOS。
+    for (const headers of [{ device: "1", res_ver: "1.4.0" }, { device: "ios", res_ver: "1.4.53" }, { device: "1" }]) {
+        const response = await postGetPath(app, headers)
+        assert.equal(response.statusCode, 503, JSON.stringify(headers))
+        assert.equal(response.json().code, "IOS_ASSETS_UNAVAILABLE", JSON.stringify(headers))
+        assert.equal("data" in response.json(), false, JSON.stringify(headers))
     }
 })
 

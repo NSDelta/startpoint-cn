@@ -348,7 +348,12 @@ function configureRuntimeHttp(config: ReturnType<typeof parseCnRuntimeConfig>): 
         httpDisplayHost: config.httpDisplayHost,
         httpPort: config.http.port,
     });
-    registerCnAssetProviderRoutes(fastify, { config: config.assetProvider });
+    // iosCompat 必须与 versionCheck/iosLeiting 一致地下传：asset 路由据此接受 iOS DEVICE 标识
+    // （DEVICE: 1 / ios）；漏传会让 iOS 客户端在 get_path 上被 400 UNSUPPORTED_PLATFORM 拒掉。
+    registerCnAssetProviderRoutes(fastify, {
+        config: config.assetProvider,
+        iosCompat: config.iosCompat,
+    });
     // iOS实验性兼容（IOS_COMPAT_ENABLED=1）：SDK裸路由与 iOS专用行为仅在启用时注册。
     // versionCheck需要运行时配置，故在 config就绪的 http阶段注册（不能早于此时）。
     fastify.register(versionCheckPlugin, { ios: config.iosCompat });
