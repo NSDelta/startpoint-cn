@@ -27,6 +27,7 @@ SpLogin_FILES = Tweak.xm \
 		SpLoginAPI.m \
 		SpLoginURLProtocol.m \
 		SpLoginTheme.m \
+		SpLoginOverlay.m \
 		SpLoginViewController.m
 
 SpLogin_FRAMEWORKS = UIKit Foundation

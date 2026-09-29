@@ -6,6 +6,7 @@
 #import "SpLoginViewController.h"
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"
+#import "SpLoginOverlay.h"
 #import "SpLoginTheme.h"
 
 typedef NS_ENUM(NSInteger, SpLoginUIState) {
@@ -49,75 +50,37 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
 
 @implementation SpLoginViewController
 
-#pragma mark - 单例式弹出
-
-+ (nullable UIViewController *)topViewController
-{
-    UIWindow *keyWindow = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) {
-                continue;
-            }
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (window.isKeyWindow) {
-                    keyWindow = window;
-                    break;
-                }
-            }
-            if (keyWindow != nil) {
-                break;
-            }
-        }
-    }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (keyWindow == nil) {
-        keyWindow = [UIApplication sharedApplication].keyWindow;
-    }
-#pragma clang diagnostic pop
-
-    UIViewController *controller = keyWindow.rootViewController;
-    while (controller.presentedViewController != nil) {
-        controller = controller.presentedViewController;
-    }
-    return controller;
-}
+#pragma mark - 打开/关闭（走独立覆盖窗口，不再走 presentViewController:）
 
 + (BOOL)presentOnKeyWindow
 {
-    UIViewController *top = [self topViewController];
-    if (top == nil) {
-        SPLoginLog(@"[SpLogin] no top view controller yet; cannot present the login panel");
-        return NO;
-    }
-    if ([top isKindOfClass:[SpLoginViewController class]]) {
-        return YES;                                            // 已经在显示，不叠第二层
-    }
-    SpLoginViewController *panel = [[SpLoginViewController alloc] init];
-    panel.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    panel.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-    [top presentViewController:panel animated:YES completion:nil];
-    SPLoginLog(@"[SpLogin] login panel presented");
-    return YES;
+    // 显示能力整体交给 SpLoginOverlay：
+    //   · 面板 view 是覆盖窗口 root 的子视图，不再弹进游戏自己的视图层级；
+    //   · 宿主（游戏）窗口还没就绪时它会把这次请求挂起，挂上后自动补开；
+    //   · 打开只是 hidden=NO，绝不抢 keyWindow（只有键盘才临时抢，编辑结束立刻归还）。
+    BOOL visible = [[SpLoginOverlay sharedOverlay] showPanel];
+    SPLoginLog(@"[SpLogin] login panel %@ (独立覆盖窗口)", visible ? @"shown" : @"pending");
+    return visible;
 }
 
 + (void)dismissIfPresented
 {
-    SpLoginViewController *panel = nil;
-    UIViewController *top = [self topViewController];
-    while (top != nil) {
-        if ([top isKindOfClass:[SpLoginViewController class]]) {
-            panel = (SpLoginViewController *)top;
-            break;
-        }
-        top = top.presentingViewController;
-    }
-    if (panel == nil) {
+    // 只藏起来、不销毁：面板实例与验证码/倒计时/轮询状态都保留，再点悬浮球即原样恢复。
+    [[SpLoginOverlay sharedOverlay] hidePanel];
+    SPLoginLog(@"[SpLogin] login panel dismissed (独立覆盖窗口)");
+}
+
+#pragma mark - 键盘避让
+
+- (void)adjustForKeyboardTop:(CGFloat)keyboardTopY
+{
+    if (self.panel == nil) {
         return;
     }
-    [panel stopTimers];
-    [panel dismissViewControllerAnimated:YES completion:nil];
+    // 用 center/bounds 算，不用 frame：被 transform 平移过的 frame 会反馈污染（面板来回抖）。
+    CGFloat overlap = CGRectGetMaxY(self.panel.bounds) - keyboardTopY;
+    CGFloat offset = (keyboardTopY > 0 && overlap > 0) ? -overlap : 0;
+    self.panel.transform = CGAffineTransformMakeTranslation(0, offset);
 }
 
 #pragma mark - 生命周期

@@ -16,6 +16,11 @@
                                 未经服主确认不擅自改。
     SPLoginAutoPresent          默认 false。启动后主动弹面板（只用于真机单点验证）。
     SPLoginAutoPresentDelay     默认 2.0 秒。
+    SPLoginFloatingButton       默认 true（= 修复后的行为）。显示常驻悬浮球（52x52、可拖动，
+                                点击开/关登录面板）。面板走独立覆盖窗口，**不依赖任何官方 UI
+                                钩子**，所以这个球是「面板一定能打开」的入口。置 false 只收起
+                                悬浮球；官方登录界面出现时的自动弹面板、SPLoginAutoPresent
+                                都不受影响（面板仍然可用，只是没有手动入口）。
 -->
 <plist version="1.0">
 <dict>
@@ -40,5 +45,7 @@
 	<false/>
 	<key>SPLoginAutoPresentDelay</key>
 	<real>2.0</real>
+	<key>SPLoginFloatingButton</key>
+	<true/>
 </dict>
 </plist>

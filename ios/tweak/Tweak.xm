@@ -3,10 +3,13 @@
 // 职责（集成者派工原文）：在 iOS 客户端启动早期把 SDK 登录相关请求/UI 接住，用于
 // **显示服务端下发的注册验证码**与「已绑定/未绑定」提示。
 //
-// 三件事，全部带 NULL 检查（钩不到就记一行日志继续跑，绝不因为类不存在而崩）：
+// 四件事，全部带 NULL 检查（钩不到就记一行日志继续跑，绝不因为类不存在而崩）：
 //   ① NSURLProtocol 注册：把 SDK 打向官方域名的请求改写到自建服务（官方 IPA 一字节不改）；
-//   ② 官方 SDK 的登录/欢迎界面出现时，弹我们自己的类游戏面板（plist 开关 SPLoginUITakeover）；
-//   ③ 可选的隐私弹窗跳过（plist 开关 SPLoginSkipPrivacyDialogs，**默认关**，红线）。
+//   ② 独立覆盖窗口 SpLoginOverlay：悬浮球 + 面板容器。**显示能力不再依赖任何官方 UI 钩子** ——
+//      在游戏进程里自建 UIWindow(windowLevel=StatusBar+100)，只用 `hidden = NO` 显示，
+//      绝不 makeKeyAndVisible（AIR 对 key 变化敏感）；面板是它的子视图，不再是 present 出来的；
+//   ③ 官方 SDK 的登录/欢迎界面出现时**自动打开**面板（plist 开关 SPLoginUITakeover）；
+//   ④ 可选的隐私弹窗跳过（plist 开关 SPLoginSkipPrivacyDialogs，**默认关**，红线）。
 //
 // ⚠️ 类名/选择器证据来源：P10-A 从官方主二进制字符串表里读到的
 //    `LTWelcomeView` / `ShowProtocolView` / `ProtocolPrivacyPopView` / `LeitingSDK`
@@ -25,6 +28,7 @@
 
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"
+#import "SpLoginOverlay.h"
 #import "SpLoginURLProtocol.h"
 #import "SpLoginViewController.h"
 
@@ -142,14 +146,19 @@ static void SpLoginInstallHooks(void)
     // ① 网络改写（先装：越早越好，SDK 一启动就会发请求）
     [SpLoginURLProtocol installIfNeeded];
 
-    // ② UI 接管
+    // ② 独立覆盖窗口：悬浮球 + 登录面板容器。**显示能力的地基**，且完全不依赖下面那些钩子
+    //    （官方类名全 miss 时悬浮球照样出现 —— 这正是本次修复的验收点）。
+    //    内部：1.5s 首挂 + UIWindowDidBecomeKeyNotification + 5s 看门狗，挂载例程幂等。
+    [[SpLoginOverlay sharedOverlay] install];
+
+    // ③ UI 接管（钩子只负责「自动打开」，打开动作本身由覆盖窗口完成，见 SpLoginOverlay）
     IMP original = NULL;
     BOOL hooked = SpLoginSwizzle([UIViewController class], @selector(viewDidAppear:),
                                  (IMP)SpLoginReplacementViewDidAppear, &original);
     sSpLoginOriginalViewDidAppear = (void (*)(id, SEL, BOOL))original;
     SPLoginLog(@"[SpLogin] hook UIViewController viewDidAppear: %@", hooked ? @"ok" : @"FAILED");
 
-    // ③ 官方 SDK 类清单（真机取证用：哪些类真的在、选择器是什么）
+    // ④ 官方 SDK 类清单（真机取证用：哪些类真的在、选择器是什么）
     for (NSString *name in @[ @"LTLoginManager", @"LeitingSDK", @"GDPRManage", @"LTWelcomeView",
                               @"ShowProtocolView", @"ProtocolPrivacyPopView" ]) {
         Class cls = NSClassFromString(name);
@@ -181,7 +190,8 @@ static void SpLoginInstallHooks(void)
         SPLoginLog(@"[SpLogin] LeitingSDK needShowPrivacy 钩不到（跳过隐私弹窗不可用，不影响主流程）");
     }
 
-    // ④ 可选：启动后主动弹面板（plist SPLoginAutoPresent，默认关；只用于真机单点验证）
+    // ⑤ 可选：启动后主动弹面板（plist SPLoginAutoPresent，默认关；只用于真机单点验证）。
+    //    面板此时可能已由悬浮球之外的路径打开，presentOnKeyWindow 是幂等的。
     SpLoginConfig *config = [SpLoginConfig sharedConfig];
     if (config.autoPresent) {
         NSTimeInterval delay = config.autoPresentDelay > 0 ? config.autoPresentDelay : 2.0;
