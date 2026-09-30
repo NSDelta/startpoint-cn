@@ -25,11 +25,39 @@ typedef NS_ENUM(NSInteger, SpLoginUIMode) {
 static const NSTimeInterval SpLoginPollInterval = 3.0;
 static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到点就提示手动重试
 
+// 皮肤层开关（plist 选填键 `SPLoginSkinEnabled`，默认 YES）。
+// 关掉时 buildViews 走「旧通用表单」那条分支：只换颜色/圆角，不改任何布局与行为。
+static BOOL SpLoginSkinEnabled(void)
+{
+    return [SpLoginConfig sharedConfig].skinEnabled;
+}
+
+#pragma mark - 皮肤层：验证码逐位显示
+
+/// 只看不写的 UILabel：业务代码写 `self.codeLabel.text = code`（这一行没动），
+/// 本子类在 setText: 里把同一个字符串拆成逐位方块。业务侧完全不知道这件事。
+@interface SpLoginCodeLabel : UILabel
+@property (nonatomic, copy, nullable) void (^sp_onTextChanged)(NSString * _Nullable text);
+@end
+
+@implementation SpLoginCodeLabel
+
+- (void)setText:(NSString *)text
+{
+    [super setText:text];
+    void (^handler)(NSString *) = self.sp_onTextChanged;
+    if (handler != nil) {
+        handler(text);
+    }
+}
+
+@end
+
 @interface SpLoginViewController () <UITextFieldDelegate>
 
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *titleLabel;
-@property (nonatomic, strong) UILabel *codeLabel;
+@property (nonatomic, strong) SpLoginCodeLabel *codeLabel;
 @property (nonatomic, strong) UILabel *countdownLabel;
 @property (nonatomic, strong) UITextField *accountField;
 @property (nonatomic, strong) UITextField *passwordField;
@@ -38,6 +66,16 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
 @property (nonatomic, strong) UIButton *secondaryButton;
 @property (nonatomic, strong) UIButton *resendButton;
 @property (nonatomic, strong) UILabel *statusLabel;
+
+// ---- 以下全部是皮肤层新增的装饰视图，不参与任何业务判定 ----
+@property (nonatomic, strong) UIView *titleBar;             // 深色标题铭牌
+@property (nonatomic, strong) UIView *titleAccent;          // 铭牌下沿的橙/红渐变描边
+@property (nonatomic, strong) UIView *codePlate;            // 验证码底板（深色）
+@property (nonatomic, strong) UIView *codeValueView;        // 逐位方块容器
+@property (nonatomic, strong) NSArray<UILabel *> *codeTiles;// 6 个方块，只做显示
+@property (nonatomic, strong) UIView *separator;            // 固定高度的分隔条
+@property (nonatomic, strong) UIView *bottomDecoration;     // 面板底缘装饰条
+@property (nonatomic, strong) UIStackView *contentStack;
 
 @property (nonatomic, assign) SpLoginUIState state;
 @property (nonatomic, assign) SpLoginUIMode mode;
@@ -72,6 +110,12 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
 
 #pragma mark - 键盘避让
 
+/// 输入框左右内边距（皮肤层的排版参数，纯视觉）。
++ (CGFloat)textInsets
+{
+    return 14.0;
+}
+
 - (void)adjustForKeyboardTop:(CGFloat)keyboardTopY
 {
     if (self.panel == nil) {
@@ -92,6 +136,12 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
     self.mode = SpLoginUIModeCreate;
     [self buildViews];
     [self applyState];
+}
+
+- (void)dealloc
+{
+    // 只清掉皮肤层自己订阅的通知，不碰键盘/轮询/网络（那些在 SpLoginOverlay 与 SpLoginAPI 里）。
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -152,10 +202,32 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
     self.countdownTimer = nil;
 }
 
+// 皮肤层固定尺寸：全部是「长什么样」的参数，改它们不影响任何行为。
+static const CGFloat SpLoginPanelWidth      = 320.0;
+static const CGFloat SpLoginPanelMaxWidth   = 360.0;
+static const CGFloat SpLoginTitleBarHeight  = 44.0;
+static const CGFloat SpLoginTitleAccentH    = 3.0;
+static const CGFloat SpLoginFooterHeight    = 30.0;   // 底缘装饰条（decoration-assets）
+static const CGFloat SpLoginCodeTileW       = 40.0;
+static const CGFloat SpLoginCodeTileH       = 50.0;
+static const CGFloat SpLoginButtonHeight    = 48.0;
+static const CGFloat SpLoginSecondaryHeight = 42.0;
+static const CGFloat SpLoginResendHeight    = 30.0;
+static const CGFloat SpLoginFieldHeight     = 44.0;
+static const CGFloat SpLoginSeparatorH      = 1.0;
+
 #pragma mark - 视图
 
 - (void)buildViews
 {
+    BOOL skin = SpLoginSkinEnabled();
+    // 小屏（iPhone SE 之类）收紧一点间距，避免面板比屏幕还高。
+    CGFloat screenH = CGRectGetHeight([UIScreen mainScreen].bounds);
+    BOOL compact = (screenH > 0.0 && screenH < 700.0);
+    CGFloat topPad     = compact ? 12.0 : 16.0;
+    CGFloat gapBig     = compact ? 14.0 : 20.0;
+    CGFloat gapField   = compact ? 8.0 : 10.0;
+
     self.view.backgroundColor = [SpLoginTheme scrim];
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
@@ -164,26 +236,117 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
     self.panel = panel;
     [self.view addSubview:panel];
 
-    UILabel *title = [self labelWithFont:[SpLoginTheme fontOfSize:20 weight:UIFontWeightSemibold]
-                                   color:[SpLoginTheme textPrimary]
+    // ---- 深色标题铭牌（token: loading.ui 的 #222222 深底 + panel.ui 的 title 位）----
+    UIView *titleBar = [[UIView alloc] initWithFrame:CGRectZero];
+    titleBar.translatesAutoresizingMaskIntoConstraints = NO;
+    titleBar.backgroundColor = [SpLoginTheme plateDark];
+    titleBar.layer.cornerRadius = [SpLoginTheme radiusPlate];
+    if (@available(iOS 11.0, *)) {
+        titleBar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    }
+    titleBar.layer.masksToBounds = YES;
+    self.titleBar = titleBar;
+    [panel addSubview:titleBar];
+
+    UIView *titleAccent = [[UIView alloc] initWithFrame:CGRectZero];
+    titleAccent.translatesAutoresizingMaskIntoConstraints = NO;
+    [SpLoginTheme applyVerticalGradient:titleAccent
+                                 colors:@[[SpLoginTheme accent], [SpLoginTheme danger]]
+                              locations:@[@0.0, @1.0]];
+    self.titleAccent = titleAccent;
+    [titleBar addSubview:titleAccent];
+
+    UILabel *title = [self labelWithFont:(skin ? [SpLoginTheme fontTitle]
+                                               : [SpLoginTheme fontOfSize:20 weight:UIFontWeightSemibold])
+                                   color:(skin ? [SpLoginTheme textOnDark] : [SpLoginTheme textPrimary])
                                    lines:1];
     title.text = @"服务器绑定";
     title.textAlignment = NSTextAlignmentCenter;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
     self.titleLabel = title;
+    [titleBar addSubview:title];
 
-    UILabel *code = [self labelWithFont:[SpLoginTheme monospacedDigitFontOfSize:40 weight:UIFontWeightBold]
-                                  color:[SpLoginTheme primary]
-                                  lines:1];
+    // ---- 验证码逐位方块（业务侧只写 codeLabel.text，方块由 sp_syncCodeTiles 跟随）----
+    UIView *codePlate = [[UIView alloc] initWithFrame:CGRectZero];
+    codePlate.translatesAutoresizingMaskIntoConstraints = NO;
+    [SpLoginTheme applyDarkPlateStyle:codePlate cornerRadius:18.0];
+    self.codePlate = codePlate;
+
+    UIView *codeValue = [[UIView alloc] initWithFrame:CGRectZero];
+    codeValue.translatesAutoresizingMaskIntoConstraints = NO;
+    self.codeValueView = codeValue;
+    [codePlate addSubview:codeValue];
+
+    SpLoginCodeLabel *code = [[SpLoginCodeLabel alloc] initWithFrame:CGRectZero];
+    code.font = [SpLoginTheme monospacedDigitFontOfSize:32.0 weight:UIFontWeightBold];
+    code.textColor = [SpLoginTheme textOnDark];
     code.textAlignment = NSTextAlignmentCenter;
+    code.numberOfLines = 1;
     code.text = @"------";
+    code.translatesAutoresizingMaskIntoConstraints = NO;
     self.codeLabel = code;
+    [codeValue addSubview:code];
 
-    UILabel *countdown = [self labelWithFont:[SpLoginTheme fontOfSize:13 weight:UIFontWeightRegular]
+    NSMutableArray<UILabel *> *tiles = [NSMutableArray arrayWithCapacity:6];
+    for (NSInteger i = 0; i < 6; i++) {
+        UILabel *tile = [[UILabel alloc] initWithFrame:CGRectZero];
+        tile.font = [SpLoginTheme codeDigitFont];
+        tile.textColor = [SpLoginTheme textOnDark];
+        tile.textAlignment = NSTextAlignmentCenter;
+        tile.backgroundColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.16];
+        tile.layer.cornerRadius = [SpLoginTheme radiusChip];
+        tile.layer.masksToBounds = YES;
+        tile.layer.borderWidth = 1.0;
+        tile.layer.borderColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.55].CGColor;
+        tile.userInteractionEnabled = NO;
+        tile.hidden = YES;
+        tile.translatesAutoresizingMaskIntoConstraints = NO;
+        [codeValue addSubview:tile];
+        [NSLayoutConstraint activateConstraints:@[
+            [tile.widthAnchor constraintEqualToConstant:SpLoginCodeTileW],
+            [tile.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
+        ]];
+        [tiles addObject:tile];
+    }
+    self.codeTiles = tiles;
+    [codeValue addConstraints:@[
+        [code.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor],
+        [code.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor],
+        [code.topAnchor constraintEqualToAnchor:codeValue.topAnchor],
+        [code.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
+    ]];
+
+    // 逐位方块用「懒惰创建 + 横向两端对齐」摆位：完全走约束，不手算 frame。
+    // 首尾两块分别贴住容器两侧，中间四块的间距由 equalSpacing 均分。
+    NSMutableArray<NSLayoutConstraint *> *tileConstraints = [NSMutableArray array];
+    UILabel *previous = nil;
+    for (UILabel *tile in tiles) {
+        [tileConstraints addObject:[tile.centerYAnchor constraintEqualToAnchor:codeValue.centerYAnchor]];
+        [tileConstraints addObject:[tile.topAnchor constraintGreaterThanOrEqualToAnchor:codeValue.topAnchor]];
+        [tileConstraints addObject:[tile.bottomAnchor constraintLessThanOrEqualToAnchor:codeValue.bottomAnchor]];
+        if (previous == nil) {
+            [tileConstraints addObject:[tile.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor]];
+        } else {
+            [tileConstraints addObject:[tile.leadingAnchor constraintGreaterThanOrEqualToAnchor:previous.trailingAnchor
+                                                                                      constant:6.0]];
+        }
+        previous = tile;
+    }
+    [tileConstraints addObject:[previous.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor]];
+    [NSLayoutConstraint activateConstraints:tileConstraints];
+
+    UILabel *countdown = [self labelWithFont:[SpLoginTheme fontCaption]
                                        color:[SpLoginTheme textSecondary]
                                        lines:1];
     countdown.textAlignment = NSTextAlignmentCenter;
     countdown.text = @"验证码会随公告下发到游戏里";
     self.countdownLabel = countdown;
+
+    UIView *separator = [[UIView alloc] initWithFrame:CGRectZero];
+    separator.translatesAutoresizingMaskIntoConstraints = NO;
+    separator.backgroundColor = [SpLoginTheme hairline];
+    separator.layer.cornerRadius = SpLoginSeparatorH * 0.5;
+    self.separator = separator;
 
     self.accountField = [self textFieldWithPlaceholder:@"QQ 号" secure:NO keyboard:UIKeyboardTypeNumberPad];
     self.passwordField = [self textFieldWithPlaceholder:@"密码" secure:YES keyboard:UIKeyboardTypeDefault];
@@ -203,76 +366,170 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
 
     UIButton *resend = [UIButton buttonWithType:UIButtonTypeCustom];
     [resend setTitle:@"重新获取验证码" forState:UIControlStateNormal];
-    [resend setTitleColor:[SpLoginTheme primary] forState:UIControlStateNormal];
-    resend.titleLabel.font = [SpLoginTheme fontOfSize:13 weight:UIFontWeightMedium];
     [resend addTarget:self action:@selector(onResendTapped) forControlEvents:UIControlEventTouchUpInside];
+    [SpLoginTheme applyLinkButtonStyle:resend];
     self.resendButton = resend;
 
-    UILabel *status = [self labelWithFont:[SpLoginTheme fontOfSize:13 weight:UIFontWeightRegular]
+    UILabel *status = [self labelWithFont:[SpLoginTheme fontCaption]
                                     color:[SpLoginTheme textSecondary]
                                     lines:0];
     status.textAlignment = NSTextAlignmentCenter;
     self.statusLabel = status;
 
-    NSArray<UIView *> *rows = @[ title, code, countdown, self.accountField, self.passwordField,
-                                 self.confirmField, primary, secondary, resend, status ];
-    for (UIView *row in rows) {
-        row.translatesAutoresizingMaskIntoConstraints = NO;
-        [panel addSubview:row];
+    // ---- 纵向内容栈。注意：UITextField 一旦进了 stack view 就会被「零间距填充」，
+    //      间距改由 stack 的 spacing 提供，所以字段没有单独的间距常量。 ----
+    UIStackView *stack = [[UIStackView alloc] initWithFrame:CGRectZero];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.alignment = UIStackViewAlignmentFill;
+    stack.spacing = gapField;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentStack = stack;
+    [panel addSubview:stack];
+    for (UIView *row in @[ codePlate, countdown, separator, self.accountField,
+                           self.passwordField, self.confirmField, primary, secondary, resend, status ]) {
+        [stack addArrangedSubview:row];
     }
-    UILayoutGuide *guide = panel.layoutMarginsGuide;
+    [stack setCustomSpacing:gapBig afterView:codePlate];
+    [stack setCustomSpacing:12.0 afterView:separator];
+    [stack setCustomSpacing:gapBig afterView:self.confirmField];
+    [stack setCustomSpacing:6.0 afterView:countdown];
+    [stack setCustomSpacing:5.0 afterView:secondary];
+
+    // ---- 底缘装饰条（token: decoration-assets/bottom_decoration_part_a|b|c）----
+    UIView *decoration = [SpLoginTheme makeBottomDecorationBarWithWidth:SpLoginPanelWidth];
+    decoration.translatesAutoresizingMaskIntoConstraints = NO;
+    self.bottomDecoration = decoration;
+    [panel addSubview:decoration];
+
+    // 160 = 面板内容的横向内边距合计；用 guide 表达，面板窄了内容跟着窄，不写死。
+    UILayoutGuide *contentGuide = [[UILayoutGuide alloc] init];
+    [panel addLayoutGuide:contentGuide];
+
+    CGFloat panelWidth = MIN(SpLoginPanelMaxWidth, CGRectGetWidth([UIScreen mainScreen].bounds) - 40.0);
+    panelWidth = MAX(panelWidth, 280.0);
+    self.accountField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.passwordField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.confirmField.translatesAutoresizingMaskIntoConstraints = NO;
+
     [NSLayoutConstraint activateConstraints:@[
         [panel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [panel.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [panel.widthAnchor constraintEqualToConstant:320.0],
+        [panel.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-8.0],
+        [panel.widthAnchor constraintEqualToConstant:panelWidth],
 
-        [title.topAnchor constraintEqualToAnchor:guide.topAnchor constant:20.0],
-        [title.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [title.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+        [titleBar.topAnchor constraintEqualToAnchor:panel.topAnchor],
+        [titleBar.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
+        [titleBar.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
+        [titleBar.heightAnchor constraintEqualToConstant:SpLoginTitleBarHeight],
 
-        [code.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:12.0],
-        [code.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [code.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+        [title.centerXAnchor constraintEqualToAnchor:titleBar.centerXAnchor],
+        [title.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
+        [title.leadingAnchor constraintGreaterThanOrEqualToAnchor:titleBar.leadingAnchor constant:12.0],
+        [title.trailingAnchor constraintLessThanOrEqualToAnchor:titleBar.trailingAnchor constant:-12.0],
 
-        [countdown.topAnchor constraintEqualToAnchor:code.bottomAnchor constant:6.0],
-        [countdown.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [countdown.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+        [titleAccent.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
+        [titleAccent.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
+        [titleAccent.bottomAnchor constraintEqualToAnchor:titleBar.bottomAnchor],
+        [titleAccent.heightAnchor constraintEqualToConstant:SpLoginTitleAccentH],
 
-        [self.accountField.topAnchor constraintEqualToAnchor:countdown.bottomAnchor constant:18.0],
-        [self.accountField.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [self.accountField.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [self.accountField.heightAnchor constraintEqualToConstant:44.0],
+        [decoration.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
+        [decoration.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
+        [decoration.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor],
+        [decoration.heightAnchor constraintEqualToConstant:SpLoginFooterHeight],
 
-        [self.passwordField.topAnchor constraintEqualToAnchor:self.accountField.bottomAnchor constant:10.0],
-        [self.passwordField.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [self.passwordField.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [self.passwordField.heightAnchor constraintEqualToConstant:44.0],
+        [contentGuide.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor constant:12.0],
+        [contentGuide.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor constant:-12.0],
+        [contentGuide.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:topPad],
+        [contentGuide.bottomAnchor constraintEqualToAnchor:decoration.topAnchor constant:-topPad],
 
-        [self.confirmField.topAnchor constraintEqualToAnchor:self.passwordField.bottomAnchor constant:10.0],
-        [self.confirmField.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [self.confirmField.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [self.confirmField.heightAnchor constraintEqualToConstant:44.0],
+        [stack.leadingAnchor constraintEqualToAnchor:contentGuide.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:contentGuide.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:contentGuide.topAnchor],
 
-        [primary.topAnchor constraintEqualToAnchor:self.confirmField.bottomAnchor constant:16.0],
-        [primary.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [primary.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [primary.heightAnchor constraintEqualToConstant:48.0],
+        [codeValue.leadingAnchor constraintEqualToAnchor:codePlate.leadingAnchor constant:10.0],
+        [codeValue.trailingAnchor constraintEqualToAnchor:codePlate.trailingAnchor constant:-10.0],
+        [codeValue.topAnchor constraintEqualToAnchor:codePlate.topAnchor constant:12.0],
+        [codeValue.bottomAnchor constraintEqualToAnchor:codePlate.bottomAnchor constant:-12.0],
 
-        [secondary.topAnchor constraintEqualToAnchor:primary.bottomAnchor constant:10.0],
-        [secondary.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [secondary.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [secondary.heightAnchor constraintEqualToConstant:44.0],
+        [separator.heightAnchor constraintEqualToConstant:SpLoginSeparatorH],
 
-        [resend.topAnchor constraintEqualToAnchor:secondary.bottomAnchor constant:8.0],
-        [resend.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [resend.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [resend.heightAnchor constraintEqualToConstant:28.0],
-
-        [status.topAnchor constraintEqualToAnchor:resend.bottomAnchor constant:12.0],
-        [status.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [status.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [status.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor constant:-18.0],
+        [self.accountField.heightAnchor constraintEqualToConstant:SpLoginFieldHeight],
+        [self.passwordField.heightAnchor constraintEqualToConstant:SpLoginFieldHeight],
+        [self.confirmField.heightAnchor constraintEqualToConstant:SpLoginFieldHeight],
+        [primary.heightAnchor constraintEqualToConstant:SpLoginButtonHeight],
+        [secondary.heightAnchor constraintEqualToConstant:SpLoginSecondaryHeight],
+        [resend.heightAnchor constraintEqualToConstant:SpLoginResendHeight],
     ]];
+
+    if (skin) {
+        // 逐位方块视觉：codeLabel.text 一变就刷新（业务侧那一行没动）。
+        __weak typeof(self) weakSelf = self;
+        self.codeLabel.sp_onTextChanged = ^(NSString *text) {
+            __strong typeof(self) strongSelf = weakSelf;
+            [strongSelf sp_syncCodeTilesWithText:text];
+        };
+        [self sp_syncCodeTilesWithText:self.codeLabel.text];
+        // 输入框聚焦描边（纯 layer：不缓存子视图树，所以光标与键盘行为一字不改）
+        for (UITextField *field in @[ self.accountField, self.passwordField, self.confirmField ]) {
+            [field addTarget:self action:@selector(sp_fieldEditingBegan:)
+            forControlEvents:UIControlEventEditingDidBegin];
+            [field addTarget:self action:@selector(sp_fieldEditingEnded:)
+            forControlEvents:UIControlEventEditingDidEnd];
+        }
+    } else {
+        // 皮肤关掉：收掉所有装饰，回到「只有标题 + 控件」的通用表单。
+        self.codeLabel.hidden = YES;
+        self.codeLabel.sp_onTextChanged = nil;
+        for (UILabel *tile in tiles) {
+            tile.hidden = YES;
+        }
+        [self sp_setDecorationsHidden:YES];
+    }
+
+    SPLoginLog(@"[SpLogin] panel skin=%@ compact=%@ width=%.0f（纯外观层，业务未变）",
+               skin ? @"on" : @"off", compact ? @"yes" : @"no", panelWidth);
+}
+
+/// 装饰视图整体开关（皮肤关掉时用）。只切 hidden，不动任何业务控件。
+- (void)sp_setDecorationsHidden:(BOOL)hidden
+{
+    self.titleBar.backgroundColor = hidden ? [SpLoginTheme primary] : [SpLoginTheme plateDark];
+    self.titleLabel.textColor = hidden ? [SpLoginTheme textOnDark] : self.titleLabel.textColor;
+    self.titleAccent.hidden = hidden;
+    self.codePlate.backgroundColor = hidden ? UIColor.clearColor : [SpLoginTheme plateDark];
+    self.bottomDecoration.hidden = hidden;
+    self.separator.hidden = hidden;
+}
+
+/// 把 `codeLabel.text` 映射到 6 个方块。等宽字体 + 固定格宽 ⇒ 逐位对齐、不跳动。
+- (void)sp_syncCodeTilesWithText:(NSString *)text
+{
+    NSString *digits = @"";
+    if ([text isKindOfClass:[NSString class]]) {
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        digits = [[text componentsSeparatedByCharactersInSet:nonDigits] componentsJoinedByString:@""];
+    }
+    if (digits.length > 6) {
+        digits = [digits substringToIndex:6];
+    }
+    BOOL showing = (digits.length == 6);
+    for (NSInteger i = 0; i < self.codeTiles.count; i++) {
+        UILabel *tile = self.codeTiles[(NSUInteger)i];
+        tile.hidden = !showing;
+        tile.text = (showing && i < (NSInteger)digits.length)
+            ? [digits substringWithRange:NSMakeRange((NSUInteger)i, 1)]
+            : @"";
+    }
+    self.codeLabel.hidden = showing;
+}
+
+- (void)sp_fieldEditingBegan:(UITextField *)field
+{
+    [SpLoginTheme setFieldFocused:field focused:YES];
+}
+
+- (void)sp_fieldEditingEnded:(UITextField *)field
+{
+    [SpLoginTheme setFieldFocused:field focused:NO];
 }
 
 - (UILabel *)labelWithFont:(UIFont *)font color:(UIColor *)color lines:(NSInteger)lines
@@ -293,13 +550,11 @@ static const NSInteger SpLoginPollLimit = 100;   // 3s × 100 ≈ 5 分钟；到
     field.autocapitalizationType = UITextAutocapitalizationTypeNone;
     field.autocorrectionType = UITextAutocorrectionTypeNo;
     field.borderStyle = UITextBorderStyleNone;
-    field.backgroundColor = [UIColor whiteColor];
-    field.textColor = [SpLoginTheme textPrimary];
-    field.font = [SpLoginTheme fontOfSize:15 weight:UIFontWeightRegular];
-    field.layer.cornerRadius = [SpLoginTheme radiusField];
-    field.layer.borderWidth = 1.0;
-    field.layer.borderColor = [SpLoginTheme hairline].CGColor;
-    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 0)];
+    // 外观整体交给皮肤层（底/描边/圆角/内边距/聚焦态）。行为部分（delegate、
+    // returnKeyType、键盘类型、左右视图）仍在下面照旧设置，一个字没改。
+    [SpLoginTheme applyFieldStyle:field];
+    CGFloat inset = [SpLoginViewController textInsets];
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, inset, 0)];
     field.leftViewMode = UITextFieldViewModeAlways;
     field.delegate = self;
     field.returnKeyType = UIReturnKeyDone;

@@ -29,6 +29,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// 悬浮球是「不依赖任何官方 UI 钩子也能打开面板」的入口；关掉只收起这个入口，
 /// 官方登录界面出现时的自动弹面板与 autoPresent 都不受影响。
 @property (nonatomic, readonly) BOOL floatingButton;
+/// **游戏化皮肤开关（plist: SPLoginSkinEnabled，默认 YES）**。
+/// 这是纯外观开关：关掉只是把面板/悬浮球退回「素色通用表单」的样子，
+/// 与网络改写、验证码、轮询、绑定状态等业务行为**没有任何关系**。
+/// 加这个键是为了真机上万一皮肤在小屏/横屏下不好看，能不改代码先退回旧观感。
+@property (nonatomic, readonly) BOOL skinEnabled;
 /// 越狱根：rootless = "/var/jb"，传统 = ""
 @property (nonatomic, copy, readonly) NSString *jailbreakRoot;
 
