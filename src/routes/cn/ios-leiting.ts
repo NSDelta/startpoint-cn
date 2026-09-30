@@ -770,6 +770,48 @@ export default async function iosLeitingRoutes(
         return reply.type("application/json").send({ code: 0 })
     })
 
+    // ── 平台/设备埋点裸路由：最小无副作用吞掉 ────────────────────────────────
+    // 依据：真机取证 2026-09-29 12:59:58（iPhone 7 Plus / iOS 15.8.3，客户端为局域网内手机，
+    // 地址按仓库隐私约定以 <LAN_IP> 占位，见 scripts/check-hygiene.sh 的 IP_RE/IP_ALLOW）
+    // 共 35 条请求落在未知路由 404 上，其中下面 4 条占 27 条 —— 全部是**平台侧埋点**，
+    // 不参与游戏进度，客户端对响应体只做「成功/失败」判断（同族端点在我们这里都回
+    // `{code:0}` 且真机 200，见 ios-leiting 既有 /logmonitor、/api/skan、MG_LOG_PATHS）。
+    //
+    // 取证原行（D:\wfcnmod\tmp\server-lan.log，UTF-16LE；同内容见 server-log-phone.txt）：
+    //   POST /behavior_log/report        12x -> 404
+    //   GET  /api/micro/micro_red/enter_position?channelNo=210009&game=wf&token=(null)&userId=(null)  8x -> 404
+    //   POST /api/device/report           4x -> 404
+    //   POST /api/iplog/report            3x -> 404
+    //
+    // 边界（务必保持）：
+    //  1. **不读身份**。`enter_position` 的 `token`/`userId` 真机上是字面串 `(null)`
+    //     （客户端 Leiting SDK extension 未赋值的属性被 `%@` 打印成 `(null)`），即该请求
+    //     不带任何可用于关联玩家的凭据。因此这里一律不解析账号、不查库、不落库 ——
+    //     否则会重蹈 load.ts:208-215 注释里「未认证 viewer_id 被当账号」的覆辙。
+    //  2. **不读 body**。埋点体形状未知（8001 抓头代理 capture.jsonl 里没有这 4 条的记录），
+    //     纯吞掉 ⇒ body 解析失败也绝不影响响应（Fastify 默认 JSON/urlencoded 解析器）。
+    //  3. `protocols/leiting/sensitive/part/*.txt` **故意不在**这里实现：它是已定稿决策
+    //     （tools/ios_leiting_route.test.cjs:267-278「remain unavailable without
+    //     authoritative payloads」+ tools/combined_startup.test.cjs:124-126
+    //     「协议版本文件没有权威 payload，保持未实现」），没有权威 payload 前必须继续 404。
+    const telemetryAck = { code: 0 } as const
+    for (const route of [
+        "/behavior_log/report",
+        "/api/device/report",
+        "/api/iplog/report",
+    ] as const) {
+        fastify.post(route, async (_request, reply) => {
+            return reply.type("application/json").send(telemetryAck)
+        })
+    }
+
+    // 社区入口（micro_red）：同族端点（/logmonitor、/api/skan）回 `{code:0,data:{}}`，
+    // 形状保持一致。**未验证**：客户端是否据 `data` 里的字段决定跳转社区页（静态判不了），
+    // 空 `data` 是最保守的选择；若真机出现「点了社区没反应/白页」，先怀疑这里。
+    fastify.get("/api/micro/micro_red/enter_position", async (_request, reply) => {
+        return reply.type("application/json").send({ code: 0, data: {} })
+    })
+
     // Leiting SDK 登录 mock（任何凭据都接受，但身份**按设备派生**）
     for (const p of iosLoginPaths) {
         fastify.all(p, (request, reply) => {
