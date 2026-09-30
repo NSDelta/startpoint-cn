@@ -26,8 +26,9 @@
 | `SpLoginConfig.h/.m` | 配置读取（编译期常量 > plist 覆写）+ 日志（NSLog + 落盘） |
 | `SpLoginURLProtocol.h/.m` | 把 SDK 打向 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com` 的请求改写到自建服务 |
 | `SpLoginAPI.h/.m` | `/sp-auth/*` 客户端（契约见分工文档 §3.2）+ 从出站请求体里嗅探 `device_id` |
-| `SpLoginTheme.h/.m` | 官方样式 token 的 Objective-C 投影（与 P6 Android 页共用同一份 token） |
+| `SpLoginTheme.h/.m` | 官方样式 token 的 Objective-C 投影（与 P6 Android 页共用同一份 token）。**2026-09-30 起是游戏化皮肤的唯一样式来源**，见第 8 节 |
 | `SpLoginViewController.h/.m` | 类游戏登录面板本体（状态机与 `ios/prototype/index.html` 一致）；由覆盖窗口当子 VC 承载，不再自己弹自己。**续轮询入口** `sp_resumeFromStoredTokenIfNeeded` 见第 5 节 |
+| `docs/preview.html` | **静态外观预览**（纯 HTML/CSS，非真机渲染）：[打开预览](docs/preview.html)。本机没有 Theos/Xcode，跑不了模拟器，用它先看个大概 |
 | `layout/DEBIAN/postinst`、`prerm` | 安装/卸载提示（纯 echo，不改系统文件） |
 
 ## 2. 构建 `[部分已验证-CI]`
@@ -100,6 +101,7 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 | `SPLoginAutoPresent` | `false` | 启动后主动弹面板（只用于真机单点验证面板本身） |
 | `SPLoginAutoPresentDelay` | `2.0` | 上面那个的延迟秒数 |
 | `SPLoginFloatingButton` | `true` | 显示常驻悬浮球（52×52、可拖动，点击开/关面板）。**默认值就是修复后的行为**；置 `false` 只收起这个手动入口，面板本身与「官方界面出现时自动打开」都不受影响 |
+| `SPLoginSkinEnabled` | `true` | **纯外观开关（第 8 节）**：`true` = 世界弹射物语风格皮肤；`false` = 退回改动前的素色表单（同一个 VC、同一套业务）。与上面任何一个键的语义都没有交叉，改它不会影响绑定/轮询/显示与否 |
 
 ## 5. 悬浮窗（独立覆盖窗口）机制
 
@@ -264,3 +266,86 @@ grep -E 'windows=\[' "$L"                               # 那一刻扫到的窗�
   `SPLoginUITakeover` 设成 `false` 退回「只做网络改写」，然后回报。
 - `NSURLProtocol` 只拦得到 `NSURLSession`/`NSURLConnection` 的请求；如果 SDK 某条链路走
   CFNetwork 裸 socket，那条请求不会被改写（真机上表现为某个接口连不上官方域名）。
+
+## 8. 游戏化皮肤（2026-09-30）
+
+服主要求（原话）：「**我说的是技术参考，不代表 ui 参考**」——所以参考实现的视觉一律不抄，
+皮肤的**唯一设计真值**是 `D:\wfcnmod\ios-ui-kit\style-tokens.json`（从官方 `.ui` 预制件里抽出来的
+颜色/圆角/发光/阴影/字号），本目录只做「参数化复刻」，不发明配色。
+
+**先看效果**：[`docs/preview.html`](docs/preview.html)（纯 HTML/CSS 静态预览，非真机渲染）。
+
+### 8.1 皮肤到底改了哪几层
+
+| 层 | 文件 | 改了什么 | 没改什么 |
+| --- | --- | --- | --- |
+| 样式常量 | `SpLoginTheme.h/.m` | 整表按官方 token 重写：色板、圆角（32/24/18/12/8）、发光 6、阴影 20/4、字号阶（22/19/15/13 + 等宽 30） | 类名与既有方法签名全部保留，调用方零改动 |
+| 面板 | `SpLoginViewController.m` | `buildViews` 的**布局与装饰**：深色标题条 + 橙→红渐变分隔、深色验证码底板 + 6 个数字方块、按钮/输入框皮肤、底部装饰弧 | 状态机、`applyState`、全部中文话术、轮询/绑定/续轮询调用链 |
+| 悬浮球 / 动画 | `SpLoginOverlay.m` | 球外观（径向渐变 + 描边 + 发光 + 内高光）、1.7 s 呼吸、按压反馈、面板入场（0.26 s 弹簧）/出场（0.16 s） | 窗口层级、`hidden = NO`、穿透、保活三路、键盘借还、`hostWindow` 记录 |
+
+开关：`SPLoginSkinEnabled`（第 4 节），默认 `true`；置 `false` 会走「素色表单」分支
+（隐藏数字方块与装饰、标题条退回主色底），**同一个 VC、同一套业务**，用于小屏/横屏观感不对时的
+免重编退路。动画另有系统级尊重：设备开了「减弱动态效果」(`UIAccessibilityIsReduceMotionEnabled()`)
+时不加动画。
+
+### 8.2 用了哪些官方 token（原值，一个没改）
+
+- 主色 `#2EC4B6`、危险 `#EA3553`、强调 `#FF9F1C`、信息 `#55ACEE`；
+  正文 `#444444`、次级 `#515151`、禁用 `#C9C9C9`、分隔线 `#DDDDDD`；
+  面板底 `#FAFAFA`、内嵌底 `#EAEAEA`、深底 `#222222`。
+- 圆角与发光直接照抄官方素材命名规范 `color<RRGGBB>_round<n>_glow<n>_shadow<n>`：
+  主按钮对应 `color2ec4b6_round24_glow6_shadow20`、次按钮对应 `colorea3553_round24_glow6_shadow20`、
+  卡片对应 `colorfafafa_round32_shadow8`、禁用对应 `colorc9c9c9_round24_glow6_shadow20`、
+  圆形按钮对应 `color<RRGGBB>_radius64_glow6_shadow8`。
+- 字号：官方包内**没有 TTF/OTF**（走 XML 位图字体 `size24_medium_ffffff` / `size30_ffffff_bold` /
+  `size32_fafafa`），所以阶 1 用系统字体按同一批数值近似：22 semibold（标题）、19 semibold（按钮）、
+  15（正文/输入）、13（说明）、30 等宽 bold（验证码数字）。
+
+### 8.3 补了哪些值，依据是什么
+
+`style-tokens.json` 里没有、但面板必须有的，逐条列出（**都在 `SpLoginTheme.h` 顶部注释里同步标了**）：
+
+| 补的值 | 用途 | 依据 |
+| --- | --- | --- |
+| `plateDark = #2A2F35` | 标题条底色、验证码底板 | token 里的深底只有 `0x222222`（官方 `color222222_round4_shadow8`），那是纯黑面板底；`0x444444` 又是正文色，当底太亮。取两者之间、偏冷的深灰，仍是同一套中性色阶 |
+| `textOnDark = 白` / `textOnDarkSecondary = 白@72%` | 深底上的文字 | 官方位图字体名 `size24_medium_ffffff` / `size30_ffffff_bold` 的 `ffffff` 就是白字配深底 |
+| `primaryGlow:` / `dangerGlow:` | 按钮与球的发光层 | 官方素材带 `glow6`，等价于「主色 55% 不透明度、半径 6」的辉光；这是发光层不透明度，不是新配色 |
+| `+primary` 的浅色渐变端（预览里的 `#4AD6C9`/`#55D8CC`） | 按钮/球的上下渐变高光 | `panel.ui`、`general_button.ui` 的 bg-asset 九宫格有上亮下暗的分层；高光端由主色向白提亮固定比例算出，**不引入新色相** |
+| `radiusChip = 12` | 验证码数字方块 | 官方圆角阶只有 18/24/32/64；方块是新增控件，取 18 的下半档，视觉上仍是「圆角矩形」而非胶囊 |
+| `shadowRadiusSoft = 4`、`hairlineWidth = 1` | 输入框/分隔线的轻阴影与 1px 描边 | 官方 `colorfafafa_round24_shadow4` 就是 shadow 4 档；1pt 描边是 iOS 上最小可见线宽 |
+
+### 8.4 皮肤层**没有**碰的东西（就是「只是外观变了」的清单）
+
+- 业务调用链（逐字未动）：`+presentOnKeyWindow`、`+dismissIfPresented`、`-adjustForKeyboardTop:`、
+  `-viewDidAppear:`、`-sp_resumeFromStoredTokenIfNeeded`、`-viewDidDisappear:`、`-stopTimers`、
+  `-applyState`、`-failWithCode:message:`、`-onPrimaryTapped`、`-onSecondaryTapped`、`-onResendTapped`、
+  `-consumeSubscribeData:`、`-parseExpiry:`、`-startCountdown`、`-tickCountdown`、`-startPolling`、
+  `-refreshBindStatus`、`-enterSuccess`、`-onBackToGameTapped`、`-textFieldShouldReturn:`；
+  以及 `SpLoginAPI.*`、`SpLoginURLProtocol.*`、`Tweak.xm`（**一个字节都没动**）。
+- 面板结构复用：面板始终是覆盖窗口的子 VC（`addChildViewController:`），
+  **没有回退到 `presentViewController:`**。
+- 人话：验证码从哪儿来、什么时候轮询、绑定成功了怎么判、错误码怎么显示，全部与改前一致；
+  改的只有「长什么样、动起来什么样」。唯一新增的数据流是**只读**的：`SpLoginCodeLabel` 重写
+  `-setText:`，把业务已经写进 `codeLabel` 的字符串同步给 6 个方块（业务侧那行 `self.codeLabel.text = code`
+  一个字没改）。
+- 新增的日志（用于真机判读皮肤是否真的生效）：
+  `panel skin=%d compact=%d width=%.0f（纯外观层，业务未变）`、
+  `skin: 悬浮球呼吸动画已开（1.7s 循环，仅 transform）`、
+  `skin: 面板入场动画（0.26s 弹簧，仅 transform/alpha）`。
+  一条命令看全：`grep -E 'overlay|skin|panel' /var/jb/var/mobile/Library/Logs/SpLogin.log | tail -40`
+  （传统越狱把 `/var/jb` 去掉）。
+
+### 8.5 皮肤层的未验证清单 `[未验证-需真机]`
+
+本机没有 Theos/Xcode，**下面这些只能装机看**（已由 CI 证明的只是「编译得过、包打得出」）：
+
+1. **好不好看**：`docs/preview.html` 是 CSS 复刻，真机上的字重、发光、阴影强度可能偏轻/偏重；
+   深色标题条上的白字在 iPhone 7 Plus 的低亮度屏上是否够清晰，没看过。
+2. **动画是否顺畅（iOS 15.8.3 / iPhone 7 Plus）**：A10 上 0.26 s 弹簧 + 1.7 s 循环呼吸同时跑，
+   会不会掉帧；呼吸动画用的是 `transform.scale`（不进 layout），理论上便宜，但没实测。
+3. **悬浮球在游戏全屏/横屏下的位置**：球初始在右上（`top = 140`，`right = 12`），拖动被
+   `sp_clampBallInsideRoot:` 限制在根视图内；游戏若横屏，球会不会落在某个必须点的 UI 上，未知。
+4. **键盘弹出时面板位移是否自然**：面板出场动画会先取当前 `transform` 再叠加，理论上不会和
+   `adjustForKeyboardTop:` 打架；但「动画进行中正好弹键盘」这个重叠时刻没实测过。
+5. **`SPLoginSkinEnabled = false` 的退路**：这条分支只做了「隐藏装饰」，真机上素色表单的观感
+   没有重新确认过（原素色表单本身是改前的样子，逻辑上等价）。

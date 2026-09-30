@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpLogin 游戏化皮肤 · 静态预览（非真机渲染）</title>
+<!--
+  SpLogin 游戏化皮肤的静态外观预览。
+
+  ⚠️ 这不是 UIKit 的真实渲染 —— 本机（Windows）没有 Theos / Xcode，跑不了模拟器。
+  这个文件用与 SpLoginTheme.h/.m **同一批色值/圆角/字号**，把面板结构与悬浮球按
+  CSS 复刻出来，只为让服主在装真机之前先看一眼「大概长这样」。
+  真机观感、动画流畅度、字体实际字重仍需真机确认（见 ../README.md 的未验证清单）。
+
+  色值来源：D:\wfcnmod\ios-ui-kit\style-tokens.json（官方 .ui 预制件抽取，只读真值），
+  补值项在 ../README.md「补了哪些值」一节逐条列出。
+-->
+<style>
+  :root{
+    /* ---- 官方 token（style-tokens.json 原值，未改） ---- */
+    --sp-primary:#2EC4B6;      /* 主色：青绿 */
+    --sp-danger:#EA3553;       /* 危险/次色：红 */
+    --sp-accent:#FF9F1C;       /* 强调：橙 */
+    --sp-blue:#55ACEE;         /* 信息：蓝 */
+    --sp-ink:#444444;          /* 正文（dialog_template.ui / panel.ui / general_menu.ui） */
+    --sp-ink-2:#515151;        /* 次级文字 */
+    --sp-disabled:#C9C9C9;     /* 禁用 */
+    --sp-hairline:#DDDDDD;     /* 分隔线 */
+    --sp-surface:#FAFAFA;      /* 面板底 */
+    --sp-surface-muted:#EAEAEA;/* 内嵌底 */
+    --sp-white:#FFFFFF;
+    /* ---- 派生/补值（README 有依据说明） ---- */
+    --sp-plate:#2A2F35;        /* 深色标题条（补值：官方深底 0x222222 偏黑，标题条用略亮的深灰） */
+    --sp-on-dark:rgba(255,255,255,1);
+    --sp-on-dark-2:rgba(255,255,255,.72);
+    /* ---- 几何（与 SpLoginTheme 常量一致） ---- */
+    --r-panel:32px; --r-btn:24px; --r-field:18px; --r-chip:12px; --r-plate:8px;
+    --glow:6px;
+    /* ---- 游戏背景：仅仅是把面板衬出来，不代表游戏画面 ---- */
+    --game-bg-1:#1d2a3a; --game-bg-2:#0e151d;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; padding:28px 18px 60px;
+    font:15px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    color:#e8eef5;
+    background:radial-gradient(120% 90% at 50% 0%,var(--game-bg-1),var(--game-bg-2) 70%) fixed;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1{font-size:20px;font-weight:600;margin:0 0 4px}
+  h2{font-size:15px;font-weight:600;margin:34px 0 10px;color:#9fb3c8;letter-spacing:.04em}
+  .sub{color:#8fa3b8;font-size:13px;margin:0 0 24px;max-width:820px}
+  .warn{color:#ffd08a;background:rgba(255,159,28,.10);border:1px solid rgba(255,159,28,.35);
+        border-radius:12px;padding:10px 14px;font-size:13px;max-width:820px;margin:0 0 22px}
+  .stage{display:flex;gap:34px;flex-wrap:wrap;align-items:flex-start}
+
+  /* ============ 手机外框 ============ */
+  .phone{
+    position:relative;width:375px;height:812px;flex:0 0 auto;border-radius:44px;
+    background:#05080c;border:9px solid #232a33;box-shadow:0 24px 60px rgba(0,0,0,.55);
+    overflow:hidden;
+  }
+  .screen{
+    position:absolute;inset:0;border-radius:35px;overflow:hidden;
+    background:
+      radial-gradient(90% 55% at 50% 8%,rgba(46,196,182,.20),transparent 60%),
+      radial-gradient(70% 40% at 80% 90%,rgba(234,53,83,.14),transparent 60%),
+      linear-gradient(180deg,#20304a,#0d141c 72%);
+  }
+  /* 假装是游戏首页的装饰文字，只用来把遮罩/对比度衬出来 */
+  .game-hint{position:absolute;left:0;right:0;bottom:54px;text-align:center;color:rgba(255,255,255,.30);
+             font-size:13px;letter-spacing:.22em}
+  .game-title{position:absolute;left:0;right:0;top:96px;text-align:center;color:rgba(255,255,255,.42);
+              font-size:26px;font-weight:700;letter-spacing:.14em}
+
+  /* 遮罩：SpLoginTheme.scrim —— 官方弹窗背后压暗的那一层 */
+  .scrim{position:absolute;inset:0;background:rgba(20,24,28,.42);backdrop-filter:blur(1px)}
+
+  /* ============ 面板 ============ */
+  .panel{
+    position:absolute;left:50%;top:50%;width:320px;max-width:calc(100% - 40px);
+    transform:translate(-50%,calc(-50% - 8px));
+    background:var(--sp-surface);border-radius:var(--r-panel);
+    box-shadow:0 10px 20px rgba(0,0,0,.18);
+    overflow:hidden;                 /* 只是为了预览把子块裁进圆角 */
+    color:var(--sp-ink);
+  }
+  /* 标题条：深色 plate + 底部橙→红渐变条（官方 take_over.ui 的 header 观感） */
+  .titlebar{position:relative;height:44px;background:var(--sp-plate);display:flex;align-items:center;
+            justify-content:center;border-radius:var(--r-plate) var(--r-plate) 0 0}
+  .titlebar h3{margin:0;font-size:22px;font-weight:600;color:var(--sp-white);letter-spacing:.06em}
+  .title-accent{position:absolute;left:0;right:0;bottom:0;height:3px;
+                background:linear-gradient(90deg,var(--sp-accent),var(--sp-danger))}
+
+  .content{padding:16px 12px 16px}
+
+  /* 验证码深色底板：codePlate */
+  .plate{background:var(--sp-plate);border-radius:var(--r-chip);padding:12px 10px;position:relative;
+         box-shadow:inset 0 0 0 1px rgba(46,196,182,.35)}
+  .plate .cap{color:var(--sp-on-dark-2);font-size:13px;text-align:center;margin-bottom:8px}
+  .tiles{display:flex;gap:6px;justify-content:center}
+  .tile{
+    width:40px;height:50px;border-radius:var(--r-chip);
+    background:rgba(46,196,182,.16);border:1px solid rgba(46,196,182,.55);
+    display:flex;align-items:center;justify-content:center;
+    color:var(--sp-white);font:700 30px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    text-shadow:0 0 6px rgba(46,196,182,.55);
+  }
+  /* 未拿到验证码时：显示等宽占位 ------ （与代码里的 codeLabel 一致） */
+  .code-plain{color:var(--sp-white);font:700 30px/1 ui-monospace,Menlo,monospace;text-align:center;
+              letter-spacing:.18em;text-shadow:0 0 6px rgba(46,196,182,.45)}
+  .countdown{margin-top:6px;text-align:center;color:var(--sp-ink-2);font-size:13px}
+  .sep{height:1px;background:var(--sp-hairline);margin:12px 0}
+
+  /* 输入框：白底 + 18 圆角 + 1pt 描边；聚焦态描边换成主色 */
+  .field{
+    height:44px;border-radius:var(--r-field);background:var(--sp-white);
+    border:1px solid var(--sp-hairline);display:flex;align-items:center;padding:0 14px;
+    color:var(--sp-ink);font-size:15px;margin-bottom:10px;
+  }
+  .field.focused{border-color:var(--sp-primary);box-shadow:0 0 0 3px rgba(46,196,182,.16)}
+  .field .ph{color:#9aa3ab}
+  .field.last{margin-bottom:0}
+
+  /* 按钮：官方 general_button.ui 的 round24 + glow6 + shadow20 观感 */
+  .btn{
+    height:48px;border-radius:var(--r-btn);border:0;width:100%;
+    display:flex;align-items:center;justify-content:center;
+    font:600 19px/1 -apple-system,"PingFang SC",system-ui,sans-serif;
+    color:var(--sp-white);position:relative;cursor:default;
+  }
+  .btn.primary{background:linear-gradient(180deg,#4AD6C9,var(--sp-primary));
+               box-shadow:0 4px 20px rgba(46,196,182,.45),inset 0 0 0 6px rgba(255,255,255,.10)}
+  .btn.secondary{height:42px;background:linear-gradient(180deg,#F2556E,var(--sp-danger));
+                 box-shadow:0 4px 16px rgba(234,53,83,.35),inset 0 0 0 6px rgba(255,255,255,.10)}
+  .btn.disabled{background:var(--sp-disabled);color:#fff;box-shadow:none}
+  .btn.link{height:30px;background:transparent;color:var(--sp-accent);font-size:13px;font-weight:500}
+  .btn.plain{height:30px;background:transparent;color:var(--sp-ink-2);font-size:13px;font-weight:500}
+  .gap-16{height:20px}.gap-14{height:14px}.gap-8{height:8px}.gap-5{height:5px}
+
+  .status{text-align:center;font-size:13px;color:var(--sp-ink-2);margin-top:12px;line-height:1.5}
+  .status.ok{color:var(--sp-primary)}
+
+  /* 底部装饰：官方 decoration-assets/bottom_decoration 的三段式弧线，用 CSS 近似 */
+  .decoration{position:relative;height:30px;overflow:hidden}
+  .decoration i{position:absolute;bottom:-19px;width:64px;height:64px;border-radius:50%;
+                border:2px solid rgba(46,196,182,.30);display:block}
+  .decoration i:nth-child(1){left:50%;margin-left:-108px}
+  .decoration i:nth-child(2){left:50%;margin-left:-32px;border-color:rgba(255,159,28,.34)}
+  .decoration i:nth-child(3){left:50%;margin-left:44px}
+
+  /* ============ 悬浮球 ============ */
+  .ball{
+    position:absolute;right:12px;top:140px;width:52px;height:52px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    color:var(--sp-white);font:700 22px/1 -apple-system,"PingFang SC",system-ui,sans-serif;
+    background:
+      radial-gradient(circle at 32% 26%,rgba(255,255,255,.55),rgba(255,255,255,0) 46%),
+      linear-gradient(180deg,#55D8CC,var(--sp-primary));
+    border:1px solid rgba(255,255,255,.65);
+    box-shadow:0 0 0 1px rgba(46,196,182,.55),0 0 6px 2px rgba(46,196,182,.55),0 8px 20px rgba(0,0,0,.35);
+    animation:breathe 1.7s ease-in-out infinite;
+  }
+  @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.045)}}
+  .ball-hint{position:absolute;right:74px;top:154px;color:rgba(255,255,255,.55);font-size:12px}
+
+  /* ============ 右侧：状态图 + 色卡 ============ */
+  .col{display:flex;flex-direction:column;gap:22px;min-width:320px;flex:1 1 340px;max-width:520px}
+  .card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px 18px}
+  .card h4{margin:0 0 10px;font-size:13px;color:#9fb3c8;font-weight:600;letter-spacing:.04em}
+  .card p{margin:0 0 8px;font-size:13px;color:#c6d3e0}
+  .swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(146px,1fr));gap:10px}
+  .sw{display:flex;align-items:center;gap:9px;font-size:12px;color:#c6d3e0}
+  .sw b{width:26px;height:26px;border-radius:8px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}
+  .sw code{color:#8fa3b8;font-size:11px}
+  .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9fb3c8}
+  .two{display:flex;gap:26px;flex-wrap:wrap}
+  .mini{width:210px}
+</style>
+</head>
+<body>
+
+<h1>SpLogin 游戏化皮肤 · 静态预览</h1>
+<p class="sub">左：面板打开时的样子（含遮罩、悬浮球）。下方：另外三种状态与色卡。所有颜色/圆角/字号取自
+  <span class="mono">SpLoginTheme.h</span>，其来源是官方 <span class="mono">style-tokens.json</span>。</p>
+<p class="warn">⚠️ 这是 <b>CSS 复刻</b>，不是 UIKit 真机渲染：本机没有 Theos/Xcode，跑不了模拟器。
+  字体字重、发光与阴影的真实观感、动画流畅度都必须装机确认。</p>
+
+<div class="stage">
+  <!-- ================= 手机 ================= -->
+  <div class="phone">
+    <div class="screen">
+      <div class="game-title">弹 射 世 界</div>
+      <div class="game-hint">点 击 开 始</div>
+
+      <div class="scrim"></div>
+
+      <!-- 面板（? 状态） -->
+      <div class="panel">
+        <div class="titlebar">
+          <h3>服务器绑定</h3>
+          <span class="title-accent"></span>
+        </div>
+        <div class="content">
+          <div class="plate">
+            <div class="cap">验证码会随公告下发到游戏里</div>
+            <div class="tiles">
+              <span class="tile">7</span><span class="tile">3</span><span class="tile">0</span>
+              <span class="tile">1</span><span class="tile">5</span><span class="tile">8</span>
+            </div>
+          </div>
+          <div class="countdown">有效期剩余 04:37</div>
+          <div class="sep"></div>
+
+          <div class="field"><span>1073</span><span style="opacity:.35">2</span><span style="opacity:.35">8</span><span style="opacity:.35">4</span><span style="opacity:.35">6</span></div>
+          <div class="field focused"><span class="ph">密码</span></div>
+          <div class="field last"><span class="ph">确认密码</span></div>
+
+          <div class="gap-16"></div>
+          <button class="btn primary">创建账号并绑定</button>
+          <div class="gap-8"></div>
+          <button class="btn secondary">我已有账号</button>
+          <div class="gap-8"></div>
+          <button class="btn link">重新获取验证码</button>
+
+          <div class="status">正在等确认……绑定成功后这里会变绿。</div>
+          <div class="decoration"><i></i><i></i><i></i></div>
+        </div>
+      </div>
+
+      <!-- 悬浮球 -->
+      <div class="ball">登</div>
+      <div class="ball-hint">← 常驻 / 可拖 / 点一下开合面板</div>
+    </div>
+  </div>
+
+  <!-- ================= 右栏 ================= -->
+  <div class="col">
+
+    <div class="card">
+      <h4>它怎么出现在游戏上（机制没动，只换了皮）</h4>
+      <p>独立 <span class="mono">UIWindow</span>（<span class="mono">level = StatusBar+100</span>），只置
+        <span class="mono">hidden = NO</span>，<b>从不 makeKeyAndVisible</b>；空白处 <span class="mono">hitTest</span>
+        返回 <span class="mono">nil</span> 直接穿透给游戏。</p>
+      <p>只有面板/悬浮球所在的那一小块吃掉触摸 —— 上图里被压暗的区域就是遮罩，点它关面板。</p>
+    </div>
+
+    <div class="card">
+      <h4>三种状态</h4>
+      <div class="two">
+        <div class="mini">
+          <p style="color:#9fb3c8;font-size:12px;margin-bottom:6px">① 还没拿到验证码 / 皮肤关掉</p>
+          <div class="plate">
+            <div class="cap">验证码会随公告下发到游戏里</div>
+            <div class="code-plain">------</div>
+          </div>
+        </div>
+        <div class="mini">
+          <p style="color:#9fb3c8;font-size:12px;margin-bottom:6px">② 绑定中（按钮禁用）</p>
+          <button class="btn primary disabled" style="height:42px">正在登录……</button>
+          <div class="gap-8"></div>
+          <button class="btn secondary">回到游戏</button>
+        </div>
+        <div class="mini">
+          <p style="color:#9fb3c8;font-size:12px;margin-bottom:6px">③ 绑定成功</p>
+          <div class="plate" style="box-shadow:inset 0 0 0 1px rgba(46,196,182,.75)">
+            <div class="cap" style="color:#fff">已绑定</div>
+          </div>
+          <div class="status ok">已绑定成功。回游戏点「点击开始」即可进入。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h4>官方色卡（style-tokens.json 原值，一个没改）</h4>
+      <div class="swatches">
+        <div class="sw"><b style="background:#2EC4B6"></b><span>主色 <code>2EC4B6</code></span></div>
+        <div class="sw"><b style="background:#EA3553"></b><span>危险 <code>EA3553</code></span></div>
+        <div class="sw"><b style="background:#FF9F1C"></b><span>强调 <code>FF9F1C</code></span></div>
+        <div class="sw"><b style="background:#55ACEE"></b><span>信息 <code>55ACEE</code></span></div>
+        <div class="sw"><b style="background:#444444"></b><span>正文 <code>444444</code></span></div>
+        <div class="sw"><b style="background:#515151"></b><span>次级 <code>515151</code></span></div>
+        <div class="sw"><b style="background:#C9C9C9"></b><span>禁用 <code>C9C9C9</code></span></div>
+        <div class="sw"><b style="background:#DDDDDD"></b><span>分隔 <code>DDDDDD</code></span></div>
+        <div class="sw"><b style="background:#FAFAFA"></b><span>面板 <code>FAFAFA</code></span></div>
+        <div class="sw"><b style="background:#EAEAEA"></b><span>内嵌 <code>EAEAEA</code></span></div>
+        <div class="sw"><b style="background:#222222"></b><span>深底 <code>222222</code></span></div>
+        <div class="sw"><b style="background:#2A2F35"></b><span>标题条 <code>2A2F35</code>（补值）</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h4>几何与字号（SpLoginTheme 常量）</h4>
+      <p class="mono">radiusPanel 32 · radiusButton 24 · radiusField 18 · radiusChip 12 · radiusPlate 8</p>
+      <p class="mono">glow 6 · shadow 20 · hairline 1</p>
+      <p class="mono">title 22 semibold · button 19 semibold · body 15 · caption 13 · 验证码 30 等宽 bold</p>
+      <p style="margin-top:10px;color:#8fa3b8">官方素材命名规范 <span class="mono">color&lt;RRGGBB&gt;_round&lt;n&gt;_glow&lt;n&gt;_shadow&lt;n&gt;</span>
+        就是上面这组数值的来源（<span class="mono">color2ec4b6_round24_glow6_shadow20</span> 即主按钮）。</p>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
