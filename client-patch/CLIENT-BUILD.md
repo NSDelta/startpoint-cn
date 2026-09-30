@@ -232,7 +232,7 @@ FFDec 的已知坑（产线已经替你做掉一半，钩子里仍要注意）�
 ```cmd
 node client-patch\build\build-client.mjs ^
   --base  apkipa\V1.8.1.apk ^
-  --host  172.16.10.105 --port 8001 ^
+  --host  192.168.1.10 --port 8001 ^
   --out   out\sp-cn-181-p6login-unsigned.apk ^
   --ffdec D:\wfcnmod\server\work\tools\ffdec.jar --allow-ffdec-version-mismatch ^
   --as3-hook client-patch\build\as3-hook-p6-pcode.mjs ^
@@ -308,7 +308,7 @@ node client-patch\tools\rename-package.mjs ^
 要让**产线**自己串起来（`[5.5]` 段在 `[5] 回封` 之后、`[6] zipalign` 之前），加两个旗标即可：
 
 ```cmd
-node client-patch\build\build-client.mjs --base apkipa\V1.8.1.apk --host 172.16.10.105 --port 8001 ^
+node client-patch\build\build-client.mjs --base apkipa\V1.8.1.apk --host 192.168.1.10 --port 8001 ^
   --out out\sp-cn-181-coexist-unsigned.apk --rename-package --rename-to cn.starpoint.a ^
   --zipalign <zipalign.exe> --apksigner <apksigner.bat> --work <纯 ASCII 目录> --keep-work
 ```

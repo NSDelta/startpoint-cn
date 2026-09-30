@@ -3,7 +3,9 @@
 //
 // 纪律（照抄 tools/ios_ipa_patch.test.cjs 的路子）：
 //   - 全程用**合成夹具**（自造 SWF + 自造 APK + 假 zipalign/apksigner/java 桩），绝不碰 apkipa/ 里的真素材；
-//   - 地址一律用 172.16.10.105:8001（18 字符）。不用 192.168.x.y：仓库里禁写个人 IP（scripts/check-hygiene.sh 只放行 192.168.1.10）；
+//   - 地址一律用 192.168.1.100:8001（占位示例地址，合计 18 字符）。不用 192.168.1.10：它只有 12 字符，
+//     会把 18 字符的 ENDPOINT_LENGTH 契约打破；也不用任何真实 172.16/12、192.168/16 内网地址。
+//     scripts/check-hygiene.sh 的白名单 IP_ALLOW='192\.168\.1\.10' 是无锚点子串匹配，192.168.1.100 同样放行；
 //   - 断言的是**行为契约**：缺 --host 必须拒、报告结构必须齐、地址必须真的落到 SWF 里、缺凭据必须明说「未签名」而不是假装成功。
 
 const assert = require("node:assert/strict")
@@ -20,7 +22,7 @@ const CLI = path.join(REPO, "client-patch", "build", "build-client.mjs")
 const MAIN_SWF = "assets/worldflipper_android_release.swf"
 const RENAME_TOOL = path.join(REPO, "client-patch", "tools", "rename-package.mjs")
 
-const HOST = "172.16.10.105"
+const HOST = "192.168.1.100"
 const PORT = "8001"
 const HOST_PORT = `${HOST}:${PORT}`
 const OLD_HOST = "shijtswygamegf.leiting.com"
@@ -284,7 +286,7 @@ test("--dry-run 打印完整命令序列且不产生任何文件", () => {
 
     const stdout = String(result.stdout)
     // 完整序列 = 常量改写 + 回封 + zipalign(对齐/校验) + 签名或未签名说明
-    assert.match(stdout, /applyApiBaseRewrite\(swf, \{ hostPort: "172\.16\.10\.105:8001" \}\)/)
+    assert.match(stdout, /applyApiBaseRewrite\(swf, \{ hostPort: "192\.168\.1\.100:8001" \}\)/)
     assert.match(stdout, /writeZipEntries\(entries\)/)
     assert.match(stdout, /fake-zipalign\.mjs -p -f 4/)
     assert.match(stdout, /fake-zipalign\.mjs -c -p 4/)
