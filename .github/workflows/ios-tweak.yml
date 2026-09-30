@@ -161,13 +161,23 @@ jobs:
           set -uo pipefail
 
           # 判据一：从 deb 里解出真正会被安装的那份 dylib（最高保真）
+          # 注意：macOS runner 上**没有 dpkg-deb**（实测 `dpkg-deb: command not found`），
+          # 所以这一路会优雅降级；降级时不静默，用 ::warning:: 明示，避免把
+          # 「只查了中间产物」误读成「连 deb 内容都查过了」。
           shipped=""
           deb=$(ls packages/*.deb 2>/dev/null | head -1 || true)
           if [ -n "$deb" ]; then
-            rm -rf "$RUNNER_TEMP/shipped"
-            mkdir -p "$RUNNER_TEMP/shipped"
-            dpkg-deb -x "$deb" "$RUNNER_TEMP/shipped" >/dev/null 2>&1 || true
-            shipped=$(find "$RUNNER_TEMP/shipped" -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
+            if command -v dpkg-deb >/dev/null 2>&1; then
+              rm -rf "$RUNNER_TEMP/shipped"
+              mkdir -p "$RUNNER_TEMP/shipped"
+              dpkg-deb -x "$deb" "$RUNNER_TEMP/shipped" >/dev/null 2>&1 || true
+              shipped=$(find "$RUNNER_TEMP/shipped" -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
+              if [ -z "$shipped" ]; then
+                echo "::warning::dpkg-deb 存在但没能从 $deb 里解出 dylib，本次只检中间产物"
+              fi
+            else
+              echo "::warning::本 runner 没有 dpkg-deb，跳过「deb 内实际安装的那份」判据，只检 obj 树（两者同源：dm.pl 正是从 .theos/obj/SpLogin.dylib 打包）"
+            fi
           fi
 
           # 判据二：obj 树里的每一份 dylib（含未 strip 的 arm64 中间产物 —— strip 藏不住一个
