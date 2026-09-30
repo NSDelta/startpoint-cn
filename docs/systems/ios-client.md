@@ -124,10 +124,10 @@ SDK 用 `%@sdk_v3/get_notice.do` 在运行时拼基址，静态无法确定基�
 | SDK 日志 | GET/POST | `{code:0,message:"success"}` | `:751-756` |
 | `/wf/210009_config_20200415.json` | GET | 回 `apiPath`/`apiScheme` 引导配置 | `:759-766` |
 | `/sync_data` | POST | 静默吞掉，`{code:0}` | `:768-771` |
-| `/behavior_log/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
-| `/api/device/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
-| `/api/iplog/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
-| `/api/micro/micro_red/enter_position` | GET | 社区入口，`{code:0,data:{}}` | `:810-812` |
+| `/behavior_log/report` | POST | 埋点静默吞掉，`{code:0}` | `:804-836` |
+| `/api/device/report` | POST | 埋点静默吞掉，`{code:0}` | `:804-836` |
+| `/api/iplog/report` | POST | 埋点静默吞掉，`{code:0}` | `:804-836` |
+| `/api/micro/micro_red/enter_position` | GET | 社区入口，`{code:0,data:{}}` | `:841-843` |
 
 **平台/设备埋点（2026-09-29 真机）**：iPhone 7 Plus / iOS 15.8.3 启动时共 155 条请求 /
 26 种 route×status，其中 35 条落在未知路由 404 上。上表最后 4 行覆盖其中的 27 条
@@ -139,6 +139,17 @@ SDK 用 `%@sdk_v3/get_notice.do` 在运行时拼基址，静态无法确定基�
   `%@` 打印成 `(null)`），即该请求**不带任何可用于关联玩家的凭据** ⇒ 服务端**不得**把它当
   已认证请求读账号（`src/routes/cn/load.ts:208-215` 有同类覆辙的注释）。
 - 埋点 body 形状未知（8001 抓头代理 `capture.jsonl` 里没有这 4 条记录）⇒ 任何 body 都照样 200。
+- **3 条 POST 埋点路由刻意容忍任意 content-type / 任意体形态**（`application/octet-stream`、
+  `multipart/form-data`、不带 `Content-Type` 的非空体、非法 JSON、非 UTF-8 字节……一律
+  200 + `{code:0}`）。原因是：路由一旦匹配，Fastify 会**先**跑 body 解析器，遇到「没有解析器的
+  content-type + 非空体」会回 415（`FST_ERR_CTP_INVALID_MEDIA_TYPE`）；而 404 兜底路径**不跑**
+  解析器 ⇒ 不做这层容忍，真机的二进制埋点上报只是把 404 噪声换成 415 噪声，`降低服务端日志噪声`
+  的目标完全落空。实现方式是在插件内再 `register` 一层子作用域，在该作用域里
+  `removeAllContentTypeParsers()` + `addContentTypeParser("*", { parseAs: "buffer" })`；
+  **容忍度被限制在这个子作用域内**，`/sync_data`、`/logmonitor/…`、`/api/mg_log!…` 等同级路由
+  既有的 415 语义原样保留（钉子断言：`tools/ios_unknown_routes.test.cjs` 的
+  `the wildcard body parser stays inside the telemetry scope` 一条）。缓冲仍有上界
+  （`src/cn-server.ts:105` `bodyLimit: 262144`）。
 - 回归测试：`tools/ios_unknown_routes.test.cjs`（登记在 `integration:cdn` 组）。
 
 **仍保持 404（刻意不实现）**：`/protocols/leiting/sensitive/part/{wf,common}[-text]_version.txt`
