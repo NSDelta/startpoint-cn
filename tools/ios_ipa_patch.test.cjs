@@ -6,6 +6,9 @@
 // 2) ABC 常量池那一对条目改写后，条目后面的字节必须一个都不动（串池索引全部保持）；
 // 3) ZIP 引擎逐条保留 method / versionMadeBy / externalAttr（否则 AltStore 拒装）；
 // 4) 「实际差异范围 = 计划范围」必须在替换串内部存在相同字节时依然成立。
+// 5) --endpoint=none（越狱线）：**URL 一个字节都不许改**，且这条线必须由 patch-ipa.mjs 自己承载
+//    —— 风险登记册 R27 明令禁止第二条 iOS 补丁代码路径（当年那份 tmp/make-jb-ipa.mjs 已收编）。
+//    所以越狱线只在参数层与"逐字节未改动"上做断言，绝不再写第二个补丁实现。
 
 const assert = require("node:assert/strict")
 const test = require("node:test")
@@ -170,4 +173,133 @@ test("patch CLI refuses to run without an explicit host", async () => {
     })
     assert.notEqual(result.status, 0)
     assert.match(String(result.stderr || result.stdout), /--host/)
+})
+
+// ═══════════════ 越狱线 --endpoint=none（R27：只有 patch-ipa.mjs 一条补丁路径）═══════════════
+// 需求：越狱线只去闪退、**一个 URL 都不许改**（URL 交给越狱 dylib 在运行期接管），
+// 所以 --endpoint=none 必须跳过 __cstring 站点与 ABC 常量池改写，同时保留六项功能补丁与 --guard-mode。
+// 下面两条是纯参数层用例（快、无夹具依赖）；再下面两条要真 IPA，缺夹具时自动 skip。
+
+const path = require("node:path")
+const fs = require("node:fs")
+const os = require("node:os")
+const crypto = require("node:crypto")
+const { spawnSync } = require("node:child_process")
+
+const REPO = path.join(__dirname, "..")
+const CLI = path.join(REPO, "client-patch", "build", "patch-ipa.mjs")
+const FIXTURE = path.join(REPO, "apkipa", "iOS-1.8.4.ipa")
+const FIXTURE_BYTES = 139212360 // 与 lib/ios-macho.mjs 的 OFFICIAL_IOS_184.ipaBytes 一致
+const FIXTURE_OK = fs.existsSync(FIXTURE) && fs.statSync(FIXTURE).size === FIXTURE_BYTES
+const FIXTURE_SKIP = FIXTURE_OK ? false : `缺少夹具 apkipa/iOS-1.8.4.ipa（官方 1.8.4，${FIXTURE_BYTES} B，仓库不跟踪）`
+const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex")
+
+function runCli(argv) {
+    return spawnSync(process.execPath, [CLI, ...argv], {
+        cwd: REPO, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 300000,
+    })
+}
+const cliLog = (res) => String(res.stdout || "") + String(res.stderr || "")
+
+test("--endpoint=none 不再要求 --host/--port（给了也明确 warn 且不改），非法取值直接拒绝", () => {
+    const missing = path.join(REPO, "apkipa", "__absent__.ipa")
+    const dummyOut = path.join(os.tmpdir(), "ios-ipa-patch-dummy.ipa")
+
+    // ① 不给 --host/--port（空格分隔写法也要能解析）：参数校验必须放行，一路走到"找不到输入 IPA"。
+    //    若 --host 仍是硬要求，这里会得到 "需要 --ipa(或 --bin) --host --port --out" —— 那正是回归。
+    const bare = runCli(["--ipa", missing, "--out", dummyOut, "--endpoint", "none"])
+    assert.notEqual(bare.status, 0)
+    assert.match(cliLog(bare), /找不到输入 IPA/)
+    assert.doesNotMatch(cliLog(bare), /--host/)
+
+    // ② 给了 --host/--port：必须 warn，且明确声明本模式不改写任何 URL
+    const withHost = runCli(["--ipa", missing, "--host", "172.16.10.105", "--port", "8001", "--out", dummyOut, "--endpoint=none"])
+    assert.notEqual(withHost.status, 0)
+    assert.match(cliLog(withHost), /WARN --endpoint=none：已忽略 --host\/--port/)
+    assert.match(cliLog(withHost), /不改写任何 URL/)
+
+    // ③ 非法取值：立刻报错退出（绝不静默退回 rewrite —— 那会把越狱线的包悄悄改成连内网端点）
+    const bogus = runCli(["--ipa", __filename, "--out", dummyOut, "--endpoint=bogus"])
+    assert.notEqual(bogus.status, 0)
+    assert.match(cliLog(bogus), /--endpoint 只接受 rewrite\|none/)
+    // 默认（缺省）仍必须是 rewrite：老命令缺 --host 的报错文案不变
+    const dflt = runCli(["--ipa", __filename, "--out", dummyOut])
+    assert.match(cliLog(dflt), /--host/)
+})
+
+test("--endpoint=none 的真 IPA 产物：URL 逐字节未动 + 守卫生效 + ZIP 结构合理", { skip: FIXTURE_SKIP }, async () => {
+    const { readZipEntries, readEntryData, unixMode } = await import("../client-patch/build/lib/zip-ipa.mjs")
+    const { scanTargets, countRewriteableUrlSites, diffRanges } = await import("../client-patch/build/lib/ios-endpoint.mjs")
+    const { findMainBinaryEntry } = await import("../client-patch/build/lib/ios-macho.mjs")
+    const { ABC_API_PAIR_OFFSET } = await import("../client-patch/build/lib/ios-abc.mjs")
+
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "ios-ipa-none-"))
+    const outIpa = path.join(outDir, "jb-none.ipa")
+    try {
+        // 越狱线 SOP：不给 --host/--port（URL 由 dylib 接管），守卫走 launch
+        const res = runCli(["--ipa", "apkipa/iOS-1.8.4.ipa", "--out", outIpa, "--endpoint=none", "--guard-mode=launch"])
+        const log = cliLog(res)
+        assert.equal(res.status, 0, log.slice(-4000))
+        assert.ok(!/\[FAIL\]/.test(log), log.slice(-4000))
+        // 工具自己的**新增正向断言**必须逐条出现（而不是把旧断言 if 掉）
+        for (const needle of [
+            "endpoint=none：URL 站点改写数 = 0",
+            "endpoint=none：ABC 常量池区域 sha256 = 基线值",
+            "endpoint=none：可改写旧站点残留 = 基线值 137 处",
+            "endpoint=none：新端点出现次数 = 0 处",
+            "endpoint=none：官方域名出现次数 = 基线值",
+            "endpoint=none：官方 URL 站点窗口 ∪ ABC 池窗口",
+            "endpoint=none：回读 ABC 池区域 sha256 = 基线值",
+            "endpoint=none：回读可改写旧站点残留 = 基线值 137 处",
+            "0 FAIL",
+        ]) assert.ok(log.includes(needle), `缺少断言输出：${needle}`)
+
+        // ── 独立复核：不引用工具自己的窗口表，直接比对输入/输出两个 IPA 的主二进制 ──
+        const inBin = readEntryData(findMainBinaryEntry(readZipEntries(fs.readFileSync(FIXTURE))))
+        const outEntries = readZipEntries(fs.readFileSync(outIpa))
+        const outMain = findMainBinaryEntry(outEntries)
+        const outBin = readEntryData(outMain)
+
+        assert.equal(outEntries.length, 3568, "ZIP 条目数应与官方件一致（结构未被破坏）")
+        assert.equal(outBin.length, inBin.length, "主二进制长度必须严格不变")
+        assert.notEqual(sha256(outBin), sha256(inBin), "功能补丁应确有写入（否则本用例是空转）")
+
+        // ① 150 个 URL 站点：偏移/长度/字节三种口径全部一致
+        const sites = scanTargets(inBin, { includeBare: false }).sites
+        assert.equal(sites.length, 150)
+        for (const site of sites) {
+            assert.deepEqual(outBin.subarray(site.offset, site.offset + site.length),
+                inBin.subarray(site.offset, site.offset + site.length), `URL 站点 @${site.offset} 被改动了`)
+        }
+        assert.equal(countRewriteableUrlSites(outBin, { hostPort: "0".repeat(18) }), 137)
+        // ② ABC 常量池 33 B 逐字节一致
+        assert.deepEqual(outBin.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + 33),
+            inBin.subarray(ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + 33), "ABC 常量池被改动了")
+        // ③ 守卫仍生效（tmp 脚本当年那条硬校验）
+        assert.equal(outBin.readUInt32LE(0xb00c), 0xd503201f, "0xb00c 未被 NOP —— 越狱线的去闪退失效")
+        // ④ 逐字节：所有改动字节都不得落在任何 URL 站点窗口或 ABC 池窗口内
+        const forbidden = [...sites.map(s => [s.offset, s.offset + s.length]), [ABC_API_PAIR_OFFSET, ABC_API_PAIR_OFFSET + 33]]
+        const diff = diffRanges(inBin, outBin)
+        assert.ok(diff.length > 0)
+        const violated = diff.filter(([a, b]) => forbidden.some(([s, e]) => a < e && b > s))
+        assert.deepEqual(violated, [], `有改动落在 URL/ABC 窗口内：${JSON.stringify(violated)}`)
+        // ⑤ ZIP 结构：主 entry 属性保持（否则 AltStore 拒装）
+        assert.equal(outMain.method, 8)
+        assert.equal(outMain.versionMadeBy, 0x1300)
+        assert.equal(outMain.externalAttr, 0x81ed0000)
+        assert.equal(unixMode(outMain), 0o100755)
+    } finally {
+        fs.rmSync(outDir, { recursive: true, force: true })
+    }
+})
+
+test("默认模式（--endpoint=rewrite）老命令仍改写 138 处端点", { skip: FIXTURE_SKIP }, () => {
+    const [host, port] = HOST_PORT.split(":")
+    const res = runCli(["--ipa", "apkipa/iOS-1.8.4.ipa", "--host", host, "--port", port,
+        "--out", path.join(os.tmpdir(), "ios-ipa-patch-rewrite.ipa"), "--guard-mode=launch", "--dry-run"])
+    const log = cliLog(res)
+    assert.equal(res.status, 0, log.slice(-4000))
+    assert.ok(log.includes("URL 站点改写数 = 可改写站点数"))
+    assert.ok(log.includes("补丁后：新端点 = 138 处"), log.slice(-2000))
+    assert.ok(log.includes("0 FAIL"), log.slice(-2000))
 })
