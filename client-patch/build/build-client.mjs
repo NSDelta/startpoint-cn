@@ -36,6 +36,10 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { ABC_API_HOST, ABC_API_SCHEME, applyApiBaseRewrite, findSchemeHostPair } from "./lib/ios-abc.mjs"
 import { createAssertions, hexRanges, sha256Hex, writeBuildReport } from "./lib/build-report.mjs"
 import { readEntryData, readZipEntries, replaceEntryData, writeZipEntries } from "./lib/zip-ipa.mjs"
+// 改名回读要**读 package 属性**，不能拿整份 manifest 做朴素子串搜索：真机 manifest 是二进制 AXML，
+// 属性名是字符串池索引、不是字面量，所以只能走 AXML 元素树解析。这里复用 P12 改名工具自己的解析器
+// （它本来就要改 package 与 authorities 属性），判定与改写共用同一份布局知识。
+import { readAxmlPackage } from "../tools/rename-package.mjs"
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(HERE, "..", "..")
@@ -239,8 +243,8 @@ export function countIn(buffer, needle) {
 
 /**
  * 改名结果的独立回读（不看改名工具的 exit code，也不信它的自述报告）：
- * 用我们自己的 ZIP 引擎重新解析产物，直接找 `AndroidManifest.xml`（二进制 AXML，字符串池多为
- * UTF-16LE，也兼容 UTF-8 变体）与 `assets/META-INF/AIR/application.xml` 的 `<id>`。
+ * 用我们自己的 ZIP 引擎重新解析产物，读 `AndroidManifest.xml` 的 **`package` 属性值**（二进制 AXML，
+ * 字符串池多为 UTF-16LE，也兼容 UTF-8 变体）与 `assets/META-INF/AIR/application.xml` 的 `<id>`。
  * 返回纯数据，由调用方决定断言阈值。
  */
 /** 标识符字符（点/下划线/`$`/`-` 也算，用于判断命中是否落在标识符开头）。 */
@@ -283,6 +287,44 @@ function countIdentityResidues(buffer, from) {
     return { count, samples }
 }
 
+/**
+ * 读 `AndroidManifest.xml` 的 **`package` 属性值** —— 「package 已是目标包名」这条判据的唯一权威来源。
+ *
+ * 为什么不能拿整份 manifest 做朴素子串搜索（`buffer.includes(to)`）：包名在 manifest 里会同时出现在
+ * 4 个 provider 的 `authorities`、`permission`、`meta-data`、入口类名等十来处。只要**任意一处**含目标串，
+ * 朴素搜索就为真 —— 实测把 `package` 改成第三个包名（既非旧名 `com.leiting.wf`、也非目标名
+ * `cn.starpoint.a`）而 authorities 已是目标前缀时，整条路线 exit 0、report.ok=true、0 条失败断言，
+ * 还打印「PASS 改名后 AndroidManifest.xml 的 package 已是目标包名」（假 PASS）。
+ *
+ * 两条路都是「**读属性值再比相等**」，不存在「串出现在别处就算过」：
+ *   1. 主路径：复用改名工具的真 AXML 解析（`readAxmlPackage`）→ `source: "axml"`；
+ *   2. 退路：非 AXML 形态（合成夹具 / 文本变体）按 `package="…"` 属性提取 → `source: "text"`。
+ * 读不到就返回 `package: null` ⇒ 判据亮红（fail-closed：解析不了绝不当作通过）。
+ */
+export function readManifestPackage(manifest) {
+    if (!manifest || manifest.length === 0) return { package: null, source: null, error: "manifest 为空" }
+    try {
+        const { packageName } = readAxmlPackage(manifest)
+        return { package: packageName, source: "axml", error: null }
+    } catch (error) {
+        const text = manifestTextPackage(manifest)
+        if (text !== null) return { package: text, source: "text", error: null }
+        return { package: null, source: null, error: `读不到 AXML 的 package 属性（解析失败：${error.message}）` }
+    }
+}
+
+/**
+ * 文本形态 manifest 的 `package="…"` 属性提取（UTF-16LE / UTF-8 两种编码各试一次）。
+ * 只认 `package=` 这个属性本身，不是「目标串在文件里出现过」。
+ */
+function manifestTextPackage(manifest) {
+    for (const encoding of ["utf16le", "utf8"]) {
+        const match = /<manifest\b[^>]*\bpackage\s*=\s*"([^"]*)"/.exec(manifest.toString(encoding))
+        if (match) return match[1]
+    }
+    return null
+}
+
 export function checkRenamedApk(apkBuffer, { from = null, to }) {
     const entries = readZipEntries(apkBuffer)
     const manifestEntry = entries.find(entry => entry.name === "AndroidManifest.xml")
@@ -293,12 +335,17 @@ export function checkRenamedApk(apkBuffer, { from = null, to }) {
     const applicationXml = applicationEntry ? readEntryData(applicationEntry).toString("utf8") : null
 
     const residues = manifest && from ? countIdentityResidues(manifest, from) : { count: 0, samples: [] }
+    const pkg = manifest ? readManifestPackage(manifest) : { package: null, source: null, error: "缺 AndroidManifest.xml 条目" }
 
     return {
         entryCount: entries.length,
         hasManifest: Boolean(manifestEntry),
         hasApplicationXml: Boolean(applicationEntry),
-        manifestHasTo: manifest ? hasEither(manifest, to) : false,
+        // 判据：**读出来的 package 属性值**必须正好等于目标包名（不是「目标串在 manifest 里出现过」）。
+        manifestHasTo: pkg.package !== null && pkg.package === to,
+        manifestPackage: pkg.package,
+        manifestPackageSource: pkg.source,
+        manifestPackageError: pkg.error,
         manifestHasFrom: manifest && from ? hasEither(manifest, from) : false,
         manifestFromResidues: residues.count,
         manifestFromResidueSamples: residues.samples,
@@ -872,7 +919,11 @@ async function main() {
             const probe = checkRenamedApk(renamedBuf, { from: state.rename.from || BASELINE_PACKAGE_NAME, to: renameTo })
             state.rename.probe = probe
             assertions.check("改名后 AndroidManifest.xml 的 package 已是目标包名", probe.manifestHasTo,
-                `to=${renameTo} entryCount=${probe.entryCount}`)
+                `to=${renameTo}`
+                + (probe.manifestPackage !== null
+                    ? `｜实测 package=${probe.manifestPackage}（${probe.manifestPackageSource === "axml" ? "二进制 AXML 属性" : "文本形态属性"}）`
+                    : `｜读不到 package 属性：${probe.manifestPackageError}`)
+                + `｜entryCount=${probe.entryCount}`)
             assertions.check("改名后 AndroidManifest.xml 无旧包名残留", probe.manifestFromResidues === 0,
                 `from=${state.rename.from || BASELINE_PACKAGE_NAME}｜身份残留(标识符开头)=${probe.manifestFromResidues} 处`
                 + `；更长标识符内部的命中不计（受保护串，如 air.com.leiting.wf.AppEntry）`

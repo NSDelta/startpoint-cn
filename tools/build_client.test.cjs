@@ -553,14 +553,18 @@ const NEW_PKG = "cn.starpoint.a"
  * AIR 的真实形态是 manifest 里**必然**带 `air.<旧包名>.AppEntry`（入口类名，改名工具按规矩逐字保留），
  * 所以回读逻辑必须能区分「标识符开头」与「更长标识符内部」两种命中。
  */
-function renameFixtureApk({ manifestText, manifestUtf16 = true, applicationXml = null }) {
+function renameFixtureApk({ manifestText = null, manifestUtf16 = true, manifestBuffer = null, applicationXml = null }) {
     const add = (name, data, entries) => entries.push({
         name, method: 8, flags: 0, mtime: 0x6000, mdate: 0x5000,
         crc: fx.zip.crc32(data), csize: deflateRawSync(data, { level: 9 }).length, usize: data.length,
         versionMadeBy: 0x14, externalAttr: 0, raw: deflateRawSync(data, { level: 9 }),
     })
     const entries = []
-    add("AndroidManifest.xml", Buffer.from(manifestText, manifestUtf16 ? "utf16le" : "utf8"), entries)
+    // manifestBuffer 走**二进制 AXML**（真机形态、主路径）；manifestText 走文本形态（退路）。
+    const manifestData = manifestBuffer !== null
+        ? manifestBuffer
+        : Buffer.from(manifestText, manifestUtf16 ? "utf16le" : "utf8")
+    add("AndroidManifest.xml", manifestData, entries)
     if (applicationXml !== null) add("assets/META-INF/AIR/application.xml", Buffer.from(applicationXml, "utf8"), entries)
     return fx.zip.writeZipEntries(entries)
 }
@@ -753,10 +757,13 @@ const RENAME_STUB = `import { readFileSync, writeFileSync } from "node:fs"
 import { readZipEntries, replaceEntryData, writeZipEntries } from ${JSON.stringify(ZIP_ENGINE_URL)}
 const argv = process.argv.slice(2)
 const value = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1] }
-const manifest = process.env.SPCN_STUB_MANIFEST
-if (!manifest) { console.error("rename-stub: 缺 SPCN_STUB_MANIFEST"); process.exit(1) }
+const manifestText = process.env.SPCN_STUB_MANIFEST
+const manifestB64 = process.env.SPCN_STUB_MANIFEST_B64
+if (!manifestText && !manifestB64) { console.error("rename-stub: 缺 SPCN_STUB_MANIFEST"); process.exit(1) }
+// B64 那条喂**二进制 AXML**（真机形态、走主路径）；文本那条走退路。
+const manifest = manifestB64 ? Buffer.from(manifestB64, "base64") : Buffer.from(manifestText, "utf8")
 const entries = readZipEntries(readFileSync(value("--in")))
-replaceEntryData(entries, "AndroidManifest.xml", Buffer.from(manifest, "utf8"))
+replaceEntryData(entries, "AndroidManifest.xml", manifest)
 writeFileSync(value("--out"), writeZipEntries(entries))
 console.log(JSON.stringify({ ok: true, from: "com.leiting.wf", to: value("--rename-to"), noop: false, equalLength: false }))
 `
@@ -771,9 +778,11 @@ function renameStub() {
 }
 
 /** 走一次完整的 --rename-package 路线；manifestText = 桩写进产物的那份 manifest。 */
-function runRenameRoute(name, manifestText, extra = []) {
-    const result = run(baseArgs(name, ["--rename-package", "--rename-tool", renameStub(), ...extra]),
-        { env: { SPCN_STUB_MANIFEST: manifestText } })
+function runRenameRoute(name, manifestText, extra = [], env = {}) {
+    const childEnv = { ...env }
+    // 只在给了文本 manifest 时才设这一项：env 里塞 undefined 会被 spawn 转成字符串 "undefined"。
+    if (manifestText !== null) childEnv.SPCN_STUB_MANIFEST = manifestText
+    const result = run(baseArgs(name, ["--rename-package", "--rename-tool", renameStub(), ...extra]), { env: childEnv })
     return { result, report: readReport(out(`${name}.apk`)) }
 }
 
@@ -827,14 +836,20 @@ test("改名判据（端到端）：package + 4 个 authorities 全带目标前�
 
 test("改名判据（端到端）：变异体 1 —— 坏掉 package 必须 FAIL，且失败原因点名到具体那一处", () => {
     // 1a：其余都对，只有 package 还是旧包名 ⇒ 必须 FAIL。
-    // 注意失败落在「无旧包名残留」这项而不是「package 已是目标包名」：后者的实现是**整串 substring**
-    // （hasEither(manifest, to)），4 个 authorities 已经带目标前缀，所以那一项看不出 package 没改。
-    // 这是判别据实现的上界，本次任务不改实现，在报告里如实记着（见交付报告「发现」一节）。
+    // P7e 起「package 已是目标包名」这一项也自己亮红了：它的判据改成**读 package 属性值再比相等**
+    // （原来是 hasEither(manifest, to) 的整串 substring，4 个 authorities 已带目标前缀 ⇒ 那一项看不出
+    // package 没改）。旧行为是这条断言的上界，**现在已关闭**，所以这里期望两项同时亮红。
     const stillOld = runRenameRoute("rename-oldpkg", renamedManifest({ pkg: OLD_PKG }))
     assert.equal(stillOld.result.status, 2, `exit=${stillOld.result.status}\nstdout=${stillOld.result.stdout}`)
     assert.equal(stillOld.report.ok, false)
-    assert.deepEqual(failedAssertions(stillOld.report), [assertionNamed(stillOld.report, A_RESIDUE).name],
-        "package 值落在标识符开头 ⇒ 由「无旧包名残留」这项抓，且只该有这一项亮红")
+    assert.deepEqual(
+        failedAssertions(stillOld.report),
+        [assertionNamed(stillOld.report, A_PACKAGE).name, assertionNamed(stillOld.report, A_RESIDUE).name],
+        "package 没改 ⇒ 「package 已是目标包名」（属性级）与「无旧包名残留」两项都该亮红")
+    const pkgItemOld = assertionNamed(stillOld.report, A_PACKAGE)
+    assert.match(pkgItemOld.detail, /to=cn\.starpoint\.a/, "失败原因要能看出目标包名是哪个")
+    assert.match(pkgItemOld.detail, /实测 package=com\.leiting\.wf/,
+        "失败原因要能看出**实际读到的** package 值（不是一句「目标串没出现」）")
     assert.equal(residueSamplesOf(assertionNamed(stillOld.report, A_RESIDUE)), OLD_PKG,
         "样例正好是 package=\"…\" 那一处（而不是空话一句「有残留」）")
 
@@ -883,6 +898,179 @@ test("改名判据（端到端）：变异体 3 —— 多一处真残留必须 
     assert.equal(assertionNamed(bareEntry.report, A_RESIDUE).ok, false)
     assert.equal(residueSamplesOf(assertionNamed(bareEntry.report, A_RESIDUE)), `${OLD_PKG}.AppEntry`,
         "少了 air. 前缀就不是受保护串了：allowlist 不能退化成「凡 AppEntry 一律放行」")
+})
+
+// ─────────── 8d. package 判据的**属性级主路径**（真二进制 AXML） ───────────
+//
+// 8c 的桩把 manifest 写成**文本**形态，走的是文本退路。真机 manifest 是二进制 AXML —— 属性名是字符串池
+// 索引、不是字面量，所以主路径必须用真 AXML 夹具钉住，否则「属性级判定」就只在退路上被证明过。
+//
+// 为什么非要有这一节：判据原来是 hasEither(manifest, to) = 整份 manifest 的**朴素子串搜索**。包名在
+// manifest 里会同时出现在 4 个 provider 的 authorities、permission、meta-data、入口类名等十来处，
+// 于是只要**任意一处**含目标串就为真。把 package 改成第三个包名（既非旧名 com.leiting.wf、也非目标名
+// cn.starpoint.a）而 authorities 已是目标前缀时 ⇒ 整条路线 exit 0 / report.ok=true / 0 条失败断言（假 PASS）。
+//
+// AXML 按 AOSP ResXMLTree 布局手拼（数值与 tools/rename_package.test.cjs:155-279 的夹具同源，那份夹具
+// 已被客户端自己的真解析器 readAxmlPackage 验证过）。
+
+/** UTF-16 字符串项：u16 长度 + UTF-16LE 正文 + u16 NUL。 */
+function axmlStringItem(s) {
+    const body = Buffer.from(s, "utf16le")
+    const head = Buffer.alloc(2)
+    head.writeUInt16LE(s.length, 0)
+    return Buffer.concat([head, body, Buffer.from([0, 0])])
+}
+
+function axmlStringPool(strings) {
+    const items = strings.map(axmlStringItem)
+    const stringsStart = 28 + strings.length * 4 // 无 style
+    const body = Buffer.concat(items)
+    const total = Math.ceil((stringsStart + body.length) / 4) * 4
+    const pool = Buffer.alloc(total)
+    pool.writeUInt16LE(0x0001, 0) // RES_STRING_POOL_TYPE
+    pool.writeUInt16LE(28, 2)     // headerSize
+    pool.writeUInt32LE(total, 4)
+    pool.writeUInt32LE(strings.length, 8)
+    pool.writeUInt32LE(0, 12)     // styleCount
+    pool.writeUInt32LE(0, 16)     // flags：UTF-16、未排序（真机 APK 就是这种）
+    pool.writeUInt32LE(stringsStart, 20)
+    pool.writeUInt32LE(0, 24)     // stylesStart
+    let cur = 0
+    strings.forEach((_, i) => { pool.writeUInt32LE(cur, 28 + i * 4); cur += items[i].length })
+    body.copy(pool, stringsStart)
+    return pool
+}
+
+/** 起止元素 chunk；attrs = [{ name: 串索引, value: 串索引 }]，值按 TYPE_STRING 存串索引。 */
+function axmlElement(nameIdx, attrs, { end = false } = {}) {
+    if (end) {
+        const b = Buffer.alloc(16)
+        b.writeUInt16LE(0x0103, 0)
+        b.writeUInt16LE(16, 2)
+        b.writeUInt32LE(16, 4)
+        b.writeInt32LE(-1, 8)
+        b.writeUInt32LE(nameIdx, 12)
+        return b
+    }
+    const size = Math.ceil((16 + 20 + attrs.length * 20) / 4) * 4
+    const b = Buffer.alloc(size)
+    b.writeUInt16LE(0x0102, 0)
+    b.writeUInt16LE(16, 2)
+    b.writeUInt32LE(size, 4)
+    b.writeUInt32LE(1, 8)      // lineNumber
+    b.writeInt32LE(-1, 12)     // comment
+    b.writeInt32LE(-1, 16)     // ns
+    b.writeUInt32LE(nameIdx, 20)
+    b.writeUInt16LE(20, 24)    // attributeStart
+    b.writeUInt16LE(20, 26)    // attributeSize
+    b.writeUInt16LE(attrs.length, 28)
+    attrs.forEach((a, i) => {
+        const o = 36 + i * 20
+        b.writeInt32LE(-1, o)              // ns
+        b.writeUInt32LE(a.name, o + 4)
+        b.writeInt32LE(-1, o + 8)          // rawValue
+        b.writeUInt16LE(8, o + 12)
+        b.writeUInt8(0, o + 14)
+        b.writeUInt8(0x03, o + 15)         // TYPE_STRING
+        b.writeUInt32LE(a.value, o + 16)
+    })
+    return b
+}
+
+/**
+ * 拼一份真二进制 AXML：根元素 manifest 的 package 属性 = `pkg`，另把 4 个 authorities 与 AIR 入口类
+ * **原样放进字符串池**（真机就是如此）。于是 `pkg` 是第三个包名时目标串依旧躺在池子里 ——
+ * 朴素子串搜索照样命中，属性级判定则必须说「不是目标包名」。
+ * withPackageAttr=false 用来造「真 AXML 但没有 package 属性」的 fail-closed 形态。
+ */
+function axmlManifest({
+    pkg,
+    authorities = AUTHORITY_SUFFIXES.map(suffix => `${NEW_PKG}${suffix}`),
+    appEntry = `air.${OLD_PKG}.AppEntry`,
+    withPackageAttr = true,
+}) {
+    const strings = ["manifest", "package", pkg, "provider", "android:authorities",
+        ...authorities, "application", "android:name", appEntry]
+    const I = {}
+    strings.forEach((s, i) => { if (!(s in I)) I[s] = i })
+    const body = Buffer.concat([
+        axmlStringPool(strings),
+        axmlElement(I.manifest, withPackageAttr ? [{ name: I.package, value: I[pkg] }] : []),
+        ...authorities.map(a => axmlElement(I.provider, [{ name: I["android:authorities"], value: I[a] }])),
+        axmlElement(I.application, [{ name: I["android:name"], value: I[appEntry] }]),
+        axmlElement(I.manifest, [], { end: true }),
+    ])
+    const head = Buffer.alloc(8)
+    head.writeUInt16LE(0x0003, 0) // RES_XML_TYPE
+    head.writeUInt16LE(8, 2)
+    head.writeUInt32LE(8 + body.length, 4)
+    return Buffer.concat([head, body])
+}
+
+test("package 属性级判定（真 AXML 主路径）：读的是 package 属性，不是「目标串在 manifest 里出现过」", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+
+    // 改对了：package = 目标包名 ⇒ PASS，且来源必须是 AXML 解析（不是文本退路）。
+    const goodProbe = mod.checkRenamedApk(renameFixtureApk({ manifestBuffer: axmlManifest({ pkg: NEW_PKG }) }),
+        { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(goodProbe.manifestPackageSource, "axml", "真 AXML 必须走主路径（退路只给非 AXML 形态）")
+    assert.equal(goodProbe.manifestPackage, NEW_PKG)
+    assert.equal(goodProbe.manifestHasTo, true)
+    assert.equal(goodProbe.manifestFromResidues, 0, `池里的 air.${OLD_PKG}.AppEntry 不算身份残留`)
+
+    // 假 PASS 形态：package 是**第三个**包名，authorities 已是目标前缀。
+    const trap = axmlManifest({ pkg: "cn.starpoint.b" })
+    assert.equal(trap.includes(Buffer.from(NEW_PKG, "utf16le")), true,
+        "陷阱前提：目标串确实躺在 AXML 字节里（authorities 那几处）⇒ 旧判据的朴素子串搜索必然命中")
+    const trapProbe = mod.checkRenamedApk(renameFixtureApk({ manifestBuffer: trap }), { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(trapProbe.manifestPackage, "cn.starpoint.b", "实际读到的就是那第三个包名")
+    assert.equal(trapProbe.manifestHasTo, false, "package ≠ 目标包名 ⇒ 必须亮红（旧判据在这里是假 PASS）")
+})
+
+test("package 属性级判定：读不到 package 就亮红（fail-closed），绝不当作通过", async () => {
+    const mod = await import(pathToFileURL(CLI).href)
+
+    // 不是 AXML，也没有文本形态的 package 属性 ⇒ package = null、来源为空、错误原因可读。
+    const garbage = mod.checkRenamedApk(
+        renameFixtureApk({ manifestBuffer: Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) }),
+        { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(garbage.manifestPackage, null)
+    assert.equal(garbage.manifestPackageSource, null)
+    assert.match(garbage.manifestPackageError, /读不到 AXML 的 package 属性/)
+    assert.equal(garbage.manifestHasTo, false, "解析不了 ⇒ 判 FAIL，不是 PASS")
+
+    // 真 AXML、根元素**没有** package 属性，但目标串仍在池子里（authorities）⇒ 同样必须亮红。
+    const noAttr = axmlManifest({ pkg: NEW_PKG, withPackageAttr: false })
+    assert.equal(noAttr.includes(Buffer.from(NEW_PKG, "utf16le")), true, "目标串在池子里（前提）")
+    const noAttrProbe = mod.checkRenamedApk(renameFixtureApk({ manifestBuffer: noAttr }), { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(noAttrProbe.manifestPackage, null)
+    assert.equal(noAttrProbe.manifestHasTo, false, "没有 package 属性 ⇒ 不能因为别处有目标串而放过")
+})
+
+test("改名判据（端到端·真 AXML·绿）：package = 目标包名 ⇒ 整条路线 PASS，报告写明判据读的是 AXML 属性", () => {
+    const ok = runRenameRoute("rename-axml-ok", null, [],
+        { SPCN_STUB_MANIFEST_B64: axmlManifest({ pkg: NEW_PKG }).toString("base64") })
+    assert.equal(ok.result.status, 0, `exit=${ok.result.status}\nstdout=${ok.result.stdout}\nstderr=${ok.result.stderr}`)
+    assert.equal(ok.report.ok, true)
+    assert.deepEqual(failedAssertions(ok.report), [])
+    assert.match(assertionNamed(ok.report, A_PACKAGE).detail, /二进制 AXML 属性/,
+        "报告要能看出判据读的是 AXML 属性（而不是文本退路）")
+})
+
+test("改名判据（端到端·真 AXML·红）：package 是第三个包名 ⇒ 整条路线 FAIL（旧判据在这里是 exit 0 假 PASS）", () => {
+    // 真 AXML、package = cn.starpoint.b（既非旧名也非目标名），但 4 个 authorities 已是目标前缀、
+    // 目标串因此在 manifest 里出现过 —— 旧判据（整份 manifest 的朴素子串搜索）在这里放行。
+    const badPkg = runRenameRoute("rename-axml-badpkg", null, [],
+        { SPCN_STUB_MANIFEST_B64: axmlManifest({ pkg: "cn.starpoint.b" }).toString("base64") })
+    assert.equal(badPkg.report.ok, false,
+        `旧判据下这里是假 PASS：exit=${badPkg.result.status}、report.ok=${badPkg.report.ok}、`
+        + `失败断言=[${failedAssertions(badPkg.report).join(", ")}]\nstdout=${badPkg.result.stdout}`)
+    assert.equal(badPkg.result.status, 2, `exit=${badPkg.result.status}\nstdout=${badPkg.result.stdout}`)
+    const item = assertionNamed(badPkg.report, A_PACKAGE)
+    assert.equal(item.ok, false)
+    assert.match(item.detail, /to=cn\.starpoint\.a/, "失败原因要能看出目标包名")
+    assert.match(item.detail, /实测 package=cn\.starpoint\.b/, "失败原因要能看出实际读到的 package 值")
+    assert.equal(failedAssertions(badPkg.report).includes(item.name), true)
 })
 
 // ─────────── 9. 钩子合法改变 SWF 长度（长度守恒的参照 = 改写前那一刻，不是基线） ───────────
