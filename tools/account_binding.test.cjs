@@ -424,10 +424,15 @@ test("审计：发码 / 绑定 / 解绑 / 吊销都有记录", () => {
         code: code.code, platform: "qq", platformUid: "690000001", actor: "bot",
     })
     const records = binding.listBindAuditSync({ accountId: account.id })
-    assert.deepEqual(records.map(record => record.action), ["bind", "issue_code"])
-    assert.equal(records[0].actor, "bot")
-    assert.equal(records[0].platformUid, "690000001")
-    assert.deepEqual(JSON.parse(records[0].detail).isPrimary, true)
+    // 消费路径：绑定成功时共享写路径会先作废该账号仍 pending 的码（含正在消费的这枚），
+    // 随后 consumeSignupCodeSync 在同一事务里把这枚码无条件置 bound —— 所以这里多一条
+    // revoke_code 审计（旧→新：issue_code, bind, revoke_code；列表是新→旧序）。
+    assert.deepEqual(records.map(record => record.action), ["revoke_code", "bind", "issue_code"])
+    // 多出来的 revoke_code 行排在 bind 之前，所以这几条要指名取 bind 行，不能再取 [0]。
+    const bindRecord = records.find(record => record.action === "bind")
+    assert.equal(bindRecord.actor, "bot")
+    assert.equal(bindRecord.platformUid, "690000001")
+    assert.deepEqual(JSON.parse(bindRecord.detail).isPrimary, true)
     assert.equal(binding.listBindAuditSync({ action: "issue_code" }).length >= 1, true)
     assert.equal(binding.listBindAuditSync({ accountId: account.id, limit: 1 }).length, 1)
 })

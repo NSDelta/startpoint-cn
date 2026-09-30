@@ -317,6 +317,34 @@ test("POST /api/bot/bind ALREADY_BOUND 在账号无名无 viewer_id 时仍给出
     )
 })
 
+test("POST /api/bot/bind 用绑定前发出的旧码 ⇒ CODE_INVALID（CC-2，且 attempts 被烧）", async () => {
+    // The hole CC-2 closes, seen from the frozen bot surface: the account is
+    // bound behind the code's back (admin path), so the code it still had in
+    // flight must not be spendable by a second platform identity.
+    const account = createAccount({ username: "bot-stale-owner" })
+    const stale = issueCode(account.id)
+    assert.equal(getSignupCodeSync(stale.code).status, "pending")
+
+    const bound = bindPlatformAccountSync({
+        accountId: account.id,
+        platform: "qq",
+        platformUid: "bot-stale-admin-1",
+        createdBy: "admin",
+        actor: "admin",
+    })
+    assert.equal(bound.ok, true)
+    assert.equal(getSignupCodeSync(stale.code).status, "revoked")
+
+    const rejected = await bind({ platform: "kook", uid: "bot-stale-thief-1", code: stale.code })
+    assert.equal(rejected.body.ok, false)
+    assert.equal(rejected.body.code, "CODE_INVALID")
+    // Spending a revoked code still burns an attempt.
+    assert.equal(getSignupCodeSync(stale.code).attempts, 1)
+    // It did not take effect on the second identity.
+    assert.equal(listBindingsSync({ platform: "kook", platformUid: "bot-stale-thief-1" }).length, 0)
+    assert.equal(listBindingsSync({ platform: "qq", platformUid: "bot-stale-admin-1" })[0].accountId, account.id)
+})
+
 test("POST /api/bot/bind 失败码：CODE_INVALID / CODE_EXPIRED / CODE_USED", async () => {
     const account = createAccount({ username: "bot-codes" })
 
