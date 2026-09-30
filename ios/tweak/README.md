@@ -132,9 +132,10 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 ## 3. 它到底改了什么
 
 1. **网络改写到自建服务**：`SpLoginURLProtocol` 拦 `https://<x>.leiting.com/<path>` 之类的请求，
-   改写成 `http://<SP_LOGIN_HOST>/<path>`。scheme 用 http 是安全的——官方 `Info.plist` 里
+   改写成 `http://<SP_LOGIN_HOST>/<request-target>`。scheme 用 http 是安全的——官方 `Info.plist` 里
    `NSAppTransportSecurity/NSAllowsArbitraryLoads = true`，明文 HTTP 不会被 ATS 拦。
    改写目标若返回 3xx，**拒绝跟随**（避免请求被导回真实官方域名）。
+   request-target 是**原文逐字节搬运**的，见 3.1。
 2. **UI 接管（现在是「自动打开」，不再是唯一的显示路径）**：面板本体挂在一个**独立覆盖窗口**
    上（`SpLoginOverlay`，见第 5 节），随 tweak 初始化就装好，屏幕上因此有一个可拖动的悬浮球；
    官方 SDK 的登录/欢迎界面一出现（`UIViewController -viewDidAppear:` 里按类名
@@ -147,6 +148,36 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
    同一个值。做法是嗅探优先——每次出站请求体都顺带扫一遍 `device_id`（JSON 与 msgpack 两种
    编码都认），抓到就落盘复用；抓不到才退到本机自生成的 UUID。**这一点必须真机确认**
    （`[未验证-需真机]`），不一致会导致绑定挂在另一个设备键上。
+
+### 3.1 request-target 必须保留原文（`SpLoginURLProtocol.m`，2026-10-01 修）
+
+改写只做一件事：把 `request.URL.absoluteString` 里的 `scheme://authority` 切掉，
+剩下那一段（原始 path + `?query` + `#fragment`）**一个字节不改**地接到 `http://<SP_LOGIN_HOST>`
+后面（`+requestTargetForURL:` 负责切；authority 里不存在 `/` `?` `#`，所以
+「`://` 之后第一个 `/` `?` `#`」就是它的起点）。
+
+**为什么不能拼 `url.path` / `url.query`**（改前的写法）：`-path` / `-query` / `-fragment` /
+`-absolutePath` 都是**已百分号解码**的取值，拿它们重新拼 URL 等于把查询串重新编码一遍：
+
+| 原始 request-target 片段 | 旧写法产出 | 后果 |
+| --- | --- | --- |
+| `sign=a%26b%3Dc` | `sign=a&b=c` | 凭空多出一个参数、且参数值里多出一个 `k=v`；`sign` 这类签名字节一变，服务端验签必失败 |
+| `sign=x%2By`、`q=a+b` | `sign=x+y`、`q=a+b` | `%2B`⇄`+` 的往返不再稳定（`+` 在 query 里是空格的少数派约定） |
+| `name=%E4%B8%96%E7%95%8C%20%E5%BC%B9%E5%B0%84` | `name=世界 反弹` | 非 ASCII 与空格被按新规则重新编码，字节数变 |
+| `x=%20y` | `x= y` | 空格直接裸露（`NSURL URLWithString:` 会把它编码回 `%20`，但 `+` 的语义已丢） |
+| `/v1/a%2Fb` | `/v1/a/b` | 路径段里的 `%2F` 被解码成真斜杠，路径分段语义改变 |
+| `?sign=abc#frag%2F1` | `?sign=abc` | fragment 被整体丢弃 |
+| `https://api.leiting.com?sign=…`（**无路径有查询**） | —（返回 nil） | 旧代码 `url.path.length == 0` 把它判成坏 URL，直接回 `NSURLErrorBadURL` |
+| `https://api.leiting.com`（authority 后什么都没有） | —（返回 nil） | 同上；改后产出 `http://<SP_LOGIN_HOST>`，**不多一个 `/`** |
+
+语义未变的部分：没配 `SPLoginHost` ⇒ `rewritePrefix == nil` ⇒ 返回 `nil`；白名单
+（`SpLoginOfficialSuffixes` / `+isOfficialSdkHost:`）与 `SpLoginHandledKey` 防重入一字未动；
+3xx 仍然拒绝跟随。改写日志（`[SpLogin] rewrite … -> …`）的 request-target 也换成同一份
+原文（含 `?query` / `#fragment`），否则真机上只看得到 path，排查签名问题会被误导。
+
+**未验证**：以上是「切 `absoluteString`」与等价 JS 推演的逐字符一致性结论，
+**不是真机验证**——SDK 在真机上到底发什么形态的查询串（是否用 `+` 表示空格、
+是否有 `%2F` 落在路径段）仍需看 `SpLogin.log` 里那行 `rewrite …` 才能确认。
 
 ## 4. 开关（`SpLogin.plist`）
 

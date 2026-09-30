@@ -94,19 +94,85 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     return request;
 }
 
-/// 改写后的 URL：`http://<host:port><path>[?query]`（官方 URL 上不会有需要保留的 port）。
+/// 原始 request-target（`absoluteString` 去掉 `scheme://authority` 之后的那一段：
+/// path + `?query` + `#fragment`，**原样**，未做任何解码/重编码）。
+/// authority（host[:port]）里的合法字符是字母数字、`-._~%!$&'()*+,;=:` 与 IPv6 的 `[` `]`，
+/// 都不含 `/` `?` `#`；所以 authority 之后第一个 `/` `?` `#` 就是 request-target 的起点。
+/// 切不出来时返回 `@""`（等价于「origin 之后什么都没有」）。
++ (NSString *)requestTargetForURL:(NSURL *)url
+{
+    if (url == nil) {
+        return @"";
+    }
+    NSString *absolute = url.absoluteString;
+    NSRange schemeMark = [absolute rangeOfString:@"://"];
+    if (schemeMark.location == NSNotFound) {
+        return @"";
+    }
+    NSUInteger authorityStart = NSMaxRange(schemeMark);
+    NSRange scan = NSMakeRange(authorityStart, absolute.length - authorityStart);
+    NSRange pathMark = [absolute rangeOfString:@"/" options:0 range:scan];
+    NSRange queryMark = [absolute rangeOfString:@"?" options:0 range:scan];
+    NSRange fragmentMark = [absolute rangeOfString:@"#" options:0 range:scan];
+    NSUInteger hinge = absolute.length;
+    if (pathMark.location != NSNotFound && pathMark.location < hinge) {
+        hinge = pathMark.location;
+    }
+    if (queryMark.location != NSNotFound && queryMark.location < hinge) {
+        hinge = queryMark.location;
+    }
+    if (fragmentMark.location != NSNotFound && fragmentMark.location < hinge) {
+        hinge = fragmentMark.location;
+    }
+    if (hinge <= authorityStart || hinge >= absolute.length) {
+        return @"";                 // authority 之后什么都没有（例：`https://api.leiting.com`）
+    }
+    return [absolute substringFromIndex:hinge];
+}
+
+/// 改写后的 URL：`http://<host:port>` + **原始 request-target**。
+///
+/// 为什么必须切 `absoluteString` 而不是拼 `url.path` / `url.query`：后两者（以及
+/// `url.fragment`、`url.absolutePath`）是**已百分号解码**的取值。拿它们重新拼 URL 等于
+/// 把查询串重新编码一遍 —— `%26` 会变成 `&`（凭空多出一个参数）、`%3D` 变成 `=`
+/// （参数值里凭空多出一个键值对）、`+` 与空格的往返不再稳定、非 ASCII 会被按新的规则
+/// 重新编码，而签名类参数（`sign=`）对字节敏感 ⇒ 服务端验签必失败；`url.fragment` 还会被
+/// 直接丢掉。参考实现 wfcore `net.m:133` 同样是**保留原文**。
+///
+/// 本实现逐字符等于「`absoluteString` 切掉 `scheme://authority`」的结果，不做任何
+/// 解码/重编码，因此签名字节不变。
 + (nullable NSURL *)rewrittenURLForRequest:(NSURLRequest *)request
 {
     NSURL *url = request.URL;
     NSString *prefix = [self rewritePrefix];
-    if (prefix == nil || url.path.length == 0) {
-        return nil;
+    if (prefix == nil) {
+        return nil;                 // 没配地址：完全不介入（语义未变）
     }
-    NSString *rewritten = [prefix stringByAppendingString:url.path];
-    if (url.query.length > 0) {
-        rewritten = [[rewritten stringByAppendingString:@"?"] stringByAppendingString:url.query];
+    NSString *target = [self requestTargetForURL:url];
+    NSString *rewritten = [prefix stringByAppendingString:target];
+    if (target.length == 0) {
+        // prefix 由 +rewritePrefix 构造成完整 URL（`http://host:port`，没有尾斜杠），
+        // 所以「authority 之后什么都没有」时这里就是 `http://host:port`（不多一个 `/`）。
+        return [NSURL URLWithString:rewritten];
     }
-    return [NSURL URLWithString:rewritten];
+    NSURL *result = [NSURL URLWithString:rewritten];
+    if (result == nil) {
+        // 兜底（正常路径走不到）：`absoluteString` 是 NSURL 自己生成的，切出来的 target 必然
+        // 合法。万一失败才用 **percentEncoded** 三件套分段拼装 —— 它们同样是未解码的原文；
+        // 绝不能退回 `url.path` / `url.query`（已解码，会破坏 `%26`/`%3D`/`+`/空格/非 ASCII）。
+        NSMutableString *fallback = [prefix mutableCopy];
+        [fallback appendString:(url.percentEncodedPath.length > 0 ? url.percentEncodedPath : @"/")];
+        if (url.percentEncodedQuery.length > 0) {
+            [fallback appendString:@"?"];
+            [fallback appendString:url.percentEncodedQuery];
+        }
+        if (url.percentEncodedFragment.length > 0) {
+            [fallback appendString:@"#"];
+            [fallback appendString:url.percentEncodedFragment];
+        }
+        result = [NSURL URLWithString:fallback];
+    }
+    return result;
 }
 
 - (void)startLoading
@@ -123,8 +189,11 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     // 顺带嗅探 device_id（游戏侧请求体经过这里；命中一次就够）
     [SpLoginAPI captureDeviceIdFromRequestBody:request.HTTPBody];
 
+    // 日志里的 request-target 与改写用同一份原文（含 `?query` / `#fragment`），
+    // 否则真机上只看到 path、看不到查询串，排查签名问题时会被误导。
     SPLoginLog(@"[SpLogin] rewrite %@://%@%@ -> %@",
-               request.URL.scheme, request.URL.host, request.URL.path, target.absoluteString);
+               request.URL.scheme, request.URL.host,
+               [[self class] requestTargetForURL:request.URL], target.absoluteString);
 
     NSMutableURLRequest *rewritten = [request mutableCopy];
     rewritten.URL = target;
