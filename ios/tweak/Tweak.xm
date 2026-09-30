@@ -26,10 +26,18 @@
 // 避免将来 SDK 收紧头文件时本文件被孤立地打断（零成本）。
 #import <dispatch/dispatch.h>
 
+// 数据转发开关：未由构建系统注入时默认 1（保持历史行为）；
+// SP_LOGIN_FORWARDING=0 的构建里本文件不含任何网络改写代码，也链接不到 URLProtocol 类。
+#ifndef SP_LOGIN_FORWARDING
+#define SP_LOGIN_FORWARDING 1
+#endif
+
 #import "SpLoginAPI.h"
 #import "SpLoginConfig.h"
 #import "SpLoginOverlay.h"
+#if SP_LOGIN_FORWARDING
 #import "SpLoginURLProtocol.h"
+#endif
 #import "SpLoginViewController.h"
 
 #pragma mark - 运行时小工具
@@ -143,8 +151,14 @@ static BOOL SpLoginReplacementNeedShowPrivacy(id self, SEL _cmd)
 
 static void SpLoginInstallHooks(void)
 {
+#if SP_LOGIN_FORWARDING
     // ① 网络改写（先装：越早越好，SDK 一启动就会发请求）
     [SpLoginURLProtocol installIfNeeded];
+#else
+    // SP_LOGIN_FORWARDING=0：只加登录的包 —— 本进程不做任何网络改写。
+    // 端点转发由 IPA 侧静态完成（client-patch/build/patch-ipa.mjs，--endpoint=rewrite）。
+    SPLoginLog(@"[SpLogin] 网络改写：编译期关闭（SP_LOGIN_FORWARDING=0），端点由 IPA 静态改写承担");
+#endif
 
     // ② 独立覆盖窗口：悬浮球 + 登录面板容器。**显示能力的地基**，且完全不依赖下面那些钩子
     //    （官方类名全 miss 时悬浮球照样出现 —— 这正是本次修复的验收点）。

@@ -32,6 +32,10 @@ on:
         description: "自建服务地址 host:port（默认是白名单占位值，真机请填你自己的）"
         required: false
         default: "192.168.1.10:8001"
+      sp_login_forwarding:
+        description: "数据转发开关：1=dylib 内 NSURLProtocol 改写官方请求（历史行为）；0=编译期剔除，只加登录，端点转发交给 IPA 静态改写"
+        required: false
+        default: "1"
   push:
     paths:
       - "ios/tweak/**"
@@ -99,7 +103,7 @@ jobs:
           set -euo pipefail
           make --version | head -1
           dpkg-deb --version | head -1 || true
-          echo "resolved SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
+          echo "resolved SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }}"
 
       # 编译输出全量落到 $RUNNER_TEMP/build.log（不在工作树里，避免污染随后要提交的 git 状态）。
       # 用 pipefail + tee：步骤自身照常因 make 失败而失败，不靠 continue-on-error 掩盖。
@@ -107,31 +111,62 @@ jobs:
         working-directory: ios/tweak
         env:
           SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
         run: |
           set -euo pipefail
+          case "$SP_LOGIN_FORWARDING" in 0|1) ;; *) echo "::error::SP_LOGIN_FORWARDING 只能是 0 或 1，收到：$SP_LOGIN_FORWARDING"; exit 1 ;; esac
           if [ -n "${{ matrix.scheme }}" ]; then
             export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
           fi
           echo "=== pwd: $(pwd)"
           echo "=== SP_LOGIN_HOST=${SP_LOGIN_HOST}"
+          echo "=== SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING}"
           echo "=== THEOS=${THEOS:-<unset>}"
           echo "=== THEOS_PACKAGE_SCHEME=${THEOS_PACKAGE_SCHEME:-<unset>}"
-          echo "=== command: make FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\""
+          echo "=== command: make FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\" SP_LOGIN_FORWARDING=\"\${SP_LOGIN_FORWARDING}\""
           set -o pipefail
-          make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" SP_LOGIN_FORWARDING="$SP_LOGIN_FORWARDING" 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: make package（打成 .deb）
         working-directory: ios/tweak
         env:
           SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
         run: |
           set -euo pipefail
           if [ -n "${{ matrix.scheme }}" ]; then
             export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
           fi
-          echo "=== command: make package FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\""
+          echo "=== command: make package FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\" SP_LOGIN_FORWARDING=\"\${SP_LOGIN_FORWARDING}\""
           set -o pipefail
-          make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+          make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" SP_LOGIN_FORWARDING="$SP_LOGIN_FORWARDING" 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      # 开关必须**在产物上**成立，而不是只在命令行上成立：
+      # 转发关闭时，SpLoginURLProtocol 这个类名不得出现在 dylib 里（源文件已被移出编译单元）。
+      # 这是本开关唯一的机器可验证判据，故放在这里 fail-fast，不放诊断通道。
+      - name: 断言 SP_LOGIN_FORWARDING 生效（类名级二进制自证）
+        if: always()
+        working-directory: ios/tweak
+        env:
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
+        run: |
+          set -uo pipefail
+          dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
+          if [ -z "$dylib" ]; then
+            echo "::warning::没有找到 dylib，跳过开关断言（构建是否成功由 make 步骤决定）"
+            exit 0
+          fi
+          hits=$(grep -a -o 'SpLoginURLProtocol' "$dylib" | wc -l | tr -d ' ')
+          echo "=== 开关自证: SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} dylib=${dylib} SpLoginURLProtocol 命中=${hits}"
+          if [ "$SP_LOGIN_FORWARDING" = "0" ] && [ "$hits" != "0" ]; then
+            echo "::error::SP_LOGIN_FORWARDING=0 但 dylib 里仍含 SpLoginURLProtocol（${hits} 处）—— 转发没有被编译期剔除"
+            exit 1
+          fi
+          if [ "$SP_LOGIN_FORWARDING" != "0" ] && [ "$hits" = "0" ]; then
+            echo "::error::SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} 但 dylib 里没有 SpLoginURLProtocol —— 转发被意外剔除"
+            exit 1
+          fi
+          echo "开关自证通过 ✓"
 
       - name: 产物清单（取证）
         if: always()
@@ -186,6 +221,7 @@ jobs:
             echo "ref=${GITHUB_REF}"
             echo "runner_os=${RUNNER_OS}"
             echo "SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
+            echo "SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }}"
             echo "toolchain=$(make --version 2>&1 | head -1)"
             echo "build_log_bytes=$(wc -c < "$RUNNER_TEMP/build.log" 2>/dev/null || echo 0)"
           } > "$DIAG_DIR/meta.txt"
@@ -231,6 +267,7 @@ jobs:
           DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
           DIAG_RUN: ${{ github.run_id }}
           RESOLVED_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
+          RESOLVED_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
         run: |
           set -uo pipefail
           # 同 ci-diag：诊断通道不得改变 job 结论，也不能静默退出。
@@ -253,6 +290,7 @@ jobs:
             echo "head_sha=${GITHUB_SHA}"
             echo "ref=${GITHUB_REF}"
             echo "SP_LOGIN_HOST=${RESOLVED_HOST}"
+            echo "SP_LOGIN_FORWARDING=${RESOLVED_FORWARDING}"
             echo "dylib=${dylib:-（没有产物）}"
             echo "dylib_bytes=${dylib_bytes}"
             echo "dylib_sha256=${dylib_sha}"
@@ -262,8 +300,8 @@ jobs:
           } > "$OUT_DIR/meta.txt"
           if [ -n "$dylib" ]; then cp "$dylib" "$OUT_DIR/SpLogin.dylib"; fi
           if [ -n "$deb" ];   then cp "$deb"   "$OUT_DIR/"; fi
-          printf '::notice title=ci-out(%s)::dylib=%s bytes dylib_sha256=%s; deb=%s bytes deb_sha256=%s\n' \
-            "$DIAG_LEG" "$dylib_bytes" "$dylib_sha" "$deb_bytes" "$deb_sha"
+          printf '::notice title=ci-out(%s)::forwarding=%s dylib=%s bytes dylib_sha256=%s; deb=%s bytes deb_sha256=%s\n' \
+            "$DIAG_LEG" "$RESOLVED_FORWARDING" "$dylib_bytes" "$dylib_sha" "$deb_bytes" "$deb_sha"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # 逐文件 git add -f：.deb/.dylib 很可能被 .gitignore 吞掉，目录级 add 会整体失败。
@@ -370,7 +408,7 @@ jobs:
           set -uo pipefail
           dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1)
           deb=$(ls packages/*.deb 2>/dev/null | head -1)
-          echo "::notice title=SpLogin(${DIAG_LEG})::SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} scheme=${DIAG_LEG:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
+          echo "::notice title=SpLogin(${DIAG_LEG})::SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }} scheme=${DIAG_LEG:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
           if [ -n "$dylib" ]; then
             ls -l "$dylib" || true
             size=$(wc -c < "$dylib" 2>/dev/null || echo '?')

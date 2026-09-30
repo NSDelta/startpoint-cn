@@ -18,13 +18,13 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `Makefile` | Theos 工程定义；`SP_LOGIN_HOST` 在构建期注入（默认值是 hygiene 白名单占位，不是真实机器） |
+| `Makefile` | Theos 工程定义；`SP_LOGIN_HOST` 与 `SP_LOGIN_FORWARDING` 都在构建期注入（地址默认值是 hygiene 白名单占位，不是真实机器）。转发开关见 2.2 |
 | `control` | deb 元数据（`Package: com.starpoint.splogin`，`Depends: mobilesubstrate`） |
 | `layout/Library/MobileSubstrate/DynamicLibraries/SpLogin.plist` | MobileSubstrate 过滤器（`Bundles: com.leiting.wf`）+ 运行时开关，双用途。**必须在 `layout/` 下**：见第 6 节 |
-| `Tweak.xm` | 入口：注册 NSURLProtocol、安装独立覆盖窗口、hook 官方登录界面、打类清单日志 |
+| `Tweak.xm` | 入口：注册 NSURLProtocol（`SP_LOGIN_FORWARDING=0` 时编译期摘除）、安装独立覆盖窗口、hook 官方登录界面、打类清单日志 |
 | `SpLoginOverlay.h/.m` | **独立覆盖窗口**（悬浮球 + 面板容器）：自建 `UIWindow`、空白穿透、保活看门狗、键盘借还。见第 5 节 |
 | `SpLoginConfig.h/.m` | 配置读取（编译期常量 > plist 覆写）+ 日志（NSLog + 落盘） |
-| `SpLoginURLProtocol.h/.m` | 把 SDK 打向 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com` 的请求改写到自建服务 |
+| `SpLoginURLProtocol.h/.m` | 把 SDK 打向 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com` 的请求改写到自建服务。**`SP_LOGIN_FORWARDING=0` 时整份文件不进编译单元**（见 2.2） |
 | `SpLoginAPI.h/.m` | `/sp-auth/*` 客户端（契约见分工文档 §3.2）+ 从出站请求体里嗅探 `device_id` |
 | `SpLoginTheme.h/.m` | 官方样式 token 的 Objective-C 投影（与 P6 Android 页共用同一份 token）。**2026-09-30 起是游戏化皮肤的唯一样式来源**，见第 8 节 |
 | `SpLoginViewController.h/.m` | 类游戏登录面板本体（状态机与 `ios/prototype/index.html` 一致）；由覆盖窗口当子 VC 承载，不再自己弹自己。**续轮询入口** `sp_resumeFromStoredTokenIfNeeded` 见第 5 节 |
@@ -129,9 +129,46 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 **不要**把 `192.168.x.x` 写进任何仓库文件：`scripts/check-hygiene.sh` 会拦（唯一白名单是
 `192.168.1.10`，也就是本目录里的占位值）。真实地址只走命令行/CI 输入。
 
+### 2.2 只加登录、不做转发（`SP_LOGIN_FORWARDING=0`）
+
+本目录的 dylib 一共做四件事：①网络改写 ②独立覆盖窗口（悬浮球+面板）③UI 接管 ④可选跳过隐私弹窗。
+其中**只有第一件是「数据转发」**，其余三件都是登录 UI 本身。如果你希望端点转发改由 **IPA 侧静态改写**
+承担（`client-patch/build/patch-ipa.mjs --endpoint=rewrite`，也就是它的默认模式），
+就把转发从 dylib 里**编译期剔除**：
+
+```
+make FINALPACKAGE=1 SP_LOGIN_HOST="<host:port>" SP_LOGIN_FORWARDING=0
+```
+
+CI 上对应 `workflow_dispatch` 的 `sp_login_forwarding` 输入。
+
+| 取值 | 效果 |
+| --- | --- |
+| `1`（默认） | `SpLoginURLProtocol.m` 参与编译，`[SpLoginURLProtocol installIfNeeded]` 生效。**产物与历史逐字节同源，零行为变化** |
+| `0` | 源文件不进 `SpLogin_FILES`；`Tweak.xm` 里 import 与 install 两侧都被 `#if` 摘掉，改打一行「网络改写：编译期关闭」日志 |
+
+CI 里有一条**类名级二进制自证**（不是靠人看日志）：对产物 dylib 跑
+`grep -a -o 'SpLoginURLProtocol' <dylib> | wc -l`，`=0` 时必须为 0、`=1` 时必须 >0，否则 job 直接失败。
+
+**拆掉转发的代价——只有这一条，但必须知道**：第 3 节第 4 条的 `device_id` 嗅探是**转发的副作用**
+（`SpLoginURLProtocol.m` 在 `startLoading` 里顺带调 `captureDeviceIdFromRequestBody:`）。
+转发搬到 IPA 之后，游戏的出站请求**本来就不再经过 dylib**，嗅探无论如何都会失效；
+`SP_LOGIN_FORWARDING=0` 只是把这件事从「迟早」变成「确定」。届时 `SpLoginAPI` 会退到
+自生成 UUID —— 那与游戏请求体里的 `device_id` **不是同一个值**，绑定闸门（`result_code 517`）会对不上。
+落地前需要换口径（备选：走已存在的注册码流程 / hook 游戏自身的 device_id 来源 /
+服务端在 `tool/signup` 时侧录）。
+
+**`=0` 时 `SP_LOGIN_HOST` 仍然必须给对**：登录面板自己发的 `/sp-auth/*` 走
+`SpLoginConfig.apiBaseURLString` 直接拼 `http://<hostPort>`，**从不经过** `NSURLProtocol`
+（后者 `canInitWithRequest` 只对三个官方域名后缀返回 YES）。所以它应当与 IPA 打补丁时用的
+`--host` 指向同一台机器。
+
+**残余缺口**：静态改写只能改**二进制里已存在的字面量 URL**；运行期拼出来的 URL 静态改不到，
+而 `NSURLProtocol` 能拦。要完全覆盖，仍然得用 `SP_LOGIN_FORWARDING=1`。
+
 ## 3. 它到底改了什么
 
-1. **网络改写到自建服务**：`SpLoginURLProtocol` 拦 `https://<x>.leiting.com/<path>` 之类的请求，
+1. **网络改写到自建服务**（构建期可关，见 2.2）：`SpLoginURLProtocol` 拦 `https://<x>.leiting.com/<path>` 之类的请求，
    改写成 `http://<SP_LOGIN_HOST>/<path>`。scheme 用 http 是安全的——官方 `Info.plist` 里
    `NSAppTransportSecurity/NSAllowsArbitraryLoads = true`，明文 HTTP 不会被 ATS 拦。
    改写目标若返回 3xx，**拒绝跟随**（避免请求被导回真实官方域名）。
@@ -144,7 +181,8 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
    「回游戏点『点击开始』」。**同一段话术也会由服务端的公告端点下发**（见报告「iOS 公告通道」
    一节），两条路互为兜底：面板是主动展示，公告是被动展示（后者不需要越狱）。
 4. **`device_id` 对齐**：绑定闸门查的是游戏自己请求体里的 `device_id`，所以本页登记的必须是
-   同一个值。做法是嗅探优先——每次出站请求体都顺带扫一遍 `device_id`（JSON 与 msgpack 两种
+   同一个值。做法是嗅探优先——每次出站请求体都顺带扫一遍 `device_id`（JSON 与 msgpack 两种。
+   **这条依赖网络改写在场**：`SP_LOGIN_FORWARDING=0` 会让它永久失效，见 2.2）
    编码都认），抓到就落盘复用；抓不到才退到本机自生成的 UUID。**这一点必须真机确认**
    （`[未验证-需真机]`），不一致会导致绑定挂在另一个设备键上。
 
@@ -154,7 +192,7 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 | --- | --- | --- |
 | `SPLoginHostOverrideEnabled` | `false` | 地址以编译期常量为准；置 `true` 才让 `SPLoginHost` 生效 |
 | `SPLoginHost` | 占位值 | 覆写目标（临时换机联调用，不必重编） |
-| `SPLoginUITakeover` | `true` | 接管官方登录界面；置 `false` 等于只做网络改写 |
+| `SPLoginUITakeover` | `true` | 接管官方登录界面；置 `false` 等于只做网络改写（那是**运行期**开关；要连改写一起去掉用构建期的 `SP_LOGIN_FORWARDING=0`，见 2.2） |
 | `SPLoginLogToFile` | `true` | 日志同时落盘；写不进去自动退回 `NSLog` |
 | `SPLoginSkipPrivacyDialogs` | `false` | 跳过官方隐私/协议弹窗。**属于官方合规流程，未经服主确认不擅自打开** |
 | `SPLoginAutoPresent` | `false` | 启动后主动弹面板（只用于真机单点验证面板本身） |
