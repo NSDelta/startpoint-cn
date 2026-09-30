@@ -179,6 +179,10 @@ function patchBuffer(buf) {
 const BLOCK_RE = /https?:\/\/[A-Za-z0-9.-]+\.sohu\.com(?::\d+)?/;
 const DEAD_HOST_PORT = '127.0.0.1:1';              // nothing listens on :1 → fast connection-refused
 const DEAD_TARGET = `http://${DEAD_HOST_PORT}`;    // 18 bytes
+// 幂等三态用的"已经是目标态"探针：前次跑法把 authority 原地改成了 `http://000…@127.0.0.1:1`
+// （或 deficit===0 时的裸 `http://127.0.0.1:1`）。这些站点已不再匹配 BLOCK_RE，必须单独认出来，
+// 否则「已屏蔽」会被当成「命中 0 处 = 真不匹配」。
+const BLOCKED_RE = /https?:\/\/0*@?127\.0\.0\.1:1/g;
 function patchBlock(buf) {
   const s = buf.toString('latin1');
   const re = new RegExp(BLOCK_RE.source, 'g');
@@ -191,7 +195,9 @@ function patchBlock(buf) {
     Buffer.from(padded, 'latin1').copy(buf, off);    // same length, nothing shifts
     blocked++; hosts.add(auth.replace(/^https?:\/\//, ''));
   }
-  return { blocked, hosts: [...hosts] };
+  // `s` 是改写前的快照 ⇒ 这里数到的只可能是**本来就已是**死循环地址的站点（幂等重跑的痕迹）。
+  const alreadyBlocked = (s.match(BLOCKED_RE) || []).length;
+  return { blocked, hosts: [...hosts], alreadyBlocked };
 }
 
 // 清除应用故意的"致命中止"模式 —— 重签后在启动时崩溃（完整性/权限校验）。
@@ -253,11 +259,7 @@ function deguardBuffer(buf, mode, collector = null) {
 // (mov w0,#0 ; ret)，SDK 跳过提示直接进入游戏。
 // 用方法序言签名守卫 (stp x22,x21,[sp,#-0x30]! = 0xa9bd57f6)，避免错误修改 → 不匹配则跳过。
 function patchFirstLoginTip(buf) {
-  const OFF = 0x6ae0dc;
-  if (OFF + 8 > buf.length || buf.readUInt32LE(OFF) !== 0xa9bd57f6) return 0;
-  buf.writeUInt32LE(0x52800000, OFF);       // mov w0, #0
-  buf.writeUInt32LE(0xd65f03c0, OFF + 4);   // ret
-  return 1;
+  return satisfiedWords(buf, 0x6ae0dc, 0xa9bd57f6, [0x52800000, 0xd65f03c0], 'shouldShowFirstLoginTip');
 }
 
 // 全新安装时跳过雷霆登录弹窗（无已存凭证）。SDK 的登录决策（sub @0x68e7xx）在 token
@@ -267,13 +269,10 @@ function patchFirstLoginTip(buf) {
 // 无弹窗、无崩溃。对正常（已有 token）情况安全：有真实 token 时这些分支永远不触发。
 // 每处用指令签名守卫 (cbz/cbnz 编码)，避免错误修改。
 function patchLoginDialog(buf) {
-  const NOP = 0xd503201f;
   const sites = [[0x68e878, 0xb4000820], [0x68e898, 0xb40006a0], [0x68e8d8, 0x35000538]];
   let n = 0;
-  for (const [off, want] of sites) {
-    if (off + 4 <= buf.length && buf.readUInt32LE(off) === want) { buf.writeUInt32LE(NOP, off); n++; }
-  }
-  return n;   // 3 = fully applied
+  for (const [off, want] of sites) n += satisfiedWords(buf, off, want, NOP_INS, `loginDialog@${hex(off)}`);
+  return n;   // 3 = fully applied（幂等重跑同样返回 3）
 }
 
 // 抑制雷霆登录后欢迎横幅（"…，欢迎入园。"浮动 toast，每次登录后短暂显示脱敏账号名）。
@@ -286,26 +285,15 @@ function patchWelcomeBanner(buf) {
   let n = 0;
   // (1) THE real one: stub -[LTLoginManager showWelcomeView:] entry -> return nil (sub sp,#0x50 = 0xd10143ff)
   const MAIN = 0x6adb14;
-  if (MAIN + 8 <= buf.length && buf.readUInt32LE(MAIN) === 0xd10143ff) {
-    buf.writeUInt32LE(0xd2800000, MAIN);      // mov x0, #0
-    buf.writeUInt32LE(0xd65f03c0, MAIN + 4);  // ret
-    n++;
-  }
+  n += satisfiedWords(buf, MAIN, 0xd10143ff, [0xd2800000, RET_INS], `welcomeBanner-main@${hex(MAIN)}`);   // mov x0,#0 ; ret
   // (2) also stub +[LTWelcomeView showWelcomeView:] (sub sp,#0x1c0 = 0xd10703ff) — a second banner
   // path; harmless defense-in-depth.
   const CLS = 0x64b238;
-  if (CLS + 8 <= buf.length && buf.readUInt32LE(CLS) === 0xd10703ff) {
-    buf.writeUInt32LE(0xd2800000, CLS);       // mov x0, #0
-    buf.writeUInt32LE(0xd65f03c0, CLS + 4);   // ret
-    n++;
-  }
+  n += satisfiedWords(buf, CLS, 0xd10703ff, [0xd2800000, RET_INS], `welcomeBanner-cls@${hex(CLS)}`);     // mov x0,#0 ; ret
   // (3) NOP the +[LTWelcomeView showWelcomeView:] call in the login-success path (0x634890).
   const CALL = 0x634890;
-  if (CALL + 4 <= buf.length && buf.readUInt32LE(CALL) === 0x9546daf4) {
-    buf.writeUInt32LE(0xd503201f, CALL);      // nop
-    n++;
-  }
-  return n;   // 3 = all applied
+  n += satisfiedWords(buf, CALL, 0x9546daf4, NOP_INS, `welcomeBanner-call@${hex(CALL)}`);               // nop
+  return n;   // 3 = all applied（幂等重跑同样返回 3）
 }
 
 // 修改 sub_100312230（AIR 启动流程），立即返回 0，跳过基于 Bundle Identifier
@@ -314,12 +302,8 @@ function patchWelcomeBanner(buf) {
 function patchBundleIdCheck(buf) {
   const OFF = 0x312230;
   // 序言签名: STP X28,X27,[SP,#-0x30]!  (0xa9bd6ffc)
-  if (OFF + 16 > buf.length || buf.readUInt32LE(OFF) !== 0xa9bd6ffc) return 0;
-  buf.writeUInt32LE(0xd2800000, OFF);       // MOV X0, #0
-  buf.writeUInt32LE(0xd65f03c0, OFF + 4);   // RET
-  buf.writeUInt32LE(0xd503201f, OFF + 8);   // NOP
-  buf.writeUInt32LE(0xd503201f, OFF + 12);  // NOP
-  return 1;
+  // 目标态：MOV X0,#0 ; RET ; NOP ; NOP（4 词一起判，避免"改了一半"被当成幂等）
+  return satisfiedWords(buf, OFF, 0xa9bd6ffc, [0xd2800000, RET_INS, NOP_INS, NOP_INS], `bundleIdCheck@${hex(OFF)}`);
 }
 
 // 全新安装时跳过雷霆协议弹窗，直接进入游戏。
@@ -336,7 +320,7 @@ function patchAgreementDialogs(buf) {
   //     Gated behind --agreement while we confirm it isn't what broke the standalone build's
   //     boot networking (ResVer.null / no server requests). Default OFF for a safe working build.
   const EULA = 0x6c6cfc;
-  if (PATCH_AGREEMENT && EULA + 4 <= buf.length && buf.readUInt32LE(EULA) === 0x37000700) { buf.writeUInt32LE(0x14000038, EULA); n++; }
+  if (PATCH_AGREEMENT) n += satisfiedWords(buf, EULA, 0x37000700, 0x14000038, `agreement-EULA@${hex(EULA)}`);
   // (B) privacy popup (ProtocolPrivacyPopView). SAFE approach = patch the "should I show privacy?"
   //     GATE predicates to return NO (already-agreed / returning-user path) so the caller never calls
   //     the show-funcs (0x68dd30/0x698b08) — which also register the boot observer/view-stack, so
@@ -346,14 +330,10 @@ function patchAgreementDialogs(buf) {
   //     Gated behind --privacy until full-flow validated on the STANDALONE build.
   if (PATCH_PRIVACY) {
     for (const off of [0x698990, 0x60f15c]) {
-      if (off + 8 <= buf.length && buf.readUInt32LE(off) === 0xa9be4ff4) {
-        buf.writeUInt32LE(0x52800000, off);      // mov w0, #0  (return NO)
-        buf.writeUInt32LE(0xd65f03c0, off + 4);  // ret
-        n++;
-      }
+      n += satisfiedWords(buf, off, 0xa9be4ff4, [0x52800000, RET_INS], `agreement-privacy@${hex(off)}`);   // mov w0,#0 ; ret
     }
   }
-  return n;   // 0 = no agreement; 1 = EULA; 3 = EULA + both privacy gates (--privacy)
+  return n;   // 0 = no agreement; 1 = EULA; 3 = EULA + both privacy gates (--privacy)（幂等重跑同值）
 }
 // EULA skip (0x6c6cfc) is DEVICE-VERIFIED SAFE on the standalone build (game enters full-flow),
 // so it is default-ON. Pass --agreement=false to disable. Privacy stub stays default-OFF (it broke
@@ -437,6 +417,36 @@ function collectGuardSites(pristine, mode) {
     }
   }
   return sites;
+}
+
+// ── 幂等三态（吸收 wfcore tools/lib/patch.mjs:191 `if (actual === value) continue;` 的纪律）──
+// 为什么必须在**补丁器层**就分三态、而不是只在断言层放宽：断言层拿到的 `tip/dlg/…` 是"改了几处"，
+// 一旦恒为 0 就与"明明不符却装作没事"（真 mismatch）不可区分 —— 那是把 fail-fast 换成静默放过。
+// 三态把二者分开：`fresh` = 原值就是期望签名（真写）／`idle` = 原值**已经是目标字节**（幂等重跑，
+// 一个字节都不写）／`bad` = 两者都不是（真不匹配，返回 0 ⇒ 既有断言照旧红）。
+// 计数语义保持"**满足该站点约束的站点数**"：fresh 与 idle 同样 +1 ⇒ 新鲜跑法的 PASS 计数逐位不变；
+// 同时 patch-ipa.mjs:462 那条站点级三态（== want 幂等 / == expect 新鲜 / 其余 mismatch）在此得到同一结论。
+const PATCH_SITE_STATES = [];
+const idleSitesIn = (...offsets) => PATCH_SITE_STATES.filter(s => s.state === 'idle' && offsets.includes(s.offset)).length;
+
+/** 逐词三态判定 + 写入。@param fresh 期望的**原值**（新鲜签名）；@param target 幂等时允许的**现目标值**。 */
+function satisfiedWords(buf, offset, fresh, target, label, kind = 'patch') {
+  const targets = Array.isArray(target) ? target : [target];
+  const words = Array.isArray(fresh) ? fresh : [fresh];
+  // 边界按"要写多少个词"（targets）算，读判定也要覆盖全部 targets —— 与原实现 `OFF + 16 > buf.length` 同口径。
+  if (offset + 4 * Math.max(words.length, targets.length) > buf.length) return 0;
+  const now = targets.map((_, k) => buf.readUInt32LE(offset + 4 * k));
+  // fresh：只校验签名词前缀（与原实现"只比签名词、然后整块写目标词"逐位等价）
+  const isFresh = words.every((w, k) => now[k] === w);
+  // idle：**全部**目标词都已是目标值才算幂等（改了一半 ⇒ bad，照旧红）
+  const isIdle = targets.every((t, k) => now[k] === t);
+  const state = isFresh ? 'fresh' : isIdle ? 'idle' : 'bad';
+  PATCH_SITE_STATES.push({ label, kind, offset, state, now, expect: words, want: targets });
+  if (state === 'fresh') {
+    for (let k = 0; k < targets.length; k++) buf.writeUInt32LE(targets[k], offset + 4 * k);
+    return 1;
+  }
+  return state === 'idle' ? 1 : 0;      // idle：约束已满足，保留计数；bad：真不匹配 ⇒ 照旧 0
 }
 
 /** deguardBuffer 的采集器：只记录"打算改哪、原值多少、改没改"，不参与任何写入判定。 */
@@ -530,10 +540,37 @@ function windowDiffRanges(before, after, windows) {
   return mergeRanges(raw);
 }
 
+/** 只读探测：输入基座是否**已经是本工具的补丁后产物**（幂等重跑）。
+ *  做法是在一份**拷贝**上跑一遍纯补丁函数、读站点三态，然后把站点台账回滚 —— 调用方缓冲区一个字节都不动。
+ *  判定：有站点是 `idle`（原值已是目标字节）且**没有**站点是 `bad`（没有真不匹配）。
+ *  只在 sha 与官方不一致、且显式 --allow-foreign-base 时才会被调用（官方基座零开销、零行为变化）。 */
+function probeAlreadyPatched(buf) {
+  const copy = Buffer.from(buf);
+  const mark = PATCH_SITE_STATES.length;
+  patchFirstLoginTip(copy); patchLoginDialog(copy); patchWelcomeBanner(copy);
+  patchBundleIdCheck(copy); patchAgreementDialogs(copy);
+  const states = PATCH_SITE_STATES.splice(mark, PATCH_SITE_STATES.length - mark);   // 取走 + 回滚台账
+  return {
+    total: states.length,
+    idle: states.filter(s => s.state === 'idle').length,
+    bad: states.filter(s => s.state === 'bad').length,
+  };
+}
+
 /** 输入指纹断言（--bin 与 --ipa 两条路径共用）。 */
 function assertOfficialInput(A, bin, label = '输入主二进制') {
+  const binSha = sha256Hex(bin);
+  const shaOk = binSha === OFFICIAL.binSha256;
+  // 三态：`fresh` = 输入就是官方原始件（照旧 PASS，措辞逐字不变）；
+  //        `idle` = 输入不是官方件、但**已经是补丁后目标态**且显式 --allow-foreign-base ⇒ 幂等重跑 PASS；
+  //        `bad`  = 其余（真外来基座）⇒ 照旧 FAIL。
+  // 不加 --allow-foreign-base 时一律不探测（保持"外来基座必须显式豁免"这条闸门不被绕过）。
+  const idem = (!shaOk && ALLOW_FOREIGN_BASE) ? probeAlreadyPatched(bin) : null;
+  const idemOk = !!idem && idem.bad === 0 && idem.idle > 0;
   A.check(`${label} = 官方 iOS 1.8.4 原始件（sha256 ${OFFICIAL.binSha256.slice(0, 16)}…）`,
-    sha256Hex(bin) === OFFICIAL.binSha256, `实测 sha256 ${sha256Hex(bin)}`);
+    shaOk || idemOk,
+    idemOk ? `幂等重跑：输入已是补丁后产物（实测 sha256 ${binSha}；站点 ${idem.idle}/${idem.total} 已是目标字节、0 处不匹配）`
+      : `实测 sha256 ${binSha}`);
   A.check(`${label}长度 = ${OFFICIAL.binBytes} B`, bin.length === OFFICIAL.binBytes, `实测 ${bin.length} B`);
   const mh = parseMachOHeader(bin);
   A.check(`输入 Mach-O：ncmds = ${OFFICIAL.ncmds} / sizeofcmds = ${OFFICIAL.sizeofcmds}`,
@@ -563,16 +600,23 @@ function assertPatchResults(A, ctx) {
       `改写 ${r.patched} 处；逐点一致 ${sitesOut.length - drift.length}/${sitesIn.length}${drift.length ? `；漂移 ${hexRanges(drift.map(s => [s.offset, s.offset + s.length]), 3)}` : ''}`);
   }
   A.check('基线六项 ① 实名提示 shouldShowFirstLoginTip -> NO', tip === 1,
-    tip ? `${hex(0x6ae0dc)}: mov w0,#0 ; ret` : `签名 0xa9bd57f6 不匹配（${hex(pristine.readUInt32LE(0x6ae0dc))}）`);
+    tip ? `${hex(0x6ae0dc)}: mov w0,#0 ; ret${idleSitesIn(0x6ae0dc) ? `（幂等重跑：原值已是目标字节 ${hex(pristine.readUInt32LE(0x6ae0dc))}，未写一个字节）` : ''}`
+      : `签名 0xa9bd57f6 不匹配（${hex(pristine.readUInt32LE(0x6ae0dc))}）`);
   A.check('基线六项 ② 全新安装登录弹窗 3/3 分支 NOP', dlg === 3, `命中 ${dlg}/3`);
   A.check('基线六项 ③ 欢迎入园横幅 3/3 处', wel === 3, `命中 ${wel}/3`);
   A.check('基线六项 ④ Bundle ID 资源校验 -> return 0', bid === 1,
-    bid ? `${hex(0x312230)}: MOV X0,#0 ; RET ; NOP ; NOP` : `签名 0xa9bd6ffc 不匹配（${hex(pristine.readUInt32LE(0x312230))}）`);
+    bid ? `${hex(0x312230)}: MOV X0,#0 ; RET ; NOP ; NOP${idleSitesIn(0x312230) ? `（幂等重跑：原值已是目标字节 ${hex(pristine.readUInt32LE(0x312230))}，未写一个字节）` : ''}`
+      : `签名 0xa9bd6ffc 不匹配（${hex(pristine.readUInt32LE(0x312230))}）`);
   const expectAgr = (PATCH_AGREEMENT ? 1 : 0) + (PATCH_PRIVACY ? 2 : 0);
   A.check('基线六项 ⑤ 协议门（EULA + 隐私 gate）', agr === expectAgr,
     `命中 ${agr}/${expectAgr}（--agreement=${PATCH_AGREEMENT} --privacy=${PATCH_PRIVACY}）`);
-  A.check('基线六项 ⑥ sohu 外发屏蔽（等长改写为 127.0.0.1:1）', blk.blocked === (PATCH_SOHU ? 1 : 0),
-    `命中 ${blk.blocked} 处${blk.hosts.length ? '：' + blk.hosts.join(', ') : ''}（--sohu-block=${PATCH_SOHU}）`);
+  // ⑥ 三态：里面那处 sohu 站点在前次跑法里已被原地改写成死循环地址 ⇒ 本次能写的命中数是 0，
+  // 但约束**已经满足**（幂等重跑）。真不匹配（既没有可改写的 sohu 站点、也没有已屏蔽痕迹）照旧 FAIL。
+  const sohuIdle = PATCH_SOHU && blk.blocked === 0 && (blk.alreadyBlocked || 0) > 0;
+  A.check('基线六项 ⑥ sohu 外发屏蔽（等长改写为 127.0.0.1:1）',
+    blk.blocked === (PATCH_SOHU ? 1 : 0) || sohuIdle,
+    `命中 ${blk.blocked} 处${blk.hosts.length ? '：' + blk.hosts.join(', ') : ''}（--sohu-block=${PATCH_SOHU}）`
+      + (sohuIdle ? `；幂等重跑：另有 ${blk.alreadyBlocked} 处**已是** 127.0.0.1:1 死循环地址，未写一个字节` : ''));
   if (GUARD_MODE === 'launch') {
     A.check('guard-mode=launch：只 NOP 0xb00c 一处', guards === 1 && buf.readUInt32LE(0xb00c) === NOP_INS,
       `0xb00c = ${hex(buf.readUInt32LE(0xb00c))}`);
@@ -587,7 +631,11 @@ function assertPatchResults(A, ctx) {
       GUARD_MODE === 'none' ? guards === 0 : buf.readUInt32LE(0xb00c) === NOP_INS,
       `0xb00c = ${hex(buf.readUInt32LE(0xb00c))}（期望 ${hex(NOP_INS)}）`);
     // guard-mode=all 时旧断言是弱断言（只查 none 模式为 0），这里补一条"真的扫到并 NOP 了"的计数断言。
-    if (GUARD_MODE === 'all') A.check(`endpoint=none：guard-mode=all 实际命中 ${guards} 处致命中止（> 0 才算守卫生效）`, guards > 0, `命中 ${guards} 处`);
+    // 幂等重跑（基座本身就是目标态）时 guards=0 但 alreadyNop>0 —— 约束同样满足，故一并放行；
+    // 若两者都是 0（站点根本没命中）则照旧 FAIL。
+    if (GUARD_MODE === 'all') A.check(`endpoint=none：guard-mode=all 实际命中 ${guards + guardDetails.alreadyNop} 处致命中止（> 0 才算守卫生效）`,
+      guards + guardDetails.alreadyNop > 0,
+      `命中 ${guards + guardDetails.alreadyNop} 处（本次新 NOP ${guards} + 已幂等 ${guardDetails.alreadyNop}）`);
   }
   if (REWRITE_ENDPOINT) {
     A.check(`ABC 池 ${ABC_API_SCHEME} + ${ABC_API_HOST} ⇒ ${abc.applied ? abc.apiBase : '未改写'}（${OFFICIAL.abcPairBytes} B 守恒）`,
@@ -749,12 +797,15 @@ function enforceInputFingerprint(check) {
  *  为什么不无条件加一条：非豁免路径上指纹已经一致，"校验通过"这件事由 enforceInputFingerprint 的
  *  打印行负责；再加一条断言就会改动既有 PASS 计数（红线要求逐字不变）。
  *  为什么必须先把 `mismatches === 0` 挡掉：`[].every()` 恒真 —— 官方基座 + 该开关同时出现时，
- *  旧写法会记下一条 FAIL「无差异（该开关此时是空操作）」，等于让"空开关"也能把构建判死。 */
+ *  旧写法会记下一条 FAIL「无差异（该开关此时是空操作）」，等于让"空开关"也能把构建判死。
+ *  ok 判据用 `mismatches > 0`：本条断言是**豁免存证**（证明"本次确实豁免了校验"），而这件事由上面
+ *  那道早退**保证**成立。旧写法 `findings.every(f => f.actual !== f.expected)` 要求"每个指纹字段都不同"，
+ *  只有 sha 不同、字节数相同（例：等长补丁后的基座）时它会记 FAIL ⇒ 幂等重跑被误判不可交付。 */
 function assertInputFingerprint(A, check, label = '输入基座') {
   if (!check || !check.allowForeignBase) return;
   if (check.mismatches === 0) return;                  // 开关是空操作 ⇒ 不记任何断言
   A.check(`${label}：显式豁免指纹前置校验（--allow-foreign-base）—— 本次不校验官方 1.8.4 基线`,
-    check.findings.every(f => f.actual !== f.expected),
+    check.mismatches > 0,
     check.findings.map(f => `${f.field} expected=${f.expected} actual=${f.actual}`).join('；'));
 }
 
@@ -780,7 +831,7 @@ if (args.bin) {
   const minLen = minReplacementLength(STAT_HOST_PORT);
   const rewriteable = scanTargets(pristine, { includeBare: false }).sites.filter(s => s.length >= minLen).length;
   const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
-  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
+  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [], alreadyBlocked: 0 };
   const guardCollector = createGuardCollector(GUARD_MODE);
   const guards = deguardBuffer(buf, GUARD_MODE, guardCollector);
   const guardDetails = guardCollector.summary();
@@ -868,7 +919,7 @@ if (args.bin) {
   progress(REWRITE_ENDPOINT ? '原地改写端点 URL + ABC 池 API 基址 + 六项功能补丁 + 解除 guard'
     : '（--endpoint=none）跳过端点 URL 与 ABC 池，只打六项功能补丁 + 解除 guard');
   const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
-  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
+  const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [], alreadyBlocked: 0 };
   const guardCollector = createGuardCollector(GUARD_MODE);
   const guards = deguardBuffer(buf, GUARD_MODE, guardCollector);
   const guardDetails = guardCollector.summary();

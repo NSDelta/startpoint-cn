@@ -293,6 +293,88 @@ test("--endpoint=none 的真 IPA 产物：URL 逐字节未动 + 守卫生效 + Z
     }
 })
 
+// ── 幂等三态（吸收 wfcore tools/lib/patch.mjs:191 `if (actual === value) continue;` 的纪律）──
+// 站点级三态（== want 幂等 / == expect 新鲜 / 其余 mismatch）本来就在实现里，缺的是**断言层**：
+// 旧版把"命中 0 处"一律当失败 ⇒ 对一份**已经正确打过补丁**的基座重跑（复用基座 / 重出包 /
+// CI 对产物复检）会被判 exit 2「不可交付」，而字节其实逐位正确。本用例钉住这件事。
+//
+// 三态必须**真三态**，不能退化成"宽松放过"：同一轮里还要钉住"真不匹配（既非期望原值、
+// 也非目标值）必须照旧 FAIL" —— 负向半边见 ios_ipa_patch_endpoint_none.test.cjs 的
+// 「0xb00c 被改成 0xdeadbeef」用例（那条在本次改动后必须仍然红）。
+test("幂等重跑：对已打好补丁的基座再跑一次必须 PASS（保留计数 + 产物逐字节不变）", { skip: FIXTURE_SKIP }, async () => {
+    const { readZipEntries, readEntryData } = await import("../client-patch/build/lib/zip-ipa.mjs")
+    const { findMainBinaryEntry } = await import("../client-patch/build/lib/ios-macho.mjs")
+
+    const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "ios-ipa-idem-"))
+    const officialBin = path.join(outDir, "official.bin") // 官方主二进制（解自夹具 IPA）
+    const patchedBin = path.join(outDir, "patched.bin")   // pass1 产物 = 已正确打过补丁的基座
+    const againBin = path.join(outDir, "again.bin")       // pass2 产物 = 对 patchedBin 再跑一次
+    const ARGV = (input, output) => ["--bin", input, "--endpoint=none", "--guard-mode=all",
+        "--allow-foreign-base", "--out", output]
+    try {
+        fs.writeFileSync(officialBin, readEntryData(findMainBinaryEntry(readZipEntries(fs.readFileSync(FIXTURE)))))
+
+        // pass1：官方主二进制 → patchedBin（--endpoint=none --guard-mode=all，与越狱线出包同参）
+        const p1 = runCli(ARGV(officialBin, patchedBin))
+        const log1 = cliLog(p1)
+        assert.equal(p1.status, 0, `pass1（对官方主二进制首次打补丁）本就必须 PASS：\n${log1.slice(-4000)}`)
+        assert.match(log1, /断言：26 PASS \/ 0 FAIL/, `pass1 的计数是红线基线（改前改后必须逐字相同）：\n${log1.slice(-2000)}`)
+
+        // ★ 被钉住的行为：对**已经打过补丁**的 patchedBin 再跑一次 ⇒ 幂等 PASS，而不是 exit 2。
+        const p2 = runCli(ARGV(patchedBin, againBin))
+        const log = cliLog(p2)
+        assert.equal(p2.status, 0, `幂等重跑必须 exit 0（旧版是 exit 2「不可交付」）：\n${log.slice(-4000)}`)
+
+        // 1) 计数必须保留：PASS 数一条不少，且不再有"命中 0/3""命中 0 处"这类失败行。
+        const m = /断言：(\d+) PASS \/ (\d+) FAIL/.exec(log)
+        assert.ok(m, `应打印断言小结：\n${log.slice(-2000)}`)
+        assert.equal(Number(m[2]), 0, `幂等重跑不得有任何 FAIL：\n${log.slice(-4000)}`)
+        // 27 = 新鲜跑的 26 + --allow-foreign-base 那条**存证**（只在确有指纹差异时才新增，且现在是 PASS）。
+        assert.equal(Number(m[1]), 27, "幂等重跑的 PASS 数 = 新鲜 26 + 指纹豁免存证 1")
+        for (const needle of ["基线六项 ① 实名提示", "基线六项 ② 全新安装登录弹窗", "基线六项 ③ 欢迎入园横幅",
+            "基线六项 ④ Bundle ID 资源校验", "基线六项 ⑤ 协议门", "基线六项 ⑥ sohu 外发屏蔽",
+            "endpoint=none：guard-mode=all 实际命中 3 处致命中止"]) {
+            assert.ok(log.includes(`[PASS] ${needle}`), `该断言在幂等重跑里必须 PASS：${needle}\n${log.slice(-3000)}`)
+        }
+        // 幂等路径必须**自证**是幂等（而不是把断言删了）：三条"幂等重跑"说明必须出现在日志里。
+        for (const needle of ["幂等重跑：输入已是补丁后产物", "幂等重跑：原值已是目标字节", "幂等重跑：另有"]) {
+            assert.ok(log.includes(needle), `幂等路径必须留下可核对的存证：${needle}\n${log.slice(-3000)}`)
+        }
+
+        // 2) 外部独立复核（不引用工具的任何内部表）：六项补丁 + launch guard 的目标偏移上，
+        //    基座 patchedBin **本来就是目标字节** —— 这证明上面的幂等 PASS 不是把断言放宽换来的。
+        const base = fs.readFileSync(patchedBin)
+        const TARGET = {
+            0x6ae0dc: 0x52800000, 0x68e878: 0xd503201f, 0x68e898: 0xd503201f, 0x68e8d8: 0xd503201f,
+            0x6adb14: 0xd2800000, 0x64b238: 0xd2800000, 0x634890: 0xd503201f, 0x312230: 0xd2800000,
+            0x6c6cfc: 0x14000038, 0x698990: 0x52800000, 0x60f15c: 0x52800000, 0xb00c: 0xd503201f,
+        }
+        for (const [off, want] of Object.entries(TARGET)) {
+            assert.equal(base.readUInt32LE(Number(off)), want, `夹具基座 @${off} 已是目标字节`)
+        }
+
+        // 3) 产物逐字节不变（幂等重跑不得写坏任何字节）
+        const out = fs.readFileSync(againBin)
+        assert.equal(out.length, base.length, "幂等重跑产物长度必须不变")
+        assert.equal(sha256(out), sha256(base), "幂等重跑产物必须与输入基座逐字节相同")
+
+        // 4) 负向半边（三态必须真三态）：把①的目标字节改成**既非期望原值、也非目标值**的第三值 ⇒
+        //    必须照旧 exit 2。这一条把"幂等分支"与"静默放过"钉开：放宽就必然在这里变绿。
+        const brokenBin = path.join(outDir, "broken.bin")
+        const broken = Buffer.from(base)
+        broken.writeUInt32LE(0xdeadbeef, 0x6ae0dc)
+        fs.writeFileSync(brokenBin, broken)
+        const p3 = runCli(ARGV(brokenBin, path.join(outDir, "broken-out.bin")))
+        const log3 = cliLog(p3)
+        assert.equal(p3.status, 2, `真不匹配（0x6ae0dc=0xdeadbeef）必须照旧 exit 2：\n${log3.slice(-4000)}`)
+        assert.ok(log3.includes("[FAIL] 基线六项 ① 实名提示"), `真不匹配必须让①红：\n${log3.slice(-3000)}`)
+        assert.ok(!log3.includes("幂等重跑：原值已是目标字节 0xdeadbeef"),
+            `0xdeadbeef 既不是期望原值、也不是目标值，不许被当成幂等：\n${log3.slice(-3000)}`)
+    } finally {
+        fs.rmSync(outDir, { recursive: true, force: true })
+    }
+})
+
 test("默认模式（--endpoint=rewrite）老命令仍改写 138 处端点", { skip: FIXTURE_SKIP }, () => {
     const [host, port] = HOST_PORT.split(":")
     const res = runCli(["--ipa", "apkipa/iOS-1.8.4.ipa", "--host", host, "--port", port,
