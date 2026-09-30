@@ -170,7 +170,7 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     NSString *origin = [prefix substringFromIndex:@"http://".length];
     if (![result.absoluteString hasPrefix:prefix]
         || ![result.host isEqualToString:url.host]
-        || requestTargetForURL(result).length != target.length) {
+        || [[self class] requestTargetForURL:result].length != target.length) {
         SPLoginLog(@"[SpLogin] 拒绝改写：目标未落在 %@ 上（target=%@）", origin, rewritten);
         return nil;
     }
