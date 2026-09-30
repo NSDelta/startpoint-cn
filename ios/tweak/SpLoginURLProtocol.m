@@ -59,6 +59,20 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     return [@"http://" stringByAppendingString:hostPort];
 }
 
+/// 我们自己的 authority（`host[:port]`），取自 `rewritePrefix`；解析不出 host 时返回 `nil`。
+/// `rewritePrefix` 必然是 `http://` + `[SpLoginConfig sharedConfig].hostPort`（见上），
+/// 所以这里的 `NSURL` 解析只可能因为 hostPort 本身畸形（例如带空格）而失败 —— 那种情况下
+/// 调方按「拒绝改写」处理（fail-closed），绝不放一个 authority 不明的请求出去。
++ (nullable NSString *)rewriteOriginHost
+{
+    NSString *prefix = [self rewritePrefix];
+    if (prefix.length == 0) {
+        return nil;
+    }
+    NSString *host = [NSURL URLWithString:prefix].host;
+    return host.length > 0 ? host : nil;
+}
+
 + (BOOL)isOfficialSdkHost:(NSString *)host
 {
     NSString *lower = host.lowercaseString;
@@ -165,13 +179,20 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
         // 把签名字节改掉）。宁可当坏 URL 报错（NSURLErrorBadURL），也不发一个签名被改坏的请求。
         return nil;
     }
-    // 防御性校验：改写后的 authority 必须还落在我们自己的 host:port 上，且 request-target
-    // 一段不丢（防止目标被拼成 `/`、或 `@`/`#` 之类字符把解析引到别的 host 上去）。
-    NSString *origin = [prefix substringFromIndex:@"http://".length];
-    if (![result.absoluteString hasPrefix:prefix]
-        || ![result.host isEqualToString:url.host]
+    // 防御性校验：改写后的 authority 必须是**我们自己的** host，且 request-target 一段不丢
+    // （防止 target 里的 `@`/`#`/`?` 之类字符把解析引到别的 host 上去）。
+    //
+    // 这里**不能**拿 `url.host` 来比：`url` 是原始请求，而 `+canInitWithRequest:`（:90-104）
+    // 只在 `isOfficialSdkHost(url.host)` 为真时才让我们进来 ⇒ `url.host` 必然是 `*.leiting.com`
+    // / `*.roguelike.com` / `*.cl2009.com`，与我们自己的 host（`[SpLoginConfig hostPort]` 的
+    // 主机部分）**永远不相等**。写成 `![result.host isEqualToString:url.host]` 会让这个子句恒真
+    // ⇒ 每一条被拦截的请求都 return nil ⇒ 全部走 NSURLErrorBadURL。要比的是 prefix 自己的 host。
+    NSString *originHost = [[self class] rewriteOriginHost];
+    if (originHost == nil
+        || ![result.host isEqualToString:originHost]
         || [[self class] requestTargetForURL:result].length != target.length) {
-        SPLoginLog(@"[SpLogin] 拒绝改写：目标未落在 %@ 上（target=%@）", origin, rewritten);
+        SPLoginLog(@"[SpLogin] 拒绝改写（origin host=%@, result host=%@, target=%@）",
+                   originHost ?: @"(prefix 解析不出 host)", result.host, rewritten);
         return nil;
     }
     return result;

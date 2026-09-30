@@ -6,7 +6,9 @@
 // P10-A 那条线是在 IPA 里原地改字节；本 tweak 线走运行时改写，好处是**官方 IPA 一字节不改**。
 //
 // 拦截面（只认官方 SDK 域名后缀，其余流量一律放行）：
-//   leiting.com / roguelike.com / cl2009.com  →  http://<SPLoginHost>/<path>?<query>
+//   https://<x>.leiting.com<request-target>  →  http://<SPLoginHost><request-target>
+//   其中 request-target（path + `?query` + `#fragment`）**一个字节不改**地搬过去 ——
+//   详见 `.m` 的 `+requestTargetForURL:` 与 `ios/tweak/README.md` §3.1。
 // scheme 改成 http：官方 Info.plist 里 `NSAppTransportSecurity/NSAllowsArbitraryLoads = true`
 // （已取证：`apkipa/iOS-1.8.4.ipa!Payload/worldflipper.app/Info.plist:127-131`），所以明文 HTTP
 // 不会被 ATS 拦掉。

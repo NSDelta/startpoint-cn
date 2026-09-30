@@ -184,9 +184,57 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 `36724884977` 两条腿实测 `error: property 'percentEncodedPath' not found on object of type
 'NSURL *'`，6 errors）。所以 `NSURL URLWithString:` 一旦返回 nil 就直接当坏 URL
 （`NSURLErrorBadURL`）上报 —— 宁可报错，也绝不退回 `url.path` / `url.query` 那种
-「先解码再编码」的写法去发一个签名被改坏的请求。另外每次改写都做一次防御校验：
-产物的 `absoluteString` 必须以 `http://<SP_LOGIN_HOST>` 开头、`host` 必须等于原 host、
-且 request-target 长度一段不丢，否则拒绝改写并写日志。
+「先解码再编码」的写法去发一个签名被改坏的请求。
+
+### 3.2 防御校验只能比 prefix 自己的 host（`SpLoginURLProtocol.m`，2026-10-01 修）
+
+每次改写后有一道 fail-closed 校验，三个子句任一成立就拒绝改写（写日志 + 返回 `nil`
+⇒ 上层报 `NSURLErrorBadURL`）：
+
+1. `[[self class] rewriteOriginHost] == nil` —— `prefix` 解析不出 host（`hostPort` 畸形，
+   例 `http://`、`http:// host:8001`）；
+2. `![result.host isEqualToString:originHost]` —— 产物的 host **不是我们自己的** host；
+3. `[[self class] requestTargetForURL:result].length != target.length` —— 产物被截断。
+
+**第 2 条曾经写成 `![result.host isEqualToString:url.host]`，那是恒真的错判**：`url` 是
+原始请求，而 `+canInitWithRequest:` 只在 `+isOfficialSdkHost(url.host)` 为真时才放行 ⇒
+`url.host` 必然是 `*.leiting.com` / `*.roguelike.com` / `*.cl2009.com`；`result` 是
+`http://<SP_LOGIN_HOST>` + target，它的 host 必然是 `SPLoginHost` 里的主机。两者**永远
+不相等** ⇒ 每一条被拦截的请求都被自己拒掉，比它要修的旧缺陷更糟（旧缺陷是「部分请求坏
+URL」，那个版本是「一条都不放行」）。CI 只编译不运行，抓不到这类恒真判定；
+`url-rewrite-sim.cjs` 第一版也只建模了字符串变换、没建模这道 guard，所以也没抓到。
+现在的等价推演把 guard 一起建模了（`url-rewrite-sim.cjs` §B），结论：
+
+| 场景 | 旧写法（比 `url.host`） | 新写法（比 prefix 的 host） |
+| --- | --- | --- |
+| 正常流量：`api.leiting.com/...` → 我们自己的 host | **拒绝**（恒真错判 = 真机全崩） | **放行** ✅ |
+| 10 组正常流量（含 `%26`/`+`/非 ASCII/`#`/无路径/带端口） | — | **10/10 放行** ✅ |
+| `prefix` = `http://` 或 `http:// host:8001` | — | **拒绝**（fail-closed）✅ |
+| 产物 host 被顶成别的域名（直接喂 `prefix`+`@evil.com/x`） | 拒绝 | **拒绝** ✅ |
+| `https://api.leiting.com#@evil.com/x`（fragment 注入） | 拒绝（错的理由） | 放行（产物仍是我们自己的 host，无害） |
+| `https://api.leiting.com/@evil.com/x`（`@` 在 path 里） | 拒绝（错的理由） | 放行（`@` 在第一个 `/` 之后 ⇒ 属 path，不是 userinfo） |
+
+**别把这道 guard 读成抗注入的主力**：只要 target 一定是「原始 URL 尾部片段」、且只被
+`prefix` **前置拼接**，产物 host 就必然是我们自己的，「打到别的域名」这件事是由这个结构
+保证的，不是 guard 保证的。第 2 条在当前改写函数下**不可达**（尾部片段的第一个字符只能是
+`/` `?` `#`，构造不出以 `@` 开头的 target）——它守的是「将来改写函数被改动」时的一致性；
+第 3 条同理，只在前置拼接被破坏（产物截断）时才咬人。这三条是兜底，不是安全边界。
+
+**`target.length == 0` 的行为（有意为之，不是漏掉）**：`https://api.leiting.com` 这种
+「authority 之后什么都没有」的官方 URL，改写结果是 `http://<SP_LOGIN_HOST>`（**无尾斜杠**），
+不是 `http://<SP_LOGIN_HOST>/`。理由：这是「切 `absoluteString` 的 origin」这一条规则的
+直接推论 —— 原始 request-target 是空串，就没有任何字符可以接上去；手工补 `/` 反而是凭空
+发明一个原始请求里不存在的字节，与「逐字符等于切 origin」的契约冲突。**未经真机验证的
+风险**：如果服务端对这个无尾斜杠形态返回 404、而根路径 `/` 才是唯一入口，那就得在
+`rewritePrefix` 层面（而不是改写函数里）决定要不要补 `/` —— 那属于配置/入口约定，
+写进这里备案，不在本函数里偷偷补。
+
+**未验证**：以上是「切 `absoluteString`」与等价 JS 推演的逐字符一致性结论，
+**不是真机验证**——SDK 在真机上到底发什么形态的查询串（是否用 `+` 表示空格、
+是否有 `%2F` 落在路径段）、以及官方 SDK 是否真会发「无路径只有查询串」的 URL，
+都仍需看 `SpLogin.log` 里那行 `rewrite …` 才能确认。JS 推演（§A 字符串变换 + §B guard
+判定）只证明字符串/判定逻辑自洽，**不能**被读成运行时结论；反过来，这次 §B 抓到的
+「恒真拒绝」正是 CI（只编译）与 §A（只建模字符串）都漏掉的那类缺陷。
 
 ## 4. 开关（`SpLogin.plist`）
 
