@@ -789,21 +789,51 @@ export default async function iosLeitingRoutes(
     //     不带任何可用于关联玩家的凭据。因此这里一律不解析账号、不查库、不落库 ——
     //     否则会重蹈 load.ts:208-215 注释里「未认证 viewer_id 被当账号」的覆辙。
     //  2. **不读 body**。埋点体形状未知（8001 抓头代理 capture.jsonl 里没有这 4 条的记录），
-    //     纯吞掉 ⇒ body 解析失败也绝不影响响应（Fastify 默认 JSON/urlencoded 解析器）。
+    //     纯吞掉 ⇒ body 解析失败也绝不影响响应。
     //  3. `protocols/leiting/sensitive/part/*.txt` **故意不在**这里实现：它是已定稿决策
     //     （tools/ios_leiting_route.test.cjs:267-278「remain unavailable without
     //     authoritative payloads」+ tools/combined_startup.test.cjs:124-126
     //     「协议版本文件没有权威 payload，保持未实现」），没有权威 payload 前必须继续 404。
+    //
+    // 契约：这 3 条路由必须在**任意 content-type / 任意体形态**下都回 200 + `{code:0}`
+    // （真机埋点体形状未知 ⇒ 不能赌它是 JSON）。光「不读 body」不够：路由一旦匹配，
+    // Fastify 会**先**跑 body 解析器，遇到「没有解析器的 content-type + 非空体」直接回
+    // 415（`FST_ERR_CTP_INVALID_MEDIA_TYPE`）—— 那样 404 噪声只是被换成 415 噪声，
+    // 目标落空。而 404 兜底路径不跑解析器，所以这个问题只在路由被实现**之后**才出现
+    // （工具链里同类失效模式的既有钉子：tools/udid_probe.test.cjs:141-172）。
     const telemetryAck = { code: 0 } as const
-    for (const route of [
+    const telemetryReportPaths = [
         "/behavior_log/report",
         "/api/device/report",
         "/api/iplog/report",
-    ] as const) {
-        fastify.post(route, async (_request, reply) => {
-            return reply.type("application/json").send(telemetryAck)
+    ] as const
+    // 收进**独立子作用域**，兜底解析器只在这个作用域里生效（Fastify 的 content-type 解析器
+    // 按插件作用域封装）。**不要**在插件顶层写 fastify.addContentTypeParser("*", …)：
+    // 那会泄漏给 /sync_data、/logmonitor/api/advert!getNewConfig.action、
+    // /api/mg_log!addMgLoginLog.action 等全部同级路由，把它们既有的 415 语义一起抹掉
+    // （封装性反向断言见 tools/ios_unknown_routes.test.cjs「zero leakage」那一条）。
+    fastify.register(async function telemetryReportScope(scope: FastifyInstance): Promise<void> {
+        // 先清掉**本作用域继承来的**具名解析器（顶层 cn-server.ts:156/:169 的
+        // application/x-www-form-urlencoded 与 application/json），再装 `*` 兜底。
+        // 不这样做就留着一条缝：Fastify 的 `*` 只在「没有具名解析器匹配」时才生效
+        // （node_modules/fastify/lib/contentTypeParser.js:139），于是顶层那两个解析器会
+        // 抢在兜底前面 —— 例如 `content-type: application/x-www-form-urlencoded` 配非 UTF-8
+        // 字节，顶层解析器会以 FST_ERR_CTP_INVALID_CONTENT_LENGTH 回 400（实测），
+        // 「任意体形态都吞」的契约就破了。removeAll 只作用于本作用域自己的解析器副本，
+        // 父作用域与同级路由不受影响（反向断言仍是 /sync_data 的 415）。
+        scope.removeAllContentTypeParsers()
+        // `*` 兜底：只缓冲、不解析 ⇒ 不读字段、不碰身份。缓冲有上界（cn-server.ts:105
+        // `bodyLimit: 262144`），不会变成无界内存槽；`done(null, undefined)` 让
+        // `request.body` 恒为 undefined，处理器连读都读不到（比「读了不用」更强的约束）。
+        scope.addContentTypeParser("*", { parseAs: "buffer" }, (_request, _body, done) => {
+            done(null, undefined)
         })
-    }
+        for (const route of telemetryReportPaths) {
+            scope.post(route, async (_request, reply) => {
+                return reply.type("application/json").send(telemetryAck)
+            })
+        }
+    })
 
     // 社区入口（micro_red）：同族端点（/logmonitor、/api/skan）回 `{code:0,data:{}}`，
     // 形状保持一致。**未验证**：客户端是否据 `data` 里的字段决定跳转社区页（静态判不了），
