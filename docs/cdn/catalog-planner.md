@@ -10,7 +10,7 @@
 - 停服前从官方 CDN 主机下载的 CN 1.4.54 dump；
 - Content Sync 从该官方 dump 生成 current Release；没有 current Release 时，服务端才使用版本库跟踪的 `assets/cdn/catalog-cn-1.4.54.json` 作为 fallback Catalog。该 Catalog 只引用 Android 所需的 common、medium（Catalog `quality` 层）和 platform 归档。
 
-物理 dump 共含 692 个 ZIP，其中包括 Android 和 iOS 归档；tracked manifest 引用 677 个 Android common/medium/platform Catalog 归档，即 490 个 full 和 187 个 diff，不引用 5 个 iOS full 与 10 个 iOS diff。“完整”只表示这 677 个归档覆盖 manifest 声明的 Android Catalog 范围，不表示运行时使用全部 692 个物理 ZIP。
+物理 dump 共含 736 个 ZIP，其中包括 Android 和 iOS 归档；tracked manifest 引用 677 个 Android common/medium/platform Catalog 归档，即 490 个 full 和 187 个 diff，不引用 5 个 iOS full 与 54 个 iOS diff（后者由 iOS 目录视图在启用 iOS 兼容时另行使用）。“完整”只表示这 677 个归档覆盖 manifest 声明的 Android Catalog 范围，不表示 Android Catalog 使用全部 736 个物理 ZIP。
 
 Android Catalog 范围缺失、不完整、被修改、重新打包或自制的 CDN 不属于运行时兼容目标。CN 1.8.1 之外的客户端、额外修改资源下载器或战斗逻辑的客户端也不在保证范围内。
 

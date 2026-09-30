@@ -9,12 +9,12 @@ import fs from "node:fs"
 import path from "node:path"
 
 import type { ContentSnapshot } from "../runtime/content-snapshot"
+import { parseEntityListInstalledBytes } from "./catalog-builder"
 import type { CatalogArchive, CatalogEdge, CdnCatalog } from "./types"
 
 const IOS_FULL_DIRECTORY = "archive-ios-full"
 const IOS_DIFF_DIRECTORY = "archive-ios-diff"
 const ARCHIVE_VERSION_PATTERN = /(?:pinball|asset)-(\d+\.\d+\.\d+)-(\d+\.\d+\.\d+)-\d+-/
-const ENTITY_LIST_HEADER = "path,version,size,hash,layer"
 const EMPTY_ALLOWLIST: ReadonlyMap<string, number> = Object.freeze(new Map<string, number>())
 
 export type IosCompatState =
@@ -176,24 +176,18 @@ export function resolveIosEntityList(catalog: CdnCatalog, cdnRoot: string): stri
     return `${directory}/${candidates[0]}`
 }
 
+// 与 Android 侧同源：直接复用 catalog-builder 的规范解析器（表头可选、UTF-8 BOM 容忍、
+// 引号感知的 CSV 切分、恰好 5 列、第三列 /^\d+$/），不再在 iOS 侧另写一份，避免两份
+// 实现再次漂移。官方实体表实测无表头（首行即数据行），因此绝不能要求首行为表头——
+// 旧实现 `lines.shift() !== ENTITY_LIST_HEADER` 把真实实体表一律判为非法。
+// 调用方契约：任何解析失败（含 parseEntityListInstalledBytes 抛出的 CatalogValidationError）
+// 一律返回 null（= iOS 视图不可用），绝不向上抛。
 function readEntityListInstalledBytes(cdnRoot: string, entityList: string): number | null {
     // 与 Android installedBytes 语义一致：实体表 size 列之和（未压缩字节），
     // 不使用 ZIP 压缩下载量。
     const absolutePath = path.join(cdnRoot, ...entityList.split("/"))
-    let total = 0
     try {
-        const lines = fs.readFileSync(absolutePath, "utf8").split(/\r?\n/)
-        if (lines.shift() !== ENTITY_LIST_HEADER) return null
-        for (const line of lines) {
-            const trimmed = line.trim()
-            if (trimmed.length === 0 || trimmed.startsWith("#")) continue
-            const columns = trimmed.split(",")
-            if (columns.length < 3) return null
-            const size = Number(columns[2])
-            if (!Number.isSafeInteger(size) || size < 0) return null
-            total += size
-        }
-        return total
+        return parseEntityListInstalledBytes(fs.readFileSync(absolutePath))
     } catch {
         return null
     }

@@ -54,10 +54,10 @@ World Flipper 国服（Leiting CN）CDN 私服的目录结构、文件寻址、�
 ├── archive-common-diff/           — 通用增量（79 ZIPs，663MB）
 ├── archive-medium-diff/           — 中画质增量（54 ZIPs，48MB，内容为 .empty 占位）
 ├── archive-android-diff/          — Android 增量（54 ZIPs，~0，内容为 .empty 占位）
-└── archive-ios-diff/              — iOS 增量（10 ZIPs）
+└── archive-ios-diff/              — iOS 增量（54 ZIPs）
 ```
 
-**总计**：692 个 ZIP（322+164+4+5+79+54+54+10），约 10GB，覆盖版本 1.4.0 → 1.4.54（54 个增量版本）。
+**总计**：736 个 ZIP（322+164+4+5+79+54+54+54），约 10GB，覆盖版本 1.4.0 → 1.4.54（54 个增量版本）。
 
 `medium-diff` 和 `android-diff` 的 ZIP 文件均为占位符（仅含 `.empty`），实际增量数据都在 `common-diff` 中。
 
@@ -66,6 +66,12 @@ World Flipper 国服（Leiting CN）CDN 私服的目录结构、文件寻址、�
 ## EntityLists CSV 格式
 
 每行 5 列，逗号分隔：
+
+实测：官方 `EntityLists/*_medium.csv`（`10939-android_medium.csv` / `10939-ios_medium.csv`）
+**首行即数据行，没有表头，也没有 UTF-8 BOM**。服务端两种都容忍——规范解析器
+`parseEntityListInstalledBytes`（`src/content/cdn/catalog-builder.ts`）把首行表头当可选：
+仅当首行恰好等于 `path,version,size,hash,layer` 时才跳过，并容忍 BOM。iOS（`ios-compat.ts`）
+与 Android 两条路径共用这一个解析器，因此 `installedBytes` 语义一致（实体表 size 列之和）。
 
 ```
 production/upload/2d/5cb9b28d...,1.4.43,72979,SHA256_BASE64,common
@@ -348,7 +354,7 @@ const plan = planCdnUpdate(contentSnapshot.cdn, {
 | CharacterTable 条目数 | 505 |
 | `character_iosbundled` hash | `db69828cac33bfcdd1d4c65e8b354adf0e815e26`（bundle stub 含 4 条目） |
 | CharacterTable 主路径 hash | `2d5cb9b28d18f984a51b345a4d7aab03d77bddfc` |
-| CDN 总 ZIP 数 | 692（322+164+4+5+79+54+54+10） |
+| CDN 总 ZIP 数 | 736（322+164+4+5+79+54+54+54） |
 | CDN 总大小 | ~10 GB |
 | 版本范围 | 1.4.0 → 1.4.54 |
 | APK 壳版本 | 1.8.1（Leiting SDK） |
