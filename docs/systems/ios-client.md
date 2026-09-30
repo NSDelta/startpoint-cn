@@ -124,6 +124,27 @@ SDK 用 `%@sdk_v3/get_notice.do` 在运行时拼基址，静态无法确定基�
 | SDK 日志 | GET/POST | `{code:0,message:"success"}` | `:751-756` |
 | `/wf/210009_config_20200415.json` | GET | 回 `apiPath`/`apiScheme` 引导配置 | `:759-766` |
 | `/sync_data` | POST | 静默吞掉，`{code:0}` | `:768-771` |
+| `/behavior_log/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
+| `/api/device/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
+| `/api/iplog/report` | POST | 埋点静默吞掉，`{code:0}` | `:796-805` |
+| `/api/micro/micro_red/enter_position` | GET | 社区入口，`{code:0,data:{}}` | `:810-812` |
+
+**平台/设备埋点（2026-09-29 真机）**：iPhone 7 Plus / iOS 15.8.3 启动时共 155 条请求 /
+26 种 route×status，其中 35 条落在未知路由 404 上。上表最后 4 行覆盖其中的 27 条
+（`behavior_log/report` 12、`enter_position` 8、`device/report` 4、`iplog/report` 3）。
+它们全是**平台侧埋点**，不参与游戏进度，故一律静默吞掉、**不读 body、不解析身份、不落库**。
+
+- `enter_position` 真机查询串是 `?channelNo=210009&game=wf&token=(null)&userId=(null)`
+  —— `token`/`userId` 是**字面串 `(null)`**（客户端 Leiting SDK extension 未赋值的属性被
+  `%@` 打印成 `(null)`），即该请求**不带任何可用于关联玩家的凭据** ⇒ 服务端**不得**把它当
+  已认证请求读账号（`src/routes/cn/load.ts:208-215` 有同类覆辙的注释）。
+- 埋点 body 形状未知（8001 抓头代理 `capture.jsonl` 里没有这 4 条记录）⇒ 任何 body 都照样 200。
+- 回归测试：`tools/ios_unknown_routes.test.cjs`（登记在 `integration:cdn` 组）。
+
+**仍保持 404（刻意不实现）**：`/protocols/leiting/sensitive/part/{wf,common}[-text]_version.txt`
+共 4 条（真机各 2 次）。原因是**没有权威 payload**，属已定稿决策，钉子断言在
+`tools/ios_leiting_route.test.cjs:267-278` 与 `tools/combined_startup.test.cjs:124-126`。
+`misclog` 亦未实现（真机日志中 0 命中，未能取证）。
 
 路径表定义在 `src/routes/cn/ios-leiting.ts:42`（`SDK_LOG_PATHS`）与 `:49`（`MG_LOG_PATHS`）。
 

@@ -1406,6 +1406,7 @@ test("generator aggregate includes both leaves while full only adds the self-con
         "tools/ios_asset_route.test.cjs",
         "tools/combined_startup.test.cjs",
         "tools/ios_leiting_route.test.cjs",
+        "tools/ios_unknown_routes.test.cjs",
         "tools/version_dis_android.test.cjs",
         "tools/legacy_asset_state.test.cjs",
     ])
