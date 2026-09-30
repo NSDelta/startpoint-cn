@@ -43,6 +43,7 @@
 | `36421222764` | `0c33c9a4` | 链接已修好，编译期 `SpLoginConfig.h:45` `-Werror,-Wnullability-completeness` |
 | `36421542559` | `38766025` | **全部成功**：`make` + `make package` 两条腿（rootful / rootless）均绿 |
 | `36711298756` | `120bab29` | **游戏化皮肤版本全部成功**（两条腿均绿，见下方 2.1 产物指纹） |
+| `36712219651` | `e57629bb` | 同源码 + 文档补充，**再次全绿**（产物指纹见 2.1，数字与上一次不同属预期） |
 
 所以「工作流本身跑得起来、依赖装得上、源码能编译、deb 能打出来」现在都已被 CI 证实。
 
@@ -85,6 +86,21 @@ git fetch mine 'refs/heads/ci-out/36711298756/*:refs/remotes/mine/ci-out/3671129
 git show 'mine/ci-out/36711298756/rootless:ci-out/36711298756/rootless/SpLogin.dylib' > /tmp/SpLogin.dylib
 shasum -a 256 /tmp/SpLogin.dylib
 ```
+
+**产物不是逐位可复现的**，同一份 `.m` 源码连着跑两次，字节数一样但 sha256 会变（`run_id`
+`36711298756` vs `36712219651`，同一个 `agent/ios-skin` 分支、仅文档改动）：
+
+| 腿 | 产物 | run `36711298756`（sha256） | run `36712219651`（sha256） |
+| --- | --- | --- | --- |
+| rootful | `SpLogin.dylib`（178720 B 两次相同） | `ac7a9d98…1dd0e5` | `419a3ef1…4b0fae` |
+| rootless | `SpLogin.dylib`（178720 B 两次相同） | `d3b87bef…e8dddd` | `b5444d8a…6e10a4` |
+| rootful | `.deb`（42966 → 42540 B） | `df4d9457…889ea1` | `b7a95613…6170bb7` |
+| rootless | `.deb`（42580 → 42862 B） | `58662c3b…56483a` | `fecb54cc…3100e22` |
+
+原因：`ld` 会把构建时间/路径信息带进 Mach-O（`LC_UUID`、`LC_BUILD_VERSION` 等），`dpkg-deb`
+的压缩也会带上 `mtime`。所以**判断「编进去的是不是这次的代码」不要看 sha256 相等，要看
+① 字节数（皮肤后稳定在 178720，皮肤前是 124560）② `build.log` 里出现本次改动文件的编译行**。
+两处都满足，见上表与上面的日志片段。
 在你自己的 Mac 上：
 
 ```sh
