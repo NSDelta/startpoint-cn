@@ -144,6 +144,14 @@ jobs:
       # 开关必须**在产物上**成立，而不是只在命令行上成立：
       # 转发关闭时，SpLoginURLProtocol 这个类名不得出现在 dylib 里（源文件已被移出编译单元）。
       # 这是本开关唯一的机器可验证判据，故放在这里 fail-fast，不放诊断通道。
+      #
+      # 两条用血换来的纪律（run 36720150349 两条腿都在本步静默变红，而编译与打包其实都成功）：
+      # ① 绝不能写 `hits=$(grep … | wc -l)`：grep 无命中时退出码是 1，配合外层 shell 的 -e 与
+      #    本步的 pipefail，赋值语句会直接终止整步 —— 且恰好炸在「应该通过」的那一侧，
+      #    一个字符都来不及打印。⇒ grep 必须包进 `( … || true )`，且先 echo 再判定。
+      # ② `find .theos/obj -name 'SpLogin*.dylib' | head -1` 拿到的是 .theos/obj/arm64/SpLogin.dylib
+      #    （未 strip 的中间产物）；真正要交付、要装进 deb 的是 deb 里那一份。
+      #    ⇒ 断言以 **deb 内实际安装的那份**为准，中间产物只作旁证。
       - name: 断言 SP_LOGIN_FORWARDING 生效（类名级二进制自证）
         if: always()
         working-directory: ios/tweak
@@ -151,22 +159,47 @@ jobs:
           SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
         run: |
           set -uo pipefail
-          dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
-          if [ -z "$dylib" ]; then
-            echo "::warning::没有找到 dylib，跳过开关断言（构建是否成功由 make 步骤决定）"
-            exit 0
+
+          # 判据一：从 deb 里解出真正会被安装的那份 dylib（最高保真）
+          shipped=""
+          deb=$(ls packages/*.deb 2>/dev/null | head -1 || true)
+          if [ -n "$deb" ]; then
+            rm -rf "$RUNNER_TEMP/shipped"
+            mkdir -p "$RUNNER_TEMP/shipped"
+            dpkg-deb -x "$deb" "$RUNNER_TEMP/shipped" >/dev/null 2>&1 || true
+            shipped=$(find "$RUNNER_TEMP/shipped" -name 'SpLogin*.dylib' 2>/dev/null | head -1 || true)
           fi
-          hits=$(grep -a -o 'SpLoginURLProtocol' "$dylib" | wc -l | tr -d ' ')
-          echo "=== 开关自证: SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} dylib=${dylib} SpLoginURLProtocol 命中=${hits}"
-          if [ "$SP_LOGIN_FORWARDING" = "0" ] && [ "$hits" != "0" ]; then
-            echo "::error::SP_LOGIN_FORWARDING=0 但 dylib 里仍含 SpLoginURLProtocol（${hits} 处）—— 转发没有被编译期剔除"
+
+          # 判据二：obj 树里的每一份 dylib（含未 strip 的 arm64 中间产物 —— strip 藏不住一个
+          # 类名，未 strip 的那份最能暴露残留）。dSYM 里的 DWARF 副本不是产物，排除。
+          stubs=$(find .theos/obj -name 'SpLogin*.dylib' -not -path '*.dSYM/*' 2>/dev/null | sort || true)
+
+          targets=""
+          if [ -n "$shipped" ]; then targets="$shipped"; fi
+          if [ -n "$stubs" ]; then targets="${targets}${targets:+ }$stubs"; fi
+          if [ -z "$targets" ]; then
+            echo "::error::既没从 deb 里取到 dylib、也没找到中间产物 —— 开关无法自证，按失败处理"
             exit 1
           fi
-          if [ "$SP_LOGIN_FORWARDING" != "0" ] && [ "$hits" = "0" ]; then
-            echo "::error::SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} 但 dylib 里没有 SpLoginURLProtocol —— 转发被意外剔除"
-            exit 1
-          fi
-          echo "开关自证通过 ✓"
+
+          echo "=== 开关自证: SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} 待检 ${targets}"
+          rc=0
+          for f in $targets; do
+            # grep 无命中 ⇒ 退出码 1，必须吞掉，否则 -e + pipefail 会静默终止整步
+            hits=$( (grep -a -o 'SpLoginURLProtocol' "$f" || true) | wc -l | tr -d ' ')
+            bytes=$(wc -c < "$f" | tr -d ' ')
+            echo "--- file=${f} bytes=${bytes} SpLoginURLProtocol 命中=${hits}"
+            if [ "$SP_LOGIN_FORWARDING" = "0" ] && [ "$hits" != "0" ]; then
+              echo "::error::SP_LOGIN_FORWARDING=0 但 ${f} 里仍含 SpLoginURLProtocol（${hits} 处）—— 转发没有被编译期剔除"
+              rc=1
+            fi
+            if [ "$SP_LOGIN_FORWARDING" != "0" ] && [ "$hits" = "0" ]; then
+              echo "::error::SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING} 但 ${f} 里没有 SpLoginURLProtocol —— 转发被意外剔除"
+              rc=1
+            fi
+          done
+          if [ "$rc" = "0" ]; then echo "开关自证通过 ✓"; fi
+          exit "$rc"
 
       - name: 产物清单（取证）
         if: always()
