@@ -705,6 +705,173 @@ test("残留计数：真残留超过 8 处时 count 照实累加、samples 只�
     assert.equal(result.manifestFromResidueSamples.every(sample => sample === OLD_PKG), true)
 })
 
+// ─────────── 8c. 改名判据的端到端 PASS/FAIL（4 个 authorities 的 AIR 真实形态 + 三份变异体） ───────────
+//
+// 8/8b 钉的是 checkRenamedApk 这个**回读函数**的返回值；这一节钉的是**整条改名段**的判据：
+// 走真 CLI（--rename-package）＋ 桩改名工具写产物，断言 [5.5] 那几条断言的 PASS/FAIL 与失败原因文本。
+// 为什么非要到这一层：生产上 exit 2 就是照 assertions.list 判的（name = 哪一项，detail = 残留样例），
+// 光看回读函数的返回值证明不了「这一项坏了就会被点名」。
+
+const ZIP_ENGINE_URL = pathToFileURL(path.join(REPO, "client-patch", "build", "lib", "zip-ipa.mjs")).href
+
+// 断言名按**片段**匹配：整名是「改名后 AndroidManifest.xml 的 package 已是目标包名」等，
+// 取足以唯一区分的片段，免得改文案就把测试碰碎。注意不能只写「无旧包名残留」——
+// application.xml 那条同名断言（夹具无该 entry 时恒 PASS）会先被匹配到。
+const A_PACKAGE = "AndroidManifest.xml 的 package 已是目标包名"
+const A_RESIDUE = "AndroidManifest.xml 无旧包名残留"
+const A_ENTRIES = "改名未增删 zip 条目"
+
+/** 真实包里的 4 个 provider：authorities 全部按 applicationId 派生（与 tools/rename_package.test.cjs 同一组后缀）。 */
+const AUTHORITY_SUFFIXES = [".fileprovider", ".ltshare.fileprovider", ".provider", ".sobot_fileprovider"]
+
+/**
+ * 造一份「像真的」改名后 manifest（纯文本 XML —— 回读只做字节扫描，编码分支见 8b）：
+ * package = 目标包名、4 个 authorities 都带目标前缀、**只**留 AIR 入口类 air.<旧包名>.AppEntry。
+ * 三个具名开关分别用来做三份变异体。
+ */
+function renamedManifest({
+    pkg = NEW_PKG,
+    authorities = AUTHORITY_SUFFIXES.map(suffix => `${NEW_PKG}${suffix}`),
+    appEntry = `air.${OLD_PKG}.AppEntry`,
+    extra = "",
+} = {}) {
+    return `<manifest package="${pkg}">`
+        + authorities.map(authority => `<provider android:authorities="${authority}"/>`).join("")
+        + `<application android:name="${appEntry}"/>`
+        + extra
+        + `</manifest>`
+}
+
+/**
+ * 桩改名工具：把 --in 的 AndroidManifest.xml 换成 SPCN_STUB_MANIFEST（其余 entry 原样搬过去，
+ * 压缩方法/属性由 replaceEntryData 沿用），再按真工具的契约吐一行 JSON。
+ * 有了它，**不改实现**就能把「改对了 / 改错了」喂进真实的 [5.5] 判定。
+ */
+const RENAME_STUB = `import { readFileSync, writeFileSync } from "node:fs"
+import { readZipEntries, replaceEntryData, writeZipEntries } from ${JSON.stringify(ZIP_ENGINE_URL)}
+const argv = process.argv.slice(2)
+const value = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1] }
+const manifest = process.env.SPCN_STUB_MANIFEST
+if (!manifest) { console.error("rename-stub: 缺 SPCN_STUB_MANIFEST"); process.exit(1) }
+const entries = readZipEntries(readFileSync(value("--in")))
+replaceEntryData(entries, "AndroidManifest.xml", Buffer.from(manifest, "utf8"))
+writeFileSync(value("--out"), writeZipEntries(entries))
+console.log(JSON.stringify({ ok: true, from: "com.leiting.wf", to: value("--rename-to"), noop: false, equalLength: false }))
+`
+
+let renameStubPath = null
+function renameStub() {
+    if (renameStubPath === null) {
+        renameStubPath = path.join(fx.dir, "rename-stub.mjs")
+        fs.writeFileSync(renameStubPath, RENAME_STUB)
+    }
+    return renameStubPath
+}
+
+/** 走一次完整的 --rename-package 路线；manifestText = 桩写进产物的那份 manifest。 */
+function runRenameRoute(name, manifestText) {
+    const result = run(baseArgs(name, ["--rename-package", "--rename-tool", renameStub()]),
+        { env: { SPCN_STUB_MANIFEST: manifestText } })
+    return { result, report: readReport(out(`${name}.apk`)) }
+}
+
+/** 报告里没通过的断言名 —— 「失败原因能看出是哪一项」就靠它。 */
+function failedAssertions(report) {
+    return report.assertions.list.filter(item => !item.ok).map(item => item.name)
+}
+
+function assertionNamed(report, fragment) {
+    const item = report.assertions.list.find(entry => String(entry.name).includes(fragment))
+    assert.ok(item, `报告里应有含「${fragment}」的断言；实际：${report.assertions.list.map(e => e.name).join(" / ")}`)
+    return item
+}
+
+/**
+ * 取 detail 里「残留样例：…」那一段（0 处残留时该段不存在，返回空串）。
+ * 不能直接拿整条 detail 判 —— detail 里**固定**写着「受保护串，如 air.com.leiting.wf.AppEntry」。
+ */
+function residueSamplesOf(item) {
+    const marker = "残留样例："
+    const at = String(item.detail).indexOf(marker)
+    return at === -1 ? "" : String(item.detail).slice(at + marker.length)
+}
+
+test("改名判据（端到端）：package + 4 个 authorities 全带目标前缀、只留 air.<旧包名>.AppEntry ⇒ PASS（exit 0）", () => {
+    const manifest = renamedManifest()
+    // 陷阱就在这份「改对了」的产物里：整串 substring 必然命中（air.com.leiting.wf.AppEntry 内部）。
+    assert.equal(manifest.includes(`air.${OLD_PKG}.AppEntry`), true, "受保护串必须在产物里（否则这条用例没有陷阱）")
+    const { result, report } = runRenameRoute("rename-ok", manifest)
+    assert.equal(result.status, 0, `exit=${result.status}\nstdout=${result.stdout}\nstderr=${result.stderr}`)
+    assert.equal(report.ok, true)
+    assert.deepEqual(failedAssertions(report), [], "改对了就不该有任何 FAIL")
+    assert.equal(assertionNamed(report, A_PACKAGE).ok, true)
+    assert.equal(assertionNamed(report, A_ENTRIES).ok, true)
+    const residue = assertionNamed(report, A_RESIDUE)
+    assert.equal(residue.ok, true)
+    assert.match(residue.detail, /身份残留\(标识符开头\)=0 处/,
+        "产物里明明有旧包名子串（AppEntry），残留却是 0 ⇒ 正确判据放行了受保护串")
+    assert.equal(/残留样例/.test(residue.detail), false, "0 处残留就不该给样例")
+})
+
+test("改名判据（端到端）：变异体 1 —— 坏掉 package 必须 FAIL，且失败原因点名到具体那一处", () => {
+    // 1a：其余都对，只有 package 还是旧包名 ⇒ 必须 FAIL。
+    // 注意失败落在「无旧包名残留」这项而不是「package 已是目标包名」：后者的实现是**整串 substring**
+    // （hasEither(manifest, to)），4 个 authorities 已经带目标前缀，所以那一项看不出 package 没改。
+    // 这是判别据实现的上界，本次任务不改实现，在报告里如实记着（见交付报告「发现」一节）。
+    const stillOld = runRenameRoute("rename-oldpkg", renamedManifest({ pkg: OLD_PKG }))
+    assert.equal(stillOld.result.status, 2, `exit=${stillOld.result.status}\nstdout=${stillOld.result.stdout}`)
+    assert.equal(stillOld.report.ok, false)
+    assert.deepEqual(failedAssertions(stillOld.report), [assertionNamed(stillOld.report, A_RESIDUE).name],
+        "package 值落在标识符开头 ⇒ 由「无旧包名残留」这项抓，且只该有这一项亮红")
+    assert.equal(residueSamplesOf(assertionNamed(stillOld.report, A_RESIDUE)), OLD_PKG,
+        "样例正好是 package=\"…\" 那一处（而不是空话一句「有残留」）")
+
+    // 1b：package 与 4 个 authorities 全都没改（改名整段没生效）⇒ package 项自己也要亮红，
+    // 且 detail 能看出目标包名是哪个。
+    const untouched = runRenameRoute("rename-untouched",
+        renamedManifest({ pkg: OLD_PKG, authorities: AUTHORITY_SUFFIXES.map(suffix => `${OLD_PKG}${suffix}`) }))
+    assert.equal(untouched.result.status, 2)
+    const pkgItem = assertionNamed(untouched.report, A_PACKAGE)
+    assert.equal(pkgItem.ok, false)
+    assert.match(pkgItem.detail, /to=cn\.starpoint\.a/, "失败原因要能看出目标包名是哪个")
+    assert.deepEqual(failedAssertions(untouched.report).includes(pkgItem.name), true)
+})
+
+test("改名判据（端到端）：变异体 2 —— 4 个 authorities 里有一个还是旧前缀必须 FAIL，样例点名那一个", () => {
+    const broken = `${OLD_PKG}.ltshare.fileprovider`
+    const authorities = AUTHORITY_SUFFIXES.map(suffix =>
+        suffix === ".ltshare.fileprovider" ? broken : `${NEW_PKG}${suffix}`)
+    const { result, report } = runRenameRoute("rename-badauth", renamedManifest({ authorities }))
+    assert.equal(result.status, 2, `exit=${result.status}\nstdout=${result.stdout}`)
+    assert.equal(report.ok, false)
+    assert.deepEqual(failedAssertions(report), [assertionNamed(report, A_RESIDUE).name],
+        "package 与条目数都还是对的 ⇒ 只该有「无旧包名残留」这一项失败")
+    assert.equal(residueSamplesOf(assertionNamed(report, A_RESIDUE)), broken,
+        "样例要点名坏掉的那一个 authority")
+    assert.equal(residueSamplesOf(assertionNamed(report, A_RESIDUE)).includes("AppEntry"), false,
+        "受保护串不该混进残留样例（否则就说不清到底坏在哪一处）")
+})
+
+test("改名判据（端到端）：变异体 3 —— 多一处真残留必须 FAIL，且受保护的只有 air. 前缀那一种", () => {
+    // 3a：正文里多一处旧包名（别处都对）⇒ 残留 1 处、样例点名它。
+    const extraResidue = runRenameRoute("rename-extra",
+        renamedManifest({ extra: `<meta-data android:value="${OLD_PKG}"/>` }))
+    assert.equal(extraResidue.result.status, 2, `exit=${extraResidue.result.status}\nstdout=${extraResidue.result.stdout}`)
+    assert.equal(extraResidue.report.ok, false)
+    assert.deepEqual(failedAssertions(extraResidue.report), [assertionNamed(extraResidue.report, A_RESIDUE).name])
+    assert.match(assertionNamed(extraResidue.report, A_RESIDUE).detail, /身份残留\(标识符开头\)=1 处/)
+    assert.equal(residueSamplesOf(assertionNamed(extraResidue.report, A_RESIDUE)), OLD_PKG)
+
+    // 3b：把 AIR 入口类写成不带 air. 前缀的 `com.leiting.wf.AppEntry` ⇒ 前一个字节是引号，
+    // 落在标识符开头 ⇒ **必须**计数。保护的是「更长标识符内部」这个位置，不是 AppEntry 这个名字。
+    const bareEntry = runRenameRoute("rename-bareentry",
+        renamedManifest({ appEntry: `${OLD_PKG}.AppEntry` }))
+    assert.equal(bareEntry.result.status, 2, `exit=${bareEntry.result.status}\nstdout=${bareEntry.result.stdout}`)
+    assert.equal(assertionNamed(bareEntry.report, A_RESIDUE).ok, false)
+    assert.equal(residueSamplesOf(assertionNamed(bareEntry.report, A_RESIDUE)), `${OLD_PKG}.AppEntry`,
+        "少了 air. 前缀就不是受保护串了：allowlist 不能退化成「凡 AppEntry 一律放行」")
+})
+
 // ─────────── 9. 钩子合法改变 SWF 长度（长度守恒的参照 = 改写前那一刻，不是基线） ───────────
 
 const GROWING_HOOK = `export async function transformSwf(ctx) {
