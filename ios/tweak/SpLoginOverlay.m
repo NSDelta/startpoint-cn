@@ -86,6 +86,13 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 @property (nonatomic, assign) BOOL pendingShow;      // 触发早于宿主窗口就绪：挂上后自动打开
 @property (nonatomic, assign) BOOL keyboardObserversInstalled;
 @property (nonatomic, assign) NSUInteger attachAttempts;
+/// 呼吸动画只在挂载点开启一次（幂等：重复挂载不会叠出第二条动画）。
+/// 纯视觉，与「球是否可点/可拖/是否常驻」没有任何关系。
+@property (nonatomic, assign) BOOL ballPulsing;
+
+- (void)sp_animateBallPulseIfNeeded;
+- (void)sp_pressDown:(UIControl *)control;
+- (void)sp_pressUp:(UIControl *)control;
 
 @end
 
@@ -325,16 +332,15 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     CGRect screen = [UIScreen mainScreen].bounds;
     button.frame = CGRectMake(screen.size.width - kSpLoginBallSize - kSpLoginBallMargin,
                               kSpLoginBallTop, kSpLoginBallSize, kSpLoginBallSize);
-    button.backgroundColor = [SpLoginTheme primary];
-    button.layer.cornerRadius = kSpLoginBallSize / 2.0;
-    button.layer.shadowColor = [UIColor blackColor].CGColor;
-    button.layer.shadowOpacity = 0.35;
-    button.layer.shadowRadius = 6.0;
-    button.layer.shadowOffset = CGSizeMake(0, 2);
     [button setTitle:@"登" forState:UIControlStateNormal];
-    [button setTitleColor:[SpLoginTheme panel] forState:UIControlStateNormal];
-    button.titleLabel.font = [SpLoginTheme fontOfSize:22 weight:UIFontWeightBold];
     button.accessibilityLabel = @"SpLogin 服务器绑定";
+    // 外观（圆形渐变 + 描边 + 光晕 + 内高光）整体交给皮肤层。
+    // 行为一字未改：同样的 frame、同样的 target/pan、同样的常驻与拖动限制。
+    [SpLoginTheme applyFloatingBallStyle:button diameter:kSpLoginBallSize];
+    [button addTarget:self action:@selector(sp_pressDown:) forControlEvents:UIControlEventTouchDown];
+    [button addTarget:self action:@selector(sp_pressUp:)
+     forControlEvents:(UIControlEventTouchUpInside | UIControlEventTouchUpOutside |
+                       UIControlEventTouchCancel)];
     [button addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [button addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                        action:@selector(sp_handleBallPan:)]];
@@ -361,6 +367,7 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
                    root.bounds.size.width, root.bounds.size.height);
     }
     [self sp_clampBallInsideRoot:root];   // 旋转/换 scene 后把球拉回屏内
+    [self sp_animateBallPulseIfNeeded];   // 纯视觉呼吸（幂等；关掉皮肤则不动）
 }
 
 - (void)sp_clampBallInsideRoot:(UIView *)root
@@ -387,6 +394,73 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     ball.center = CGPointMake(ball.center.x + translation.x, ball.center.y + translation.y);
     [gesture setTranslation:CGPointZero inView:root];
     [self sp_clampBallInsideRoot:root];
+}
+
+#pragma mark - 悬浮球：纯视觉反馈（呼吸 + 按压）
+
+/// 呼吸：官方圆形按钮（circle-assets/color2ec4b6_radius64_glow6_shadow8）自带发光，
+/// 静态图在真机上像「贴纸」，给它一层 1.7s 的极轻微缩放，观感上更像游戏里会呼吸的按钮。
+/// 只动 transform（不改 frame/center/hitTest 结果），且尊重「减弱动态效果」无障碍开关。
+- (void)sp_animateBallPulseIfNeeded
+{
+    UIButton *ball = self.floatingButton;
+    if (ball == nil || self.ballPulsing) {
+        return;
+    }
+    if (![SpLoginConfig sharedConfig].skinEnabled) {
+        return;   // 皮肤关掉：球保持静态（旧观感）
+    }
+    if (UIAccessibilityIsReduceMotionEnabled()) {
+        return;   // 无障碍：不做动画
+    }
+    self.ballPulsing = YES;
+    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    pulse.fromValue = @1.0;
+    pulse.toValue = @1.045;
+    pulse.duration = 1.7;
+    pulse.autoreverses = YES;              // 来回缩放 = 呼吸
+    pulse.repeatCount = HUGE_VALF;
+    pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    pulse.removedOnCompletion = NO;
+    pulse.fillMode = kCAFillModeForwards;  // 与「点一下球」时的 0.94 按压动画共用 transform，避免闪回
+    [ball.layer addAnimation:pulse forKey:@"SpLoginBallPulse"];
+    SPLoginLog(@"[SpLogin] skin: 悬浮球呼吸动画已开（1.7s 循环，仅 transform）");
+}
+
+- (void)sp_pressDown:(UIControl *)control
+{
+    if (UIAccessibilityIsReduceMotionEnabled()) {
+        return;
+    }
+    // 呼吸动画会盖住按压的缩放（presentation layer 优先），按下时先摘掉它。
+    if (control == self.floatingButton) {
+        [control.layer removeAnimationForKey:@"SpLoginBallPulse"];
+        self.ballPulsing = NO;
+    }
+    [UIView animateWithDuration:0.09
+                          delay:0.0
+                        options:(UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        control.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    } completion:nil];
+    CABasicAnimation *glow = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    glow.fromValue = @1.0;
+    glow.toValue = @0.55;
+    glow.duration = 0.09;
+    glow.removedOnCompletion = NO;
+    glow.fillMode = kCAFillModeForwards;
+    [control.layer addAnimation:glow forKey:@"SpLoginPressGlow"];
+}
+
+- (void)sp_pressUp:(UIControl *)control
+{
+    // 无条件复位：即便「减弱动态效果」中途被打开，也不能把控件留在按下去的缩放态。
+    control.transform = CGAffineTransformIdentity;
+    [control.layer removeAnimationForKey:@"SpLoginPressGlow"];
+    if (control == self.floatingButton) {
+        [self sp_animateBallPulseIfNeeded];   // 松手后接回呼吸（幂等）
+    }
 }
 
 #pragma mark - 面板（复用 SpLoginViewController，不动业务逻辑）
@@ -465,8 +539,43 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
         [root bringSubviewToFront:self.floatingButton];
     }
     if (wasHidden) {
+        // 入场动画（纯视觉）。放在 hidden=NO 之后、日志之前：
+        // 动画只动 transform/opacity，不改 hidden，所以 `-isPanelVisible` 与 `pendingShow` 语义不变；
+        // 关键是它不引入任何延迟——面板立刻可点，动画只是叠在已就位的视图上。
+        [self sp_animatePanelIn];
         SPLoginLog(@"[SpLogin] overlay panel shown (reason=%@) %@", reason, [self sp_overlayState]);
     }
+}
+
+/// 面板入场：从 0.94 缩放 + 略偏下 + 透明，弹回原位（仿游戏内弹窗的「弹出」）。
+/// 只动 transform/alpha；键盘避让用的 transform 在动画开始前取当前值、结束后原样放回。
+- (void)sp_animatePanelIn
+{
+    UIView *view = self.panelController.view;
+    if (view == nil) {
+        return;
+    }
+    if (![SpLoginConfig sharedConfig].skinEnabled || UIAccessibilityIsReduceMotionEnabled()) {
+        return;   // 皮肤关掉 / 无障碍减弱动态效果：直接出现（旧行为）
+    }
+    CGAffineTransform resting = view.transform;   // 可能已经有键盘避让的位移，别丢掉
+    view.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(0.94, 0.94),
+                                             CGAffineTransformTranslate(resting, 0.0, 18.0));
+    view.alpha = 0.0;
+    [UIView animateWithDuration:0.26
+                          delay:0.0
+         usingSpringWithDamping:0.72
+          initialSpringVelocity:0.4
+                        options:UIViewAnimationOptionAllowUserInteraction |
+                                UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+        view.transform = resting;
+        view.alpha = 1.0;
+    } completion:^(BOOL finished) {
+        view.transform = resting;
+        view.alpha = 1.0;
+    }];
+    SPLoginLog(@"[SpLogin] skin: 面板入场动画（0.26s 弹簧，仅 transform/alpha）");
 }
 
 - (BOOL)showPanel
@@ -500,6 +609,29 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
         return;
     }
     [self.panelController.view endEditing:YES];   // 收键盘 -> 触发 key 归还宿主
+    // 出场：先看一眼本代面板的 transform（可能带着键盘避让的位移），缩放淡出后**原样放回**。
+    // 键盘避让与 `hidden=YES` 都写在下面，顺序不变 —— 只是藏起来之前多看了一眼。
+    CGAffineTransform resting = self.panelController.view.transform;
+    if ([SpLoginConfig sharedConfig].skinEnabled && !UIAccessibilityIsReduceMotionEnabled()) {
+        self.panelController.view.transform = resting;
+        self.panelController.view.alpha = 1.0;
+        __weak typeof(self) weakSelf = self;
+        [UIView animateWithDuration:0.16
+                              delay:0.0
+                            options:UIViewAnimationOptionAllowUserInteraction |
+                                    UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{
+            __strong typeof(self) strongSelf = weakSelf;
+            UIView *panel = strongSelf.panelController.view;
+            panel.alpha = 0.0;
+            panel.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(0.96, 0.96), resting);
+        } completion:^(BOOL finished) {
+            __strong typeof(self) strongSelf = weakSelf;
+            UIView *panel = strongSelf.panelController.view;
+            panel.transform = resting;
+            panel.alpha = 1.0;
+        }];
+    }
     self.panelController.view.hidden = YES;       // 连同 hitTest 一起让开：触摸立刻回到游戏
     [self.panelController adjustForKeyboardTop:0];
     SPLoginLog(@"[SpLogin] overlay panel hidden（触摸已交还游戏）%@", [self sp_overlayState]);

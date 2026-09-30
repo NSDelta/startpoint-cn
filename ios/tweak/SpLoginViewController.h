@@ -32,6 +32,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// 由 SpLoginOverlay 在键盘 frame 变化时调用；只对面板卡片做平移，不碰业务状态。
 - (void)adjustForKeyboardTop:(CGFloat)keyboardTopY;
 
+/// 输入框左右内边距（皮肤层用；`SpLoginViewController.m` 的 `-textFieldWithPlaceholder:` 调）。
+/// 只是文本排版辅助，不涉及任何业务状态。
++ (CGFloat)textInsets;
+
 /// 「本地已有验证码/令牌 ⇒ 接着轮询绑定状态」这条续跑的**显式入口**。
 ///
 /// 为什么需要它：覆盖窗口版是用 `addChildViewController:` 把本 VC 容器化的，**刻意不做

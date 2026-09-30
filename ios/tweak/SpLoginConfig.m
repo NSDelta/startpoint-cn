@@ -31,6 +31,7 @@ static BOOL sSPLoginConfigIsLoading = NO;
 @property (nonatomic, assign) BOOL autoPresent;
 @property (nonatomic, assign) NSTimeInterval autoPresentDelay;
 @property (nonatomic, assign) BOOL floatingButton;
+@property (nonatomic, assign) BOOL skinEnabled;
 @property (nonatomic, copy) NSString *jailbreakRoot;
 @property (nonatomic, copy, nullable) NSString *logFilePath;
 @end
@@ -61,6 +62,7 @@ static BOOL sSPLoginConfigIsLoading = NO;
     _autoPresent = NO;
     _autoPresentDelay = 2.0;
     _floatingButton = YES;   // 缺省 = 修复后的行为：常驻悬浮球（不依赖任何官方 UI 钩子）
+    _skinEnabled = YES;      // 缺省 = 游戏化皮肤（纯外观；关掉退回素色表单）
 
     // plist 覆写（与 MobileSubstrate 过滤器同文件，见 SpLogin.plist）
     NSString *plistPath = [NSString stringWithFormat:@"%@/Library/MobileSubstrate/DynamicLibraries/%@",
@@ -94,6 +96,9 @@ static BOOL sSPLoginConfigIsLoading = NO;
         }
         if ([prefs[@"SPLoginFloatingButton"] isKindOfClass:[NSNumber class]]) {
             _floatingButton = [prefs[@"SPLoginFloatingButton"] boolValue];
+        }
+        if ([prefs[@"SPLoginSkinEnabled"] isKindOfClass:[NSNumber class]]) {
+            _skinEnabled = [prefs[@"SPLoginSkinEnabled"] boolValue];
         }
     } else {
         SPLoginLog(@"[config] 未读到 %@（用编译期常量）", plistPath);
