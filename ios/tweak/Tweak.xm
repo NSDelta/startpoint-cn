@@ -225,8 +225,34 @@ static void SpLoginInstallHooks(void)
 __attribute__((constructor)) static void SpLoginInit(void)
 {
     @autoreleasepool {
-        SpLoginInstallHooks();
-        // 出站请求体里的 device_id 一次性对齐（见 SpLoginAPI.m 顶部注释）
-        SPLoginLog(@"[SpLogin] current device_id=%@", [SpLoginAPI sharedAPI].deviceId ?: @"(none)");
+        // 取证第一优先：先把「这条 dylib 进了这个进程」这件事落成一个文件。
+        // 单独 @try 且排在所有事情之前 —— 后面任何一步炸了都不影响这条记录
+        // （wfcore `dylib/src/main.m:44-79` 往 Documents 写 WFCore-ctor.txt 就是这个作用）。
+        // 判读方式：Documents 里没有 SpLogin-0-loaded.txt = dylib 根本没被加载，
+        // 那属于注入环节的问题，改多少代码都不会有变化。
+        @try {
+            // 这一条刻意不碰任何其它类（不读配置、不建单例）：它的唯一职责是
+            // 「证明 dylib 被加载并执行到了 constructor」，越不依赖别的东西越可信。
+            SPLoginMarker(@"SpLogin-0-loaded",
+                          @"constructor 已进入 —— 本文件存在 = dylib 被加载并执行了。", YES);
+        } @catch (NSException *e) {
+            NSLog(@"[SpLogin] ctor 标记写入异常（已吞）: %@", e);
+        }
+
+        // 主流程整体 @try/@catch：一个 hook 抛异常不该让整个 dylib 变成哑巴
+        // （wfcore main.m:51-82 对它自己的 constructor 也是这么包的）。
+        @try {
+            SpLoginInstallHooks();
+        } @catch (NSException *e) {
+            NSLog(@"[SpLogin] SpLoginInstallHooks 抛异常（已吞，不崩进程）: %@", e);
+            SPLoginMarker(@"SpLogin-8-exception", [e description], YES);
+        }
+
+        @try {
+            // 出站请求体里的 device_id 一次性对齐（见 SpLoginAPI.m 顶部注释）
+            SPLoginLog(@"[SpLogin] current device_id=%@", [SpLoginAPI sharedAPI].deviceId ?: @"(none)");
+        } @catch (NSException *e) {
+            NSLog(@"[SpLogin] device_id 记录异常（已吞）: %@", e);
+        }
     }
 }

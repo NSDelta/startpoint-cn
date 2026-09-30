@@ -59,6 +59,19 @@ extern "C" {
 /// 统一日志：NSLog + 可选落盘（真机没有 Mac 时靠日志文件取证）
 void SPLoginLog(NSString * _Nonnull format, ...) NS_FORMAT_FUNCTION(1, 2);
 
+/// 取证标记：往 **app 沙盒 Documents** 写一个 `<name>.txt`，内容 = 时间 + 进程信息 + detail。
+///
+/// 为什么必须是 Documents（照抄 wfcore `dylib/src/main.m:22-25` 往 Documents 写
+/// `WFCore-ctor.txt` 的做法）：本包的使用方式是「服主自己把 dylib 注入进 IPA」，
+/// 那种环境下 `<jbroot>/var/mobile/Library/Logs` 不存在、`NSTemporaryDirectory()`
+/// 用户也进不去 —— 结果就是「装没装上、卡在哪一步」完全不可判，只能凭猜。
+/// Documents 是沙盒里唯一用「文件」App / Filza / iMazing 都能直接看到的地方，
+/// 所以「dylib 到底加载没有」这件事必须落在那里。
+///
+/// append=YES：追加，攒成一条时间线（构造/安装/面板等一次性事件用）。
+/// append=NO ：覆盖，只留最新状态（挂载尝试这种高频事件用，避免无限增长）。
+void SPLoginMarker(NSString * _Nonnull name, NSString * _Nullable detail, BOOL append);
+
 #ifdef __cplusplus
 }
 #endif

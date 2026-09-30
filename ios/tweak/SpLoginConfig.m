@@ -22,6 +22,16 @@ static NSString *const kSPLoginLogFileName = @"SpLogin.log";
 // SPLoginLog 又会去取 sharedConfig —— dispatch_once 不可重入，必须挡住这次回环。
 static BOOL sSPLoginConfigIsLoading = NO;
 
+/// app 沙盒 Documents 目录 —— 写「取证标记」与日志的首选地。
+/// 非越狱注入场景下这是唯一用户能自己打开看的目录（见 SPLoginMarker 的说明）。
+static NSString * _Nullable SPLoginDocumentsDirectory(void)
+{
+    NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                    NSUserDomainMask, YES);
+    NSString *dir = dirs.firstObject;
+    return [dir isKindOfClass:[NSString class]] ? dir : nil;
+}
+
 @interface SpLoginConfig ()
 @property (nonatomic, copy) NSString *hostPort;
 @property (nonatomic, copy) NSString *apiBaseURLString;
@@ -135,7 +145,12 @@ static BOOL sSPLoginConfigIsLoading = NO;
         return;
     }
     NSFileManager *fm = [NSFileManager defaultManager];
+    // 顺序即优先级。**Documents 放第一位**：本包的主用法是「服主自己把 dylib 注入进
+    // IPA」，那种环境里越狱日志目录不存在、/tmp 用户也进不去，只有 Documents 能在
+    // 「文件」App / Filza / iMazing 里直接看到 —— 看不到日志的日志等于没有日志。
+    // 越狱环境照样写 Documents 成功，所以这个顺序对两种用法都是最优。
     NSArray<NSString *> *candidates = @[
+        SPLoginDocumentsDirectory() ?: @"",
         [NSString stringWithFormat:@"%@/var/mobile/Library/Logs", _jailbreakRoot],
         NSTemporaryDirectory()
     ];
@@ -156,6 +171,68 @@ static BOOL sSPLoginConfigIsLoading = NO;
 }
 
 @end
+
+void SPLoginMarker(NSString *name, NSString *detail, BOOL append) {
+    @try {
+        if (name.length == 0) {
+            return;
+        }
+        NSString *dir = SPLoginDocumentsDirectory();
+        if (dir.length == 0) {
+            return;
+        }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+        }
+        NSString *path = [dir stringByAppendingPathComponent:
+                          [name stringByAppendingPathExtension:@"txt"]];
+
+        NSMutableString *text = [NSMutableString string];
+        if (!append) {
+            [text appendFormat:@"== %@（覆盖写：这里永远是最新一次状态）\n", name];
+        }
+        [text appendFormat:@"%@\n", [NSDate date]];
+        [text appendFormat:@"bundle=%@\n", [NSBundle mainBundle].bundleIdentifier ?: @"(nil)"];
+        [text appendFormat:@"pid=%d %@\n",
+                           (int)[NSProcessInfo processInfo].processIdentifier,
+                           [NSThread isMainThread] ? @"main-thread" : @"bg-thread"];
+        if (detail.length > 0) {
+            [text appendFormat:@"%@\n", detail];
+        }
+        NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+        if (data == nil) {
+            return;
+        }
+
+        // 覆盖语义：高频状态（挂载尝试）用，文件不增长，永远只有最新一份。
+        // 追加语义：一次性事件（构造 / 安装 / 球 / 面板）用，攒成时间线；
+        //           超过 64KB 就整体重来，避免 5s 看门狗把它写爆。
+        BOOL rewrite = !append;
+        if (!rewrite && [fm fileExistsAtPath:path]) {
+            NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:path error:NULL];
+            unsigned long long size = [attrs[NSFileSize] unsignedLongLongValue];
+            rewrite = (size + (unsigned long long)data.length > 64ULL * 1024ULL);
+        }
+        if (rewrite || ![fm fileExistsAtPath:path]) {
+            [data writeToFile:path atomically:NO];
+            return;
+        }
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (handle == nil) {
+            [data writeToFile:path atomically:NO];
+            return;
+        }
+        @try {
+            [handle seekToEndOfFile];
+            [handle writeData:data];
+        } @finally {
+            [handle closeFile];
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[SpLogin] marker(%@) 写入异常（已吞，绝不因此崩溃）: %@", name, e);
+    }
+}
 
 void SPLoginLog(NSString *format, ...) {
     if (format == nil) {

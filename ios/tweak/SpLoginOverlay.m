@@ -74,6 +74,17 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 
 - (void)sp_handleBallPan:(UIPanGestureRecognizer *)gesture;
 - (void)sp_scrimTapped:(UITapGestureRecognizer *)gesture;
+/// 宿主窗口全找不到时的兜底来源：优先前台激活的 UIWindowScene，其次任意一个。
+- (UIWindowScene *)sp_preferredWindowScene;
+/// 覆盖窗口创建：scene 为空才退回 UIScreen bounds（host 可以为 nil，此时只靠 scene）。
+- (void)sp_createOverlayWindowWithHost:(UIWindow *)host
+                                 scene:(UIWindowScene *)scene;
+/// 把一次挂载尝试的结果整理成写进 Documents 的取证文本。
+- (NSString *)sp_attachReportWithResult:(NSString *)result
+                                 reason:(NSString *)reason
+                                attempt:(NSUInteger)attempt
+                                 hostBy:(NSString *)hostBy
+                                windows:(NSString *)windows;
 
 @property (nonatomic, strong, nullable) UIWindow *overlayWindow;
 /// 宿主（游戏）窗口。weak + 挂载时记录：编辑期间 overlay 自己是 key，现查会查到 overlay
@@ -133,9 +144,19 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     }
     self.installed = YES;
 
-    SPLoginLog(@"[SpLogin] overlay install: 1.5s 首挂 + UIWindowDidBecomeKey 通知 + 5s 看门狗；"
+    SPLoginLog(@"[SpLogin] overlay install: 1.5s 首挂 + 4 个唤醒通知 + 5s 看门狗；"
                @"显示只用 hidden=NO（绝不 makeKeyAndVisible），悬浮球=%@",
                [SpLoginConfig sharedConfig].floatingButton ? @"开" : @"关");
+    // 取证第一落点：这个文件存在 = 构造函数走到了 overlay install。
+    // 它不存在 = dylib 根本没进进程（或构造炸在更前面）——两种结论完全不同，
+    // 所以必须先把它写下来再谈别的。
+    SPLoginMarker(@"SpLogin-1-install", [NSString stringWithFormat:
+                                         @"overlay install 进入\nfloatingButton=%@\nuiTakeover=%@\nhost=%@\n"
+                                         @"jbRoot=\"%@\"",
+                                         [SpLoginConfig sharedConfig].floatingButton ? @"YES" : @"NO",
+                                         [SpLoginConfig sharedConfig].uiTakeover ? @"YES" : @"NO",
+                                         [SpLoginConfig sharedConfig].hostPort,
+                                         [SpLoginConfig sharedConfig].jailbreakRoot], YES);
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSpLoginFirstAttachDelay * NSEC_PER_SEC)),
@@ -143,10 +164,23 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
         [weakSelf sp_attachWithReason:@"timer1.5s"];
     });
 
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(sp_windowDidBecomeKey:)
-                                                 name:UIWindowDidBecomeKeyNotification
-                                               object:nil];
+    // 唤醒时机从一个 keyWindow 通知扩到四个（四者都调同一个**幂等**挂载例程，多报无副作用）：
+    //   · UIWindowDidBecomeKeyNotification        宿主建窗/抢焦点（wfcore ui.m:532-538 用的就是它）
+    //   · UIApplicationDidFinishLaunchingNotification  启动完成 —— 构造函数跑在它**之前**，
+    //     所以这条是「冷启动时第一个真正可靠的时机」
+    //   · UIApplicationDidBecomeActiveNotification 回前台（AIR 挂起恢复后重建窗口）
+    //   · UISceneDidActivateNotification           scene 激活（多 scene 机型上只有这条会来）
+    // 只靠 keyWindow 通知的话，只要宿主窗口从没「变成 key」，覆盖窗口就永远不会被创建 ——
+    // 症状恰好就是「悬浮球和悬浮窗都不出现」。
+    for (NSNotificationName name in @[ UIWindowDidBecomeKeyNotification,
+                                       UIApplicationDidFinishLaunchingNotification,
+                                       UIApplicationDidBecomeActiveNotification,
+                                       UISceneDidActivateNotification ]) {
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(sp_windowDidBecomeKey:)
+                                                     name:name
+                                                   object:nil];
+    }
 
     [NSTimer scheduledTimerWithTimeInterval:kSpLoginWatchdogInterval
                                     repeats:YES
@@ -164,9 +198,10 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 
 - (void)sp_windowDidBecomeKey:(NSNotification *)note
 {
-    (void)note;   // 只借这个时机，不看 payload
-    // 宿主换了 key window（AIR 重建窗口、系统弹窗收回焦点…）：重新评估挂载并更新 hostWindow。
-    [self sp_attachWithReason:@"keyWindowChanged"];
+    (void)note;   // 只借时机，不看 payload
+    // 四条通知共用这一个入口（keyWindow 变化 / 启动完成 / 回前台 / scene 激活）：
+    // 宿主换了 key window（AIR 重建窗口、系统弹窗收回焦点…）→ 重新评估挂载并更新 hostWindow。
+    [self sp_attachWithReason:@"wakeup"];
 }
 
 #pragma mark - 挂载（幂等：通知 / 定时器 / 看门狗都可以随便反复调）
@@ -187,26 +222,67 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     UIWindow *host = [self sp_keyWindowExcludingOverlay];
     NSString *hostBy = @"key";
     if (host == nil) {
-        // 兜底：没有 key 窗口时（加载中/被系统弹窗接管）退到「可见的普通层窗口」，
-        // 否则悬浮球会一直不出现 —— 而「没有官方 UI 钩子也要出现」正是本次修复的验收点。
+        // 兜底一：没有 key 窗口时（加载中/被系统弹窗接管）退到「可见的普通层窗口」。
         host = [self sp_visibleNormalWindowExcludingOverlay];
         hostBy = @"visible(normal)";
     }
+
+    // 兜底二（本轮新增，直接对应「悬浮球和悬浮窗都不出现」）：
+    // 宿主窗口一个都找不到时，**只要有一个可用 scene 就把覆盖窗口建出来**，宿主退化为「仅记录」。
+    //
+    // 为什么要放宽：wfcore ui.m:496-516 的纪律是「先找到宿主 key window 才建窗」，
+    // 那在它自己的宿主上够用；但在 AIR 宿主上，只要主窗口因任何原因从没被标记成
+    // isKeyWindow（自绘窗口 / windowLevel 非 Normal / scene 激活晚于我们的看门狗…），
+    // 我们就**永远不建窗** —— 表现不是「球位置不对」而是「什么都没有」，正是服主看到的现象。
+    // 窗口属于 scene 而不是属于宿主窗口，所以提前建窗是安全的：宿主之后重建自己的窗口
+    // 也不会把覆盖窗口带走（wfcore ui.m:79-116 注释讲的就是这件事）。
+    UIWindowScene *scene = nil;
+    if (@available(iOS 13.0, *)) {
+        scene = host.windowScene;
+        if (scene == nil) {
+            scene = [self sp_preferredWindowScene];
+        }
+    }
+    if (host == nil && scene == nil) {
+        // 非 scene 宿主（App 没声明 UIApplicationSceneManifest 时，iOS 13+ 下
+        // connectedScenes 是**空的**，窗口仍由 UIApplication 直接管）。AIR 打包的 App
+        // 就可能是这一类：此时上面那条 scene 兜底也用不上，只能看「有没有窗口」。
+        // 只要已经有窗口，就照样建窗 —— 走 initWithFrame: 这条老路径（窗口照样显示）。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSUInteger appWindowCount = [UIApplication sharedApplication].windows.count;
+#pragma clang diagnostic pop
+        if (appWindowCount == 0) {
+            NSString *result = @"FAIL 既没有宿主窗口也没有可用 scene（app 还没有任何窗口）";
+            SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) %@ windows=[%@] %@",
+                       (unsigned long)attempt, reason, result, windows, [self sp_overlayState]);
+            SPLoginMarker(@"SpLogin-2-attach-latest",
+                          [self sp_attachReportWithResult:result reason:reason attempt:attempt
+                                                   hostBy:@"(无)" windows:windows], NO);
+            return NO;
+        }
+        hostBy = @"frameless(non-scene)";
+    }
+
     if (host == nil) {
-        SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) FAIL: 找不到可用宿主窗口 windows=[%@] %@",
-                   (unsigned long)attempt, reason, windows, [self sp_overlayState]);
-        return NO;
+        // 走到这里 = 宿主窗口没找到但窗照样要建。日志里必须一眼看出是哪条兜底生效的。
+        hostBy = (scene != nil) ? @"scene-only(没有宿主窗口，仅记录)"
+                                : @"frameless(non-scene：只按 UIScreen bounds 建窗)";
     }
 
     if (self.overlayWindow == nil) {
-        [self sp_createOverlayWindowWithHost:host];
+        [self sp_createOverlayWindowWithHost:host scene:scene];
         if (self.overlayWindow == nil) {
-            SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) FAIL: 覆盖窗口创建失败 host=%@ windows=[%@]",
-                       (unsigned long)attempt, reason, NSStringFromClass([host class]), windows);
+            NSString *result = [NSString stringWithFormat:@"FAIL 覆盖窗口创建失败 host=%@",
+                                host != nil ? NSStringFromClass([host class]) : @"(nil)"];
+            SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) %@ windows=[%@]",
+                       (unsigned long)attempt, reason, result, windows);
+            SPLoginMarker(@"SpLogin-2-attach-latest",
+                          [self sp_attachReportWithResult:result reason:reason attempt:attempt
+                                                   hostBy:hostBy windows:windows], NO);
             return NO;
         }
     } else if (@available(iOS 13.0, *)) {
-        UIWindowScene *scene = host.windowScene;
         if (scene != nil && self.overlayWindow.windowScene != scene) {
             self.overlayWindow.windowScene = scene;   // 场景切换：把覆盖窗口迁过去
             SPLoginLog(@"[SpLogin] overlay windowScene 迁移（宿主 scene 变了）");
@@ -222,17 +298,27 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 
     UIView *root = self.overlayWindow.rootViewController.view;
     if (root == nil) {
-        SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) FAIL: 覆盖窗口 root view 不存在 host=%@ %@",
-                   (unsigned long)attempt, reason, NSStringFromClass([host class]), [self sp_overlayState]);
+        NSString *result = @"FAIL 覆盖窗口 root view 不存在";
+        SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) %@ host=%@",
+                   (unsigned long)attempt, reason, result,
+                   host != nil ? NSStringFromClass([host class]) : @"(nil)");
+        SPLoginMarker(@"SpLogin-2-attach-latest",
+                      [self sp_attachReportWithResult:result reason:reason attempt:attempt
+                                               hostBy:hostBy windows:windows], NO);
         return NO;
     }
 
     [self sp_ensureFloatingButtonInRoot:root];
     [self sp_reattachPanelViewInRoot:root];
 
-    SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) ok host=%@ hostBy=%@ %@ windows=[%@]",
-               (unsigned long)attempt, reason, NSStringFromClass([host class]), hostBy,
-               [self sp_overlayState], windows);
+    NSString *success = [NSString stringWithFormat:@"OK host=%@ hostBy=%@ 球=%@",
+                         host != nil ? NSStringFromClass([host class]) : @"(nil)", hostBy,
+                         self.floatingButton.superview != nil ? @"已挂上" : @"未挂上"];
+    SPLoginLog(@"[SpLogin] overlay attach#%lu (reason=%@) %@ %@ windows=[%@]",
+               (unsigned long)attempt, reason, success, [self sp_overlayState], windows);
+    SPLoginMarker(@"SpLogin-2-attach-latest",
+                  [self sp_attachReportWithResult:success reason:reason attempt:attempt
+                                           hostBy:hostBy windows:windows], NO);
 
     if (self.pendingShow) {
         self.pendingShow = NO;
@@ -243,6 +329,40 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 }
 
 #pragma mark - 宿主窗口选择
+
+/// 宿主窗口全找不到时的兜底：优先「前台激活」的 UIWindowScene，其次任意一个 UIWindowScene。
+/// 覆盖窗口挂到 scene 上，不依赖任何宿主窗口 —— 这是「宿主迟迟不成 key 也要有球」的关键。
+- (UIWindowScene *)sp_preferredWindowScene
+{
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *fallback = nil;
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) {
+                continue;
+            }
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            if (windowScene.activationState == UISceneActivationStateForegroundActive) {
+                return windowScene;       // 前台激活：首选
+            }
+            if (fallback == nil) {
+                fallback = windowScene;   // 其余（含 background）：只当备胎
+            }
+        }
+        return fallback;
+    }
+    return nil;
+}
+
+- (NSString *)sp_attachReportWithResult:(NSString *)result
+                                 reason:(NSString *)reason
+                                attempt:(NSUInteger)attempt
+                                 hostBy:(NSString *)hostBy
+                                windows:(NSString *)windows
+{
+    return [NSString stringWithFormat:
+            @"attach#%lu reason=%@\n结果=%@\n宿主取得方式=%@\n覆盖窗口=%@\n窗口列表=[%@]",
+            (unsigned long)attempt, reason, result, hostBy, [self sp_overlayState], windows];
+}
 
 /// 扫 connectedScenes 里 UIWindowScene 的 windows，找 isKeyWindow **且不是 overlay 自己** 的那个；
 /// 找不到再退回 [UIApplication sharedApplication].keyWindow（同样排除 overlay）。
@@ -297,11 +417,8 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
 #pragma mark - 覆盖窗口创建
 
 - (void)sp_createOverlayWindowWithHost:(UIWindow *)host
+                                 scene:(UIWindowScene *)scene
 {
-    UIWindowScene *scene = nil;
-    if (@available(iOS 13.0, *)) {
-        scene = host.windowScene;
-    }
     UIWindow *window = nil;
     if (scene != nil) {
         window = [[UIWindow alloc] initWithWindowScene:scene];   // iOS 13+：必须带 scene，否则不显示
@@ -317,11 +434,18 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     window.hidden = NO;   // ★ 唯一显示手段：绝不 makeKeyAndVisible（AIR 对 key 变化敏感）
     self.overlayWindow = window;
 
-    SPLoginLog(@"[SpLogin] overlay window 创建 lvl=%.0f scene=%@ frame=(%.0f,%.0f,%.0fx%.0f) hidden=NO",
+    SPLoginLog(@"[SpLogin] overlay window 创建 lvl=%.0f scene=%@ host=%@ frame=(%.0f,%.0f,%.0fx%.0f) hidden=NO",
                window.windowLevel,
                scene != nil ? @"有" : @"无(退回 UIScreen bounds)",
+               host != nil ? NSStringFromClass([host class]) : @"(nil)",
                window.frame.origin.x, window.frame.origin.y,
                window.frame.size.width, window.frame.size.height);
+    SPLoginMarker(@"SpLogin-3-window", [NSString stringWithFormat:
+                                        @"覆盖窗口已创建\nlevel=%.0f\nscene=%@\nhost=%@\nframe=%@",
+                                        window.windowLevel,
+                                        scene != nil ? @"有" : @"无",
+                                        host != nil ? NSStringFromClass([host class]) : @"(nil)",
+                                        NSStringFromCGRect(window.frame)], YES);
 }
 
 #pragma mark - 悬浮球
@@ -354,6 +478,10 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
             [self.floatingButton removeFromSuperview];
             SPLoginLog(@"[SpLogin] 悬浮球按 plist(SPLoginFloatingButton=false) 撤下");
         }
+        // 覆盖写（append:NO）：这个分支每次挂载都会走到，用覆盖才不会把文件写爆。
+        SPLoginMarker(@"SpLogin-3-ball",
+                      @"悬浮球当前是关的：plist 里 SPLoginFloatingButton=false。\n"
+                      @"（如果这不是你想要的，删掉那个键或改成 true 再重启 App）", NO);
         return;
     }
     if (self.floatingButton == nil) {
@@ -365,6 +493,13 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
         [root addSubview:self.floatingButton];
         SPLoginLog(@"[SpLogin] 悬浮球挂到覆盖窗口 root=(%.0fx%.0f)",
                    root.bounds.size.width, root.bounds.size.height);
+        SPLoginMarker(@"SpLogin-3-ball", [NSString stringWithFormat:
+                                          @"悬浮球已挂上覆盖窗口\nroot=(%.0fx%.0f)\nframe=%@\n"
+                                          @"windowLevel=%.0f  hidden=%@",
+                                          root.bounds.size.width, root.bounds.size.height,
+                                          NSStringFromCGRect(self.floatingButton.frame),
+                                          self.overlayWindow.windowLevel,
+                                          self.overlayWindow.hidden ? @"YES" : @"NO"], YES);
     }
     [self sp_clampBallInsideRoot:root];   // 旋转/换 scene 后把球拉回屏内
     [self sp_animateBallPulseIfNeeded];   // 纯视觉呼吸（幂等；关掉皮肤则不动）
@@ -544,6 +679,9 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
         // 关键是它不引入任何延迟——面板立刻可点，动画只是叠在已就位的视图上。
         [self sp_animatePanelIn];
         SPLoginLog(@"[SpLogin] overlay panel shown (reason=%@) %@", reason, [self sp_overlayState]);
+        SPLoginMarker(@"SpLogin-4-panel", [NSString stringWithFormat:
+                                           @"登录面板已打开（reason=%@）\n%@",
+                                           reason, [self sp_overlayState]], YES);
     }
 }
 
