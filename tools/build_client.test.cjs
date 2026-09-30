@@ -769,8 +769,8 @@ function renameStub() {
 }
 
 /** 走一次完整的 --rename-package 路线；manifestText = 桩写进产物的那份 manifest。 */
-function runRenameRoute(name, manifestText) {
-    const result = run(baseArgs(name, ["--rename-package", "--rename-tool", renameStub()]),
+function runRenameRoute(name, manifestText, extra = []) {
+    const result = run(baseArgs(name, ["--rename-package", "--rename-tool", renameStub(), ...extra]),
         { env: { SPCN_STUB_MANIFEST: manifestText } })
     return { result, report: readReport(out(`${name}.apk`)) }
 }
@@ -796,11 +796,11 @@ function residueSamplesOf(item) {
     return at === -1 ? "" : String(item.detail).slice(at + marker.length)
 }
 
-test("改名判据（端到端）：package + 4 个 authorities 全带目标前缀、只留 air.<旧包名>.AppEntry ⇒ PASS（exit 0）", () => {
+test("改名判据（端到端）：package + 4 个 authorities 全带目标前缀、只留 air.<旧包名>.AppEntry ⇒ PASS（exit 0）", async () => {
     const manifest = renamedManifest()
     // 陷阱就在这份「改对了」的产物里：整串 substring 必然命中（air.com.leiting.wf.AppEntry 内部）。
     assert.equal(manifest.includes(`air.${OLD_PKG}.AppEntry`), true, "受保护串必须在产物里（否则这条用例没有陷阱）")
-    const { result, report } = runRenameRoute("rename-ok", manifest)
+    const { result, report } = runRenameRoute("rename-ok", manifest, ["--keep-work"])
     assert.equal(result.status, 0, `exit=${result.status}\nstdout=${result.stdout}\nstderr=${result.stderr}`)
     assert.equal(report.ok, true)
     assert.deepEqual(failedAssertions(report), [], "改对了就不该有任何 FAIL")
@@ -811,6 +811,16 @@ test("改名判据（端到端）：package + 4 个 authorities 全带目标前�
     assert.match(residue.detail, /身份残留\(标识符开头\)=0 处/,
         "产物里明明有旧包名子串（AppEntry），残留却是 0 ⇒ 正确判据放行了受保护串")
     assert.equal(/残留样例/.test(residue.detail), false, "0 处残留就不该给样例")
+
+    // 落到**真产物**（CLI 判过的那份 renamed.apk）上做对照：朴素 substring 判据说 true、正确判据说 0。
+    // 这一条比拿夹具文本推理硬 —— 它证明的是「差一点被判死的正是这份产物」。
+    const renamed = fs.readFileSync(path.join(workDir("rename-ok"), "renamed.apk"))
+    const mod = await import(pathToFileURL(CLI).href)
+    const probe = mod.checkRenamedApk(renamed, { from: OLD_PKG, to: NEW_PKG })
+    assert.equal(probe.manifestHasFrom, true, "整串 substring 在产物里确实还在（air.<旧包名>.AppEntry 内部）")
+    assert.equal(probe.manifestFromResidues, 0, "身份残留 0 处 —— 「不能朴素子串扫描」的全部要点")
+    assert.equal(probe.manifestHasTo, true)
+    assert.equal(probe.entryCount, report.zip.entriesAfter)
 })
 
 test("改名判据（端到端）：变异体 1 —— 坏掉 package 必须 FAIL，且失败原因点名到具体那一处", () => {
@@ -834,7 +844,8 @@ test("改名判据（端到端）：变异体 1 —— 坏掉 package 必须 FAI
     const pkgItem = assertionNamed(untouched.report, A_PACKAGE)
     assert.equal(pkgItem.ok, false)
     assert.match(pkgItem.detail, /to=cn\.starpoint\.a/, "失败原因要能看出目标包名是哪个")
-    assert.deepEqual(failedAssertions(untouched.report).includes(pkgItem.name), true)
+    assert.equal(failedAssertions(untouched.report).includes(pkgItem.name), true,
+        "整段没生效时 package 项自己也要亮红（不能只靠残留项兜）")
 })
 
 test("改名判据（端到端）：变异体 2 —— 4 个 authorities 里有一个还是旧前缀必须 FAIL，样例点名那一个", () => {
