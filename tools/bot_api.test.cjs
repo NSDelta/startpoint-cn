@@ -317,8 +317,8 @@ test("POST /api/bot/bind ALREADY_BOUND 在账号无名无 viewer_id 时仍给出
     )
 })
 
-test("POST /api/bot/bind 用绑定前发出的旧码 ⇒ CODE_INVALID（CC-2，且 attempts 被烧）", async () => {
-    // The hole CC-2 closes, seen from the frozen bot surface: the account is
+test("POST /api/bot/bind 用绑定前发出的旧码 ⇒ CODE_INVALID（CC-6，且 attempts 被烧）", async () => {
+    // The hole CC-6 closes, seen from the frozen bot surface: the account is
     // bound behind the code's back (admin path), so the code it still had in
     // flight must not be spendable by a second platform identity.
     const account = createAccount({ username: "bot-stale-owner" })

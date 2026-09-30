@@ -82,7 +82,7 @@ pending ──(绑定平台成功)──▶ active
 | 设备授权 TTL | 30 天 | `src/data/domains/account-binding.ts:38` |
 
 - **一个账号同时只有一个活码**：发新码时吊销上一枚（`src/lib/signup-code.ts:62-78`）。
-- **绑定成功即作废该账号仍 pending 的码（CC-2）**：账号一旦有了绑定，绑定之前发出的码
+- **绑定成功即作废该账号仍 pending 的码（CC-6）**：账号一旦有了绑定，绑定之前发出的码
   就失去意义 —— 留在 `pending` 只会在别处被消费掉，并在同一账号上再挂一条非 primary
   绑定（`consumeSignupCodeSync` 只拦「该 uid 已是别账号的 primary」，**不**拦「该账号已有
   绑定」，`src/data/domains/account-binding.ts:520-526`）。作废落在共享写路径的成功分支

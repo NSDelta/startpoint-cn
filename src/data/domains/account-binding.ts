@@ -681,7 +681,7 @@ export function bindPlatformAccountSync(
         })
 
         // Becoming bound is the end of every code this account still has in
-        // flight (CC-2; docs/systems/client-binding.md: one live code per
+        // flight (CC-6; docs/systems/client-binding.md: one live code per
         // account). A straggler left pending here could later be handed to a
         // *different* platform identity and would still pass the
         // `consumeSignupCodeSync` pre-checks — that path only rejects a uid
