@@ -42,8 +42,49 @@
 | `36420791202` | `637b1839` | 编译**全过**，链接期 `ld: symbol(s) not found` / `NOTE: found '_SPLoginLog' … missing 'extern "C"'` |
 | `36421222764` | `0c33c9a4` | 链接已修好，编译期 `SpLoginConfig.h:45` `-Werror,-Wnullability-completeness` |
 | `36421542559` | `38766025` | **全部成功**：`make` + `make package` 两条腿（rootful / rootless）均绿 |
+| `36711298756` | `120bab29` | **游戏化皮肤版本全部成功**（两条腿均绿，见下方 2.1 产物指纹） |
 
 所以「工作流本身跑得起来、依赖装得上、源码能编译、deb 能打出来」现在都已被 CI 证实。
+
+### 2.1 皮肤版（`120bab29`）的产物指纹 —— 已取回原件逐个校验
+
+run：<https://github.com/NSDelta/startpoint-cn/actions/runs/36711298756>（`run_id=36711298756`，
+`event=push`，`head_sha=120bab293d2f712d32450c46773c9298a7eb63c0`，两条腿 `build (rootful)` /
+`build (rootless)` 都 success）。下表的字节数与 sha256 是**把产物从 CI 分支取回本地重算**得到的，
+和 CI 自己写进 `meta.txt` 的数字逐位一致：
+
+| 腿 | 产物 | 字节 | sha256 |
+| --- | --- | --- | --- |
+| rootful | `SpLogin.dylib` | 178720 | `ac7a9d988d0954703f22b574e7841a74acb276b011713a5985ffe5cd811dd0e5` |
+| rootful | `com.starpoint.splogin_0.1.0_iphoneos-arm.deb` | 42966 | `df4d94571caaee1d67eaa92c0e367adcb33939937065a8cbe3eb09ec0d889ea1` |
+| rootless | `SpLogin.dylib` | 178720 | `d3b87befc07e05e95d1f8ea9b970ee865cd77838a361034e3fd91b1dd7e8dddd` |
+| rootless | `com.starpoint.splogin_0.1.0_iphoneos-arm64.deb` | 42580 | `58662c3bfb1edf5050fff4320cfca862507c1fb8dade7c37fe689d1c4356483a` |
+
+两条腿的 dylib 字节数一样、sha256 不同，是因为 rootless 方案换了安装前缀/编译宏，属预期。
+`SpLogin.dylib` 从皮肤前的 124560 字节涨到 178720 字节，配合下面 `build.log` 里确实出现
+`SpLoginTheme.m` / `SpLoginOverlay.m` / `SpLoginViewController.m` 的编译行，可以确认皮肤代码
+真的进了产物，而不是「改了源码但 CI 编的是旧的」：
+
+```text
+==> Compiling Tweak.xm (arm64)…
+==> Compiling SpLoginConfig.m (arm64)…
+==> Compiling SpLoginAPI.m (arm64)…
+==> Compiling SpLoginURLProtocol.m (arm64)…
+==> Compiling SpLoginTheme.m (arm64)…          ← 本次新增文件
+==> Compiling SpLoginOverlay.m (arm64)…
+==> Compiling SpLoginViewController.m (arm64)…
+==> Linking library SpLogin (arm64)…
+```
+
+（`SpLoginConfig.m` / `SpLoginOverlay.m` / `SpLoginViewController.m` 是本次改动文件，两条腿的
+`build.log` 都有这几行；全日志 `error:` 零命中，只有那条历史就存在的 `ld: warning:
+-multiply_defined is obsolete`。）取产物用冒号形式，`git show ref/path` 会报 unknown revision：
+
+```sh
+git fetch mine 'refs/heads/ci-out/36711298756/*:refs/remotes/mine/ci-out/36711298756/*'
+git show 'mine/ci-out/36711298756/rootless:ci-out/36711298756/rootless/SpLogin.dylib' > /tmp/SpLogin.dylib
+shasum -a 256 /tmp/SpLogin.dylib
+```
 在你自己的 Mac 上：
 
 ```sh
@@ -64,7 +105,8 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 | `THEOS_PACKAGE_SCHEME=rootless` | `packages/com.starpoint.splogin_0.1.0_iphoneos-arm64.deb` | `com.starpoint.splogin:iphoneos-arm64` |
 
 注意 rootless 那条**不是** `iphoneos-arm`：Theos 的 rootless 方案会把 arch 换成 `iphoneos-arm64`
-（安装前缀同时自动改成 `/var/jb`）。`SpLogin.dylib` 在 `.theos/obj/` 下，实测 124560 字节。
+（安装前缀同时自动改成 `/var/jb`）。`SpLogin.dylib` 在 `.theos/obj/` 下，皮肤前实测 124560 字节、
+加重皮肤后 178720 字节（run `36711298756`，见 2.1）。
 链接期会有一条无害的 `ld: warning: -multiply_defined is obsolete`（Theos 的默认 LDFLAGS 带来）。
 
 **不要**把 `192.168.x.x` 写进任何仓库文件：`scripts/check-hygiene.sh` 会拦（唯一白名单是
