@@ -13,7 +13,7 @@
 const assert = require("node:assert/strict")
 const test = require("node:test")
 
-const HOST_PORT = "172.16.10.105:8001" // 18 字符，与任务单目标长度一致（刻意不用 192.168.x.y：仓库内禁写个人 IP）
+const HOST_PORT = "192.168.1.100:8001" // 18 字符 = ENDPOINT_LENGTH 契约（占位示例地址，非真实内网 IP；192.168.1.10 只有 12 字符，会打破该契约）
 const MIN_LEN = `http://${HOST_PORT}`.length // 25
 
 test("replacement stays the same length or refuses to patch at all", async () => {
@@ -213,7 +213,7 @@ test("--endpoint=none 不再要求 --host/--port（给了也明确 warn 且不�
     assert.doesNotMatch(cliLog(bare), /--host/)
 
     // ② 给了 --host/--port：必须 warn，且明确声明本模式不改写任何 URL
-    const withHost = runCli(["--ipa", missing, "--host", "172.16.10.105", "--port", "8001", "--out", dummyOut, "--endpoint=none"])
+    const withHost = runCli(["--ipa", missing, "--host", "192.168.1.100", "--port", "8001", "--out", dummyOut, "--endpoint=none"])
     assert.notEqual(withHost.status, 0)
     assert.match(cliLog(withHost), /WARN --endpoint=none：已忽略 --host\/--port/)
     assert.match(cliLog(withHost), /不改写任何 URL/)
