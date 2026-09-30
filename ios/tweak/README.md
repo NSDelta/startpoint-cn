@@ -1,8 +1,27 @@
 # SpLogin —— iOS 登录 UI tweak（P10-B）
 
-越狱注入线：把「长得像游戏原生」的登录面板插进 iOS 客户端，用于**把服务端下发的注册验证码
+> ## ⚠️ 目标用法（2026-10-01 起，覆盖下面所有与之冲突的旧描述）
+>
+> 这个 dylib 是给**非越狱设备**用的：**使用者自己签名、自己把 dylib 注入进 IPA**。
+> 由此派生三条硬规矩：
+>
+> 1. **只有一份构建，不按 rootful / rootless 分叉。**
+>    不要 `THEOS_PACKAGE_SCHEME=rootless`，不要出两份产物。越狱布局（`/var/jb`、
+>    MobileSubstrate 目录）不得出现在这个 dylib 的任何路径假设里 —— 配置、日志、取证
+>    全部落在**沙盒内**（`Documents` / 主包 / `tmp`）。
+> 2. **不做 URL 重定向**（`SP_LOGIN_FORWARDING` 缺省已改为 `0`）。
+>    网络改写交给 IPA 侧静态改写（`client-patch` 的 `patch-ipa.mjs --endpoint=rewrite`）——
+>    两层改写叠在一起时，出问题无法归因。
+> 3. **先看`Documents` 里的取证标记再谈别的。**
+>    `SpLogin-0-loaded.txt` 不存在 = dylib 根本没被加载，改代码没用。判读表见
+>    `D:\wfcnmod\交付产物\ios-tweak-inject-v2\注入说明.md`（仓库外的交付目录）。
+>
+> 下面第 2 节及以后的 `rootful/rootless`、Dopamine、`/var/jb`、deb 安装等内容是**历史记录**
+> （当时的越狱线），保留是为了留下验尸痕迹，**不再是本目录的推荐用法**。
+
+越狱注入线（历史）：把「长得像游戏原生」的登录面板插进 iOS 客户端，用于**把服务端下发的注册验证码
 显示给玩家**、并显示「已绑定 / 未绑定」状态。与 P10-A 的「往 IPA 里塞 dylib」是同一条主线的
-两个分支：本目录这条线要求设备已越狱（Dopamine 等），好处是**官方 IPA 一字节不改**。
+两个分支。
 
 > 状态：**编译与打包已由 CI 验证（见第 2 节）；注入、显示、钩子命中与否都还没在真机上验证过。**
 > 本机（Windows）没有 `make` / `clang` / `ldid`，也没有 WSL 发行版，编译只能在 macOS（CI 或你
@@ -110,9 +129,20 @@ export THEOS=$HOME/theos
 git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
 
 cd ios/tweak
-make package FINALPACKAGE=1 SP_LOGIN_HOST=<你的服务器 IP>:8001                 # 传统越狱
-make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  # 无根越狱（Dopamine）
+# ★ 唯一正确的构建命令（一份构建，不按 rootful/rootless 分叉；转发缺省就是关的）
+make FINALPACKAGE=1 SP_LOGIN_HOST=<你的服务器 IP>:8001
 ```
+
+产物就是 `packages/*.deb` 里的那个 dylib，或者更直接 —— CI 产物里的
+`.theos/obj/SpLogin.dylib`（**未 strip**，deb 载荷与它**逐字节相同**，179072 B）。
+要交付给「非越狱自签注入」的使用者，只需要这一个 `.dylib`；deb 是历史遗留的打包形式，
+本目录不再推荐使用。
+
+> 历史命令（**不要再照抄**，只为解释下面那些旧指纹从哪来）：
+> ```sh
+> make package FINALPACKAGE=1 SP_LOGIN_HOST=<你的服务器 IP>:8001                 # 传统越狱
+> make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  # 无根越狱（Dopamine）
+> ```
 
 产物（两条腿的 arch 名不同，CI run `36421542559` 实测）：
 

@@ -4,24 +4,32 @@
 # 官方包注入线（P10-A）与越狱安装线（本文件）都只能在这里出产物。
 #
 # [已验证-CI-部分] 首次真实运行 = run 36417028903（fork NSDelta/startpoint-cn，
-#    head_sha ce51e155，event=push，两个 matrix 腿都是 FAILURE）。那次实测确认**通过**的步骤：
+#    head_sha ce51e155，event=push，当时还是 rootful/rootless 两条 matrix 腿，都 FAILURE；
+#    单腿化见下方「只有一条腿」的说明）。那次实测确认**通过**的步骤：
 #      环境信息 / actions/checkout@v7 / brew install ldid / 克隆 Theos / chmod +x，
 #    失败点是 `make`（exit code 2，日志当时无法取回）。
 #    ⇒ 下面这些步骤的写法已被证明可用，不要再"顺手改好"。
 #
-# 地址注入：默认用 hygiene 白名单占位 192.168.1.10:8001（**不是**任何真实机器）。
-# 真实地址只能从 workflow_dispatch 的输入传进来，且**绝不写进仓库文件**。
+# 产物用途（决定了本工作流的所有取舍）：**非越狱设备**上自己签名、自己把 dylib 注入进 IPA。
+#   ⇒ 只有**一条腿**，不按 rootful / rootless 分叉（不要 THEOS_PACKAGE_SCHEME）。
+#   ⇒ **不做 URL 重定向**：SP_LOGIN_FORWARDING 缺省 0，端点转发交给 IPA 侧静态改写。
+#   ⇒ 配置/日志/取证全部落在**沙盒内**（Documents / 主包 / tmp），不涉及任何越狱目录。
+
+# 地址注入：CI 只用 hygiene 白名单占位 192.168.1.10:8001（**不是**任何真实机器）。
+# 真实地址绝不从 CI 输入传：仓库是**公开**的，输入会落进 ci-diag 分支的 meta.txt 与运行日志。
+# 真实地址一律在本机离线烧进二进制（交付目录里的 工具/bake-host.cjs）。
 #
 # ── 失败诊断通道（无凭据可读）─────────────────────────────────────────────
 # GitHub 的 job 日志 API 需要仓库权限（匿名 GET /actions/runs/<id>/logs 返回 403），
 # 所以编译失败时外部读者拿不到 make 的输出。本工作流因此把**完整构建日志**在
 # `if: always()` 的诊断步骤里提交并强推到一条一次性分支：
-#     refs/heads/ci-diag/<run_id>/<leg>          leg ∈ {rootful, rootless}
+#     refs/heads/ci-diag/<run_id>/dylib          （单腿；更早版本是 leg ∈ {rootful, rootless}）
 # 读取方式（无需任何凭据，公开仓库）：
 #     git fetch origin 'refs/heads/ci-diag/*:refs/remotes/origin/ci-diag/*'
 #     然后看 origin/ci-diag/<run_id>/<leg>:ci-diag/<run_id>/<leg>/build.log
 # 说明：用 GITHUB_TOKEN 推送不会再次触发 workflow，所以没有回环；每个 run_id 一条分支，
-# 两个 matrix 腿各写各的文件，互不覆盖。
+# **只有一条腿（dylib）**：这个包面向「非越狱设备自签注入」，不按 rootful/rootless 分叉，
+# 所以不存在两腿互相覆盖的问题。它同时**不做 URL 重定向**（SP_LOGIN_FORWARDING 缺省 0）。
 
 name: ios-tweak
 
@@ -33,9 +41,9 @@ on:
         required: false
         default: "192.168.1.10:8001"
       sp_login_forwarding:
-        description: "数据转发开关：1=dylib 内 NSURLProtocol 改写官方请求（历史行为）；0=编译期剔除，只加登录，端点转发交给 IPA 静态改写"
+        description: "数据转发开关（缺省 0 = 不做 URL 重定向，网络改写交给 IPA 侧静态改写）：1=dylib 内 NSURLProtocol 改写官方请求（历史行为，仅越狱场景后备）；0=编译期剔除，只加登录"
         required: false
-        default: "1"
+        default: "0"
   push:
     paths:
       - "ios/tweak/**"
@@ -47,14 +55,9 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.scheme || 'rootful' }})
+    name: build (dylib)
     runs-on: macos-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        # rootless = Dopamine / 无根越狱（服主那台 iPhone 7 Plus / iOS 15.8.3 走这个）
-        scheme: ["rootless", ""]
     steps:
       - uses: actions/checkout@v7
 
@@ -103,7 +106,7 @@ jobs:
           set -euo pipefail
           make --version | head -1
           dpkg-deb --version | head -1 || true
-          echo "resolved SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }}"
+          echo "resolved SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '0' }}"
 
       # 编译输出全量落到 $RUNNER_TEMP/build.log（不在工作树里，避免污染随后要提交的 git 状态）。
       # 用 pipefail + tee：步骤自身照常因 make 失败而失败，不靠 continue-on-error 掩盖。
@@ -111,18 +114,16 @@ jobs:
         working-directory: ios/tweak
         env:
           SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
-          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '0' }}
         run: |
           set -euo pipefail
           case "$SP_LOGIN_FORWARDING" in 0|1) ;; *) echo "::error::SP_LOGIN_FORWARDING 只能是 0 或 1，收到：$SP_LOGIN_FORWARDING"; exit 1 ;; esac
-          if [ -n "${{ matrix.scheme }}" ]; then
-            export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
-          fi
+
           echo "=== pwd: $(pwd)"
           echo "=== SP_LOGIN_HOST=${SP_LOGIN_HOST}"
           echo "=== SP_LOGIN_FORWARDING=${SP_LOGIN_FORWARDING}"
           echo "=== THEOS=${THEOS:-<unset>}"
-          echo "=== THEOS_PACKAGE_SCHEME=${THEOS_PACKAGE_SCHEME:-<unset>}"
+          echo "=== THEOS_PACKAGE_SCHEME=${THEOS_PACKAGE_SCHEME:-<unset>}（单腿：本包不按 rootful/rootless 分叉，这里应当永远是 <unset>）"
           echo "=== command: make FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\" SP_LOGIN_FORWARDING=\"\${SP_LOGIN_FORWARDING}\""
           set -o pipefail
           make FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" SP_LOGIN_FORWARDING="$SP_LOGIN_FORWARDING" 2>&1 | tee "$RUNNER_TEMP/build.log"
@@ -131,12 +132,10 @@ jobs:
         working-directory: ios/tweak
         env:
           SP_LOGIN_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
-          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '0' }}
         run: |
           set -euo pipefail
-          if [ -n "${{ matrix.scheme }}" ]; then
-            export THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}"
-          fi
+
           echo "=== command: make package FINALPACKAGE=1 SP_LOGIN_HOST=\"\${SP_LOGIN_HOST}\" SP_LOGIN_FORWARDING=\"\${SP_LOGIN_FORWARDING}\""
           set -o pipefail
           make package FINALPACKAGE=1 SP_LOGIN_HOST="$SP_LOGIN_HOST" SP_LOGIN_FORWARDING="$SP_LOGIN_FORWARDING" 2>&1 | tee -a "$RUNNER_TEMP/build.log"
@@ -156,7 +155,7 @@ jobs:
         if: always()
         working-directory: ios/tweak
         env:
-          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
+          SP_LOGIN_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '0' }}
         run: |
           set -uo pipefail
 
@@ -215,7 +214,7 @@ jobs:
         if: always()
         working-directory: ios/tweak
         env:
-          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_LEG: dylib
         run: |
           set -uo pipefail
           echo "=== .theos/obj 树（Theos 会把目标放进 TARGET/SCHEME 子目录）"
@@ -227,7 +226,7 @@ jobs:
             [ -f "$deb" ] || continue
             echo "== $deb"
             dpkg-deb -I "$deb" || true
-            echo "== $deb 内容（确认 SpLogin.dylib 与 SpLogin.plist 都在、且 rootless 落在 /var/jb）"
+            echo "== $deb 内容（确认 SpLogin.dylib 与 SpLogin.plist 都在）"
             dpkg-deb -c "$deb" || true
             # 同一份清单再走 ::notice —— 这样「deb 里到底有没有过滤器 plist」这件事
             # 不需要任何凭据就能从 check-run annotations 读到（step 日志仍需 admin 权限）。
@@ -247,7 +246,7 @@ jobs:
       - name: 诊断日志（失败时也可无凭据取回）
         if: always()
         env:
-          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_LEG: dylib
           DIAG_RUN: ${{ github.run_id }}
         run: |
           set -uo pipefail
@@ -264,7 +263,7 @@ jobs:
             echo "ref=${GITHUB_REF}"
             echo "runner_os=${RUNNER_OS}"
             echo "SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}"
-            echo "SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }}"
+            echo "SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '0' }}"
             echo "toolchain=$(make --version 2>&1 | head -1)"
             echo "build_log_bytes=$(wc -c < "$RUNNER_TEMP/build.log" 2>/dev/null || echo 0)"
           } > "$DIAG_DIR/meta.txt"
@@ -307,10 +306,10 @@ jobs:
         if: always()
         working-directory: ios/tweak
         env:
-          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_LEG: dylib
           DIAG_RUN: ${{ github.run_id }}
           RESOLVED_HOST: ${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }}
-          RESOLVED_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '1' }}
+          RESOLVED_FORWARDING: ${{ github.event.inputs.sp_login_forwarding || '0' }}
         run: |
           set -uo pipefail
           # 同 ci-diag：诊断通道不得改变 job 结论，也不能静默退出。
@@ -379,7 +378,7 @@ jobs:
       - name: 错误注解（把编译器要害变成 check-run annotation）
         if: always()
         env:
-          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_LEG: dylib
         run: |
           set -uo pipefail
           # 注解通道不依赖 git push 权限，所以这里的判定只看 build.log 内容，不看 job 结论。
@@ -446,12 +445,12 @@ jobs:
         if: success()
         working-directory: ios/tweak
         env:
-          DIAG_LEG: ${{ matrix.scheme || 'rootful' }}
+          DIAG_LEG: dylib
         run: |
           set -uo pipefail
           dylib=$(find .theos/obj -name 'SpLogin*.dylib' 2>/dev/null | head -1)
           deb=$(ls packages/*.deb 2>/dev/null | head -1)
-          echo "::notice title=SpLogin(${DIAG_LEG})::SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '1' }} scheme=${DIAG_LEG:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
+          echo "::notice title=SpLogin(${DIAG_LEG})::SP_LOGIN_HOST=${{ github.event.inputs.sp_login_host || '192.168.1.10:8001' }} SP_LOGIN_FORWARDING=${{ github.event.inputs.sp_login_forwarding || '0' }} leg=${DIAG_LEG} dylib=${dylib:-<none>} deb=${deb:-<none>}"
           if [ -n "$dylib" ]; then
             ls -l "$dylib" || true
             size=$(wc -c < "$dylib" 2>/dev/null || echo '?')
@@ -465,7 +464,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sp-login-buildlog-${{ matrix.scheme || 'rootful' }}
+          name: sp-login-buildlog-dylib
           path: ${{ runner.temp }}/build.log
           if-no-files-found: warn
           retention-days: 30
@@ -473,7 +472,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sp-login-${{ matrix.scheme || 'rootful' }}
+          name: sp-login-dylib
           # Theos 把目标放在 .theos/obj/<TARGET>/<SCHEME>/ 之类的子目录里，不是 .theos/obj/SpLogin.dylib。
           # 用 subdir-glob 匹配真实布局；无匹配时只 warn 而不 error，否则失败运行连诊断日志都传不出来。
           path: |

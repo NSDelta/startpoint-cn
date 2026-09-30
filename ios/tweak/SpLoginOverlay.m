@@ -152,11 +152,11 @@ static BOOL SpLoginViewHasFirstResponder(UIView *view);
     // 所以必须先把它写下来再谈别的。
     SPLoginMarker(@"SpLogin-1-install", [NSString stringWithFormat:
                                          @"overlay install 进入\nfloatingButton=%@\nuiTakeover=%@\nhost=%@\n"
-                                         @"jbRoot=\"%@\"",
+                                         @"plist=%@",
                                          [SpLoginConfig sharedConfig].floatingButton ? @"YES" : @"NO",
                                          [SpLoginConfig sharedConfig].uiTakeover ? @"YES" : @"NO",
                                          [SpLoginConfig sharedConfig].hostPort,
-                                         [SpLoginConfig sharedConfig].jailbreakRoot], YES);
+                                         [SpLoginConfig sharedConfig].preferenceSourcePath ?: @"(无，用编译期常量)"], YES);
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSpLoginFirstAttachDelay * NSEC_PER_SEC)),

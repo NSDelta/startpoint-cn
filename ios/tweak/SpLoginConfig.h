@@ -34,8 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 与网络改写、验证码、轮询、绑定状态等业务行为**没有任何关系**。
 /// 加这个键是为了真机上万一皮肤在小屏/横屏下不好看，能不改代码先退回旧观感。
 @property (nonatomic, readonly) BOOL skinEnabled;
-/// 越狱根：rootless = "/var/jb"，传统 = ""
-@property (nonatomic, copy, readonly) NSString *jailbreakRoot;
+/// 实际生效的 plist 来源路径（沙盒 Documents / app 包内 / dylib 同目录）；一个都没读到就是 nil。
+/// 只为取证：日志与 `SpLogin-1-install` 标记里都写它，方便一眼看出「覆写到底有没有被读到」。
+@property (nonatomic, copy, readonly, nullable) NSString *preferenceSourcePath;
 
 @end
 
@@ -62,8 +63,8 @@ void SPLoginLog(NSString * _Nonnull format, ...) NS_FORMAT_FUNCTION(1, 2);
 /// 取证标记：往 **app 沙盒 Documents** 写一个 `<name>.txt`，内容 = 时间 + 进程信息 + detail。
 ///
 /// 为什么必须是 Documents（照抄 wfcore `dylib/src/main.m:22-25` 往 Documents 写
-/// `WFCore-ctor.txt` 的做法）：本包的使用方式是「服主自己把 dylib 注入进 IPA」，
-/// 那种环境下 `<jbroot>/var/mobile/Library/Logs` 不存在、`NSTemporaryDirectory()`
+/// `WFCore-ctor.txt` 的做法）：本包的使用方式是「**非越狱设备上自己签名、自己把 dylib
+/// 注入进 IPA**」，那种环境下根本没有任何越狱目录可写，`NSTemporaryDirectory()`
 /// 用户也进不去 —— 结果就是「装没装上、卡在哪一步」完全不可判，只能凭猜。
 /// Documents 是沙盒里唯一用「文件」App / Filza / iMazing 都能直接看到的地方，
 /// 所以「dylib 到底加载没有」这件事必须落在那里。

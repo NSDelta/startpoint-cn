@@ -42,7 +42,7 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
 @property (nonatomic, assign) NSTimeInterval autoPresentDelay;
 @property (nonatomic, assign) BOOL floatingButton;
 @property (nonatomic, assign) BOOL skinEnabled;
-@property (nonatomic, copy) NSString *jailbreakRoot;
+@property (nonatomic, copy, nullable) NSString *preferenceSourcePath;
 @property (nonatomic, copy, nullable) NSString *logFilePath;
 @end
 
@@ -58,11 +58,41 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
     return shared;
 }
 
+/// plist 覆写的候选位置，**顺序即优先级**。全部是沙盒内路径，与越狱布局无关。
+///
+/// 为什么不是 `/Library/MobileSubstrate/DynamicLibraries/SpLogin.plist`：
+/// 本 dylib 的目标用法是「**非越狱设备上自签、自注入**」，那种设备上不存在任何
+/// MobileSubstrate 目录，越狱路径写了也读不到 —— 于是「覆写开关」变成永远无效的摆设。
+/// 改成沙盒内的三处：
+///   1. `Documents/SpLogin.plist`  —— 用户不用重签名就能改（「文件」App / 爱思 / iMazing 丢进去）
+///   2. `<主包>/SpLogin.plist`     —— 打包进 .app 的默认配置（注入时顺手塞进去）
+///   3. `<dylib 所在 bundle>/SpLogin.plist` —— 与 dylib 同目录（通常 Frameworks/）
++ (nullable NSString *)sp_firstExistingPreferencePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    NSString *documents = SPLoginDocumentsDirectory();
+    if (documents.length > 0) {
+        [candidates addObject:[documents stringByAppendingPathComponent:kSPLoginPreferenceFileName]];
+    }
+    NSString *inApp = [[NSBundle mainBundle] pathForResource:@"SpLogin" ofType:@"plist"];
+    if (inApp.length > 0) {
+        [candidates addObject:inApp];
+    }
+    NSString *besideDylib = [[NSBundle bundleForClass:[SpLoginConfig class]]
+                             pathForResource:@"SpLogin" ofType:@"plist"];
+    if (besideDylib.length > 0 && ![candidates containsObject:besideDylib]) {
+        [candidates addObject:besideDylib];
+    }
+    for (NSString *path in candidates) {
+        if ([fm fileExistsAtPath:path]) {
+            return path;
+        }
+    }
+    return nil;
+}
+
 - (void)load {
     sSPLoginConfigIsLoading = YES;
-    // rootless（Dopamine）把整个越狱树挂在 /var/jb 下 —— 判断依据就这一个目录。
-    NSFileManager *fm = [NSFileManager defaultManager];
-    _jailbreakRoot = [fm fileExistsAtPath:@"/var/jb"] ? @"/var/jb" : @"";
 
     // 缺省：编译期常量 + 保守开关
     NSString *hostPort = SP_LOGIN_HOST;
@@ -74,10 +104,10 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
     _floatingButton = YES;   // 缺省 = 修复后的行为：常驻悬浮球（不依赖任何官方 UI 钩子）
     _skinEnabled = YES;      // 缺省 = 游戏化皮肤（纯外观；关掉退回素色表单）
 
-    // plist 覆写（与 MobileSubstrate 过滤器同文件，见 SpLogin.plist）
-    NSString *plistPath = [NSString stringWithFormat:@"%@/Library/MobileSubstrate/DynamicLibraries/%@",
-                           _jailbreakRoot, kSPLoginPreferenceFileName];
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    // plist 覆写：候选全部在沙盒内（见 sp_firstExistingPreferencePath 的说明）
+    NSString *plistPath = [[self class] sp_firstExistingPreferencePath];
+    NSDictionary *prefs = plistPath != nil ? [NSDictionary dictionaryWithContentsOfFile:plistPath] : nil;
+    _preferenceSourcePath = [plistPath copy];
     BOOL hostOverrideEnabled = NO;
     if ([prefs isKindOfClass:[NSDictionary class]]) {
         id overrideFlag = prefs[@"SPLoginHostOverrideEnabled"];
@@ -111,7 +141,7 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
             _skinEnabled = [prefs[@"SPLoginSkinEnabled"] boolValue];
         }
     } else {
-        SPLoginLog(@"[config] 未读到 %@（用编译期常量）", plistPath);
+        SPLoginLog(@"[config] 未读到 plist 覆写（Documents / 主包 / dylib 同目录都没有），用编译期常量");
     }
 
     // 去掉可能被写进来的 scheme / 结尾斜杠，统一成 host:port
@@ -129,10 +159,10 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
     _apiBaseURLString = [[NSString stringWithFormat:@"http://%@", hostPort] copy];
 
     [self prepareLogFile];
-    SPLoginLog(@"[config] host=%@ (plist覆写=%@) root=\"%@\" uiTakeover=%@ skipPrivacy=%@ autoPresent=%@ floatingButton=%@",
+    SPLoginLog(@"[config] host=%@ (plist覆写=%@ 来源=%@) uiTakeover=%@ skipPrivacy=%@ autoPresent=%@ floatingButton=%@",
                _hostPort,
                hostOverrideEnabled ? @"开" : @"关",
-               _jailbreakRoot,
+               _preferenceSourcePath != nil ? _preferenceSourcePath : @"(无，用编译期常量)",
                _uiTakeover ? @"YES" : @"NO",
                _skipPrivacyDialogs ? @"YES" : @"NO",
                _autoPresent ? @"YES" : @"NO",
@@ -145,14 +175,14 @@ static NSString * _Nullable SPLoginDocumentsDirectory(void)
         return;
     }
     NSFileManager *fm = [NSFileManager defaultManager];
-    // 顺序即优先级。**Documents 放第一位**：本包的主用法是「服主自己把 dylib 注入进
-    // IPA」，那种环境里越狱日志目录不存在、/tmp 用户也进不去，只有 Documents 能在
+    // 顺序即优先级。**Documents 放第一位**：本包的主用法是「非越狱设备上自签、把 dylib
+    // 注入进 IPA」，那种环境里没有任何越狱目录可写，/tmp 用户也进不去，只有 Documents 能在
     // 「文件」App / Filza / iMazing 里直接看到 —— 看不到日志的日志等于没有日志。
-    // 越狱环境照样写 Documents 成功，所以这个顺序对两种用法都是最优。
+    // 这里刻意**不**探测 /var/jb 之类越狱根：这个 dylib 只有一份构建，不按 rootful/
+    // rootless 分叉，任何越狱布局都不该出现在它的路径假设里。
     NSArray<NSString *> *candidates = @[
         SPLoginDocumentsDirectory() ?: @"",
-        [NSString stringWithFormat:@"%@/var/mobile/Library/Logs", _jailbreakRoot],
-        NSTemporaryDirectory()
+        NSTemporaryDirectory() ?: @""
     ];
     for (NSString *dir in candidates) {
         if (![dir isKindOfClass:[NSString class]] || [dir length] == 0) {
