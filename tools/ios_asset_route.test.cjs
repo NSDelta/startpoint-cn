@@ -13,6 +13,7 @@ const Fastify = require("fastify")
 const assetPlugin = require("../src/routes/cn/asset").default
 const assetInTitlePlugin = require("../src/routes/cn/assetInTitle").default
 const cdnFilesPlugin = require("../src/routes/cn/cdnFiles").default
+const { prepareIosCompat } = require("../src/content/cdn/ios-compat")
 
 const SHA = "a".repeat(64)
 
@@ -49,11 +50,21 @@ function createSnapshot() {
 
 const IOS_COMPAT = { enabled: true, apiHost: "10.0.0.5:8001", apiScheme: "http" }
 
+// 真实生产格式：官方实体表没有表头，首行即数据行
+// （.cdn/cn/EntityLists/10939-ios_medium.csv 首行为
+//  "production/upload/00/00401ec42e20c5704dd17f0c612519bf65e586,1.4.0,353,...,common"）。
+// Android 侧规范解析器（catalog-builder.parseEntityListInstalledBytes）早就把表头当可选；
+// iOS 侧曾强制首行为表头 ⇒ 真实实体表一律被判非法。夹具与生产格式一致，避免再次漏网。
 // ios_medium.csv 的 size 列之和 = 3000（installedBytes 语义）
 const IOS_ENTITY_LIST = [
-    "path,version,size,hash,layer",
     "pinball-a,1.4.0,1000,hash-a,common",
     "pinball-b,1.4.0,2000,hash-b,common",
+].join("\n")
+
+// 带显式表头的等价实体表（历史夹具格式）：表头必须被跳过，不得计入 size 之和。
+const IOS_ENTITY_LIST_WITH_HEADER = [
+    "path,version,size,hash,layer",
+    ...IOS_ENTITY_LIST.split("\n"),
 ].join("\n")
 
 function buildIosFixture() {
@@ -71,6 +82,14 @@ function buildIosFixture() {
     fs.writeFileSync(path.join(cn, "EntityLists", "android_medium.csv"), "path,version,size,hash,layer\n")
     fs.writeFileSync(path.join(cn, "EntityLists", "ios_medium.csv"), IOS_ENTITY_LIST)
     return { tempRoot, cn }
+}
+
+// 用给定实体表内容覆盖 fixture 的 ios_medium.csv。
+// 每个 fixture 的 cdnRoot 唯一（mkdtemp）⇒ ios-compat 的模块级缓存互不干扰。
+function buildIosFixtureWithEntityList(content) {
+    const fixture = buildIosFixture()
+    fs.writeFileSync(path.join(fixture.cn, "EntityLists", "ios_medium.csv"), content)
+    return fixture
 }
 
 async function createAssetApp(options = {}) {
@@ -561,4 +580,149 @@ test("get_path logs a warning when it falls back to an empty plan on an unavaila
         lines.some(line => line.includes("missing ios archive directories") || line.includes("missing ios entity list")),
         `expected the unavailable reason in the warning, got: ${lines.join("")}`,
     )
+})
+
+// ---------------------------------------------------------------------------
+// 实体表格式回归（真实生产格式 = 无表头）：
+// src/content/cdn/ios-compat.ts 曾强制实体表首行为 "path,version,size,hash,layer"，
+// 而官方实体表没有表头 ⇒ readEntityListInstalledBytes 恒返回 null ⇒ iOS 视图恒为
+// unavailable("invalid ios entity list") ⇒ 所有需要归档的 iOS get_path 恒 503
+// IOS_ASSETS_UNAVAILABLE（iOS 资源更新功能永远不可用）。
+// 现改为与 Android 同源：复用 catalog-builder.parseEntityListInstalledBytes。
+// ---------------------------------------------------------------------------
+
+test("real (header-less) ios entity list keeps the ios view ready and sums the size column", async t => {
+    const fixture = buildIosFixture() // 默认夹具即真实生产格式：无表头、5 列
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    // 解析层：ready 且 installedBytes = size 列之和（未压缩字节），不是 ZIP 压缩下载量
+    const state = prepareIosCompat(createSnapshot(), fixture.cn)
+    assert.equal(state.kind, "ready")
+    assert.equal(state.installedBytes, 3000)
+
+    const app = await createAssetApp({
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    t.after(() => app.close())
+
+    const info = await app.inject({
+        method: "POST",
+        url: "/asset/version_info",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(info.statusCode, 200)
+    assert.equal(info.json().data.total_size, 3000)
+
+    // 需要归档的 iOS 请求不再 503（旧实现这里恒为 503 IOS_ASSETS_UNAVAILABLE）
+    const plan = await app.inject({
+        method: "POST",
+        url: "/asset/get_path",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(plan.statusCode, 200)
+    assert.ok(
+        plan.json().data.full.archive.some(item =>
+            item.location.includes("archive-ios-full/pinball-1.4.0-1-abc123.zip")),
+        `expected an ios-full archive in the plan, got: ${plan.body}`,
+    )
+})
+
+test("a header-ed ios entity list stays ready with the same installedBytes (header is skipped)", async t => {
+    const fixture = buildIosFixtureWithEntityList(IOS_ENTITY_LIST_WITH_HEADER)
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    // 表头不得计入 size 之和：仍为 3000（而不是表头被当数据行后的非法/多加）
+    const state = prepareIosCompat(createSnapshot(), fixture.cn)
+    assert.equal(state.kind, "ready")
+    assert.equal(state.installedBytes, 3000)
+
+    const app = await createAssetApp({
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    t.after(() => app.close())
+
+    const info = await app.inject({
+        method: "POST",
+        url: "/asset/version_info",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(info.statusCode, 200)
+    assert.equal(info.json().data.total_size, 3000)
+})
+
+test("a UTF-8 BOM header-less ios entity list is tolerated", async t => {
+    const fixture = buildIosFixtureWithEntityList(`\uFEFF${IOS_ENTITY_LIST}`)
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    const state = prepareIosCompat(createSnapshot(), fixture.cn)
+    assert.equal(state.kind, "ready")
+    assert.equal(state.installedBytes, 3000)
+
+    const app = await createAssetApp({
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    t.after(() => app.close())
+
+    const info = await app.inject({
+        method: "POST",
+        url: "/asset/version_info",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(info.statusCode, 200)
+    assert.equal(info.json().data.total_size, 3000)
+})
+
+test("invalid ios entity list rows yield unavailable(invalid ios entity list), never a throw", async t => {
+    const cases = [
+        { label: "four columns", content: "pinball-a,1.4.0,1000,hash-a" },
+        { label: "non-numeric size column", content: "pinball-a,1.4.0,abc,hash-a,common" },
+        { label: "empty size column", content: "pinball-a,1.4.0,,hash-a,common" },
+    ]
+    for (const item of cases) {
+        const fixture = buildIosFixtureWithEntityList(item.content)
+        t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+        // 解析层：绝不向上抛（parseEntityListInstalledBytes 抛 CatalogValidationError，
+        // 必须被 readEntityListInstalledBytes 吞掉）→ 一律 unavailable + 固定 reason
+        const state = prepareIosCompat(createSnapshot(), fixture.cn)
+        assert.equal(state.kind, "unavailable", item.label)
+        assert.equal(state.reason, "invalid ios entity list", item.label)
+        assert.equal(state.installedBytes, undefined, item.label)
+
+        const app = await createAssetApp({
+            env: localEnv(fixture.tempRoot),
+            resolveListenHost: () => "10.0.0.5",
+            iosCompat: IOS_COMPAT,
+        })
+        t.after(() => app.close())
+
+        // HTTP 层：需要归档 ⇒ 503 明确不可用（既不降级下发 Android 归档，也不 500）
+        const stale = await app.inject({
+            method: "POST",
+            url: "/asset/get_path",
+            headers: { device: "1", res_ver: "1.4.0" },
+            payload: {},
+        })
+        assert.equal(stale.statusCode, 503, item.label)
+        assert.equal(stale.json().code, "IOS_ASSETS_UNAVAILABLE", item.label)
+
+        const info = await app.inject({
+            method: "POST",
+            url: "/asset/version_info",
+            headers: { device: "1" },
+            payload: {},
+        })
+        assert.equal(info.statusCode, 503, item.label)
+        assert.equal(info.json().code, "IOS_ASSETS_UNAVAILABLE", item.label)
+    }
 })

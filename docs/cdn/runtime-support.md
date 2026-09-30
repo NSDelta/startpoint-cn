@@ -7,7 +7,7 @@
 | 输入或能力 | 状态 | 当前边界 |
 |---|---|---|
 | 官方 CN 1.8.1 客户端，仅修改服务器 IP 和跳过登录 | 保证 | 唯一保证的客户端；协议与行为以该版本为准 |
-| 停服前从官方 CDN 主机下载的 CN 1.4.54 dump | 有限保证 | 支持资源清单目录为 `EntityLists/` 或 `entities/` 的两种已知官方布局；物理 dump 有 692 个 ZIP，运行时只保证 tracked manifest 引用的 677 个 Android common、medium（Catalog `quality` 层）和 platform 归档完整，不使用 15 个 iOS 归档 |
+| 停服前从官方 CDN 主机下载的 CN 1.4.54 dump | 有限保证 | 支持资源清单目录为 `EntityLists/` 或 `entities/` 的两种已知官方布局；物理 dump 有 736 个 ZIP，运行时只保证 tracked manifest 引用的 677 个 Android common、medium（Catalog `quality` 层）和 platform 归档完整；启用 iOS 兼容（`iosCompat`）时，iOS 视图另行使用 `archive-ios-full`（5 个）与 `archive-ios-diff`（54 个）归档，且绝不回退 Android platform 归档 |
 | latest 更新计划 | 保证 | 当前版本等于 active Catalog 目标版本时返回 `full=null`、`diff=null`；无补丁时目标为 1.4.54，安装合法补丁后以 Overlay 计算出的唯一末端为目标 |
 | incremental 更新计划 | 有限保证 | 官方 manifest 提供 1.4.0 至 1.4.54 的基线链；合法 patch manifest 声明的 inner ZIP 可继续形成唯一、允许跳号的后续链；未知或不可达版本返回错误 |
 | initial 更新计划 | 保证 | 返回 1.4.0 full 和到 active Catalog 目标版本的唯一链 |
