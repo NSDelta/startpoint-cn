@@ -52,7 +52,20 @@
 //            --agreement=false / --privacy=false 关闭协议门补丁
 //            --app=<App 名> 显式指定 Payload/<App>.app/<App>（默认自动探测）
 //            --dry-run 只算不写（不产出 IPA，回读断言不执行）
+//            --allow-foreign-base 显式豁免"输入基座指纹前置校验"（仅合成夹具 / 测试用，见下）
 //      旧参数 --jar= / --res= / --work= 已随 jar 一起废弃（无人使用则忽略）。
+//
+// ★★ 输入基座指纹前置校验（吸收 wfcore tools/patch-ipa.mjs:100-114 的「补丁纪律」）：
+//   在**真正写入任何字节之前**，校验输入 IPA 与主二进制的 sha256 + 字节数是否等于官方 iOS 1.8.4 基线。
+//   为什么前置而不是"打完再断言"：一份第三方已打过补丁的产物（例如 sha256 5c0b67e0… 那份）本身就是
+//   被改写过的基座，在它上面再打一遍会得到"看似成功、实际双重补丁"的包 —— 而既有断言全部是**正向**
+//   断言（改了多少处、长度没变），它们无法识别"基座本身就不对"。所以这里做成一道**独立的闸**：
+//   · 一致 ⇒ 打印 `输入基座指纹 ✓ …`，不新增任何断言（保持既有 PASS 计数与措辞逐字不变）；
+//   · 不一致且未豁免 ⇒ 打印逐条 `… 字节数/sha256 不匹配 expected=… actual=…` 并 `process.exit(1)`，
+//     **一个字节都不写**（此时连 build-report 都不产出，因为没有可信的构建结果可记录）；
+//   · 不一致但显式 `--allow-foreign-base` ⇒ 只 WARN + 新增 1 条断言（证明"本次豁免了校验"），
+//     供合成夹具的端到端测试使用。
+//   注意：`--bin` 路径与 `--ipa` 路径**都**过这道闸；`--bin` 时没有整包 IPA 可比，只校验主二进制。
 //
 // ★ 端点模式（R27：iOS 补丁只允许一条代码路径，所以越狱线不再另写脚本）：
 //   · `--endpoint=rewrite`（默认）＝ 既有行为，一个字节都不变：改 `__cstring` 站点 + ABC 常量池。
@@ -106,6 +119,11 @@ if (ENDPOINT_MODE !== 'rewrite' && ENDPOINT_MODE !== 'none') fail(`--endpoint �
 if (!OUT || (!args.ipa && !args.bin)) fail('需要 --ipa(或 --bin) --out');
 if (REWRITE_ENDPOINT && (!HOST || !PORT)) fail('需要 --ipa(或 --bin) --host --port --out');
 if (!REWRITE_ENDPOINT && (HOST || PORT)) console.log(`WARN --endpoint=none：已忽略 --host/--port（${HOST || '-'}:${PORT || '-'}），本模式不改写任何 URL`);
+
+// A1c 新增：输入基座指纹前置校验的**显式豁免开关**。默认 false ⇒ 不是官方 1.8.4 基座就直接拒绝出包。
+// 只有合成夹具 / 单元测试才该传它；它**不**放宽 assertOfficialInput 那几条既有断言（那些在 --bin 路径上另有
+// 各自的措辞与计数要求），只负责打开"前置拒绝"这道闸。详见下方「输入基座指纹」段。
+const ALLOW_FOREIGN_BASE = args['allow-foreign-base'] === true;
 
 const HOST_PORT = `${HOST}:${PORT}`;                // e.g. 192.168.1.10:8001（示例值必须是 hygiene 白名单里的 192.168.1.10，勿改成真实局域网 IP）
 const TARGET = REWRITE_ENDPOINT ? `http://${HOST_PORT}` : null;   // replacement scheme+authority (e.g. 26 bytes)；none 模式无目标端点
@@ -182,33 +200,44 @@ function patchBlock(buf) {
 // 只匹配刚清零 X8 后的 store → 不会误伤正常写操作。
 // mode: 'launch' = 仅 NOP 0xb00c 处启动计时器 guard（最小改动，已验证不破坏 AIR 加载）;
 //        'all' = NOP 每个安全回退的中止点; 'none' = 跳过。
-function deguardBuffer(buf, mode) {
+/** 从 strOff 往后找「安全回退」：6 词内出现 RET 或尾 B 才算安全（A1c 从 deguardBuffer 提出，
+ *  供 collectGuardSites 与 deguardBuffer 共用 —— 两边必须给出同一结论，否则站点计数会对不上）。 */
+function safeFallthroughAt(buf, strOff) {
+  for (let j = 1; j <= 6; j++) {
+    const w = buf.readUInt32LE(strOff + 4 * j);
+    if (w === RET_INS) return true;
+    if ((w & 0xFC000000) >>> 0 === 0x14000000) return true;   // B (tail branch)
+    if ((w >>> 24) === 0xa8 || (w >>> 24) === 0xa9) continue;  // LDP epilogue → keep scanning
+  }
+  return false;
+}
+
+function deguardBuffer(buf, mode, collector = null) {
   if (mode === 'none') return 0;
   if (mode === 'launch') {                    // only the launch guard — avoid disturbing content-load
-    if (buf.readUInt32LE(0xb00c) === 0xb9000109) { buf.writeUInt32LE(0xd503201f, 0xb00c); return 1; }
+    const site = { ...EXPECTED_LAUNCH_GUARD, actual: buf.readUInt32LE(EXPECTED_LAUNCH_GUARD.offset) };
+    if (collector) collector.write = (s) => { if (s.actual !== EXPECTED_LAUNCH_GUARD.expect) return false; buf.writeUInt32LE(NOP_INS, EXPECTED_LAUNCH_GUARD.offset); return true; };
+    if (collector) return collector.hit(site) ? 1 : 0;
+    if (buf.readUInt32LE(0xb00c) === 0xb9000109) { buf.writeUInt32LE(NOP_INS, 0xb00c); return 1; }
     return 0;
   }
-  const NOP = 0xd503201f, RET = 0xd65f03c0; let n = 0, skipped = 0; const len = buf.length & ~3;
-  const isStoreToX8 = (w) => (((w >>> 5) & 31) === 8) &&
-    [0xB9000000, 0xF9000000, 0x39000000, 0x79000000].includes((w & 0xFFC00000) >>> 0);
+  const NOP = NOP_INS, RET = RET_INS; let n = 0, skipped = 0; const len = buf.length & ~3;
+  const isStoreToX8 = isStoreToX8Signature;
   // Only NOP an abort whose fall-through is SAFE: a RET (or unconditional B) appears within a few
   // words after the store. NOPping an abort with code after it would run that code with the bad
   // state the abort guarded against — risking exactly the black-screen we're chasing.
-  const safeFallthrough = (strOff) => {
-    for (let j = 1; j <= 6; j++) {
-      const w = buf.readUInt32LE(strOff + 4 * j);
-      if (w === RET) return true;
-      if ((w & 0xFC000000) >>> 0 === 0x14000000) return true;   // B (tail branch)
-      if ((w >>> 24) === 0xa8 || (w >>> 24) === 0xa9) continue;  // LDP epilogue → keep scanning
-    }
-    return false;
-  };
+  const safeFallthrough = (strOff) => safeFallthroughAt(buf, strOff);
   for (let o = 0; o + 28 <= len; o += 4) {
     if (buf.readUInt32LE(o) !== 0xd2800008) continue;       // MOVZ X8,#0
     for (let k = 1; k <= 3; k++) {
       const w = buf.readUInt32LE(o + 4 * k);
       if (isStoreToX8(w)) {
-        if (safeFallthrough(o + 4 * k)) { buf.writeUInt32LE(NOP, o + 4 * k); n++; }
+        const strOff = o + 4 * k, safe = safeFallthrough(strOff);
+        if (collector) collector.write = (s) => { if (!s.safeFallthrough) return false; buf.writeUInt32LE(NOP, strOff); return true; };
+        if (collector) {
+          if (collector.hit({ kind: 'scan', offset: strOff, movzOffset: o, expect: w, want: NOP, actual: w, safeFallthrough: safe })) n++;
+          else if (!safe) { skipped++; collector.skip({ kind: 'scan', offset: strOff, movzOffset: o, expect: w, want: NOP, actual: w, reason: '不安全回退（store 后 6 词内无 RET/尾 B）' }); }
+        } else if (safe) { buf.writeUInt32LE(NOP, strOff); n++; }
         else skipped++;
         break;
       }
@@ -349,6 +378,93 @@ const MACHO_REL = 'Payload/worldflipper.app/worldflipper';
 const OFFICIAL = OFFICIAL_IOS_184;
 const NOP_INS = 0xd503201f;
 const hex = (n) => `0x${(n >>> 0).toString(16)}`;
+const RET_INS = 0xd65f03c0;                          // A1c：从 deguardBuffer 提出来共用，值不变
+const STORE_TO_X8_MASKS = [0xB9000000, 0xF9000000, 0x39000000, 0x79000000];   // A1c：同上
+/** store 到 X8（"写 0 到 x8 指向处"）的签名判定 —— 与 deguardBuffer 里那份**故意重复**：
+ *  单一来源就无法交叉校验，重复才能发现"改了扫描条件忘了改断言"。 */
+const isStoreToX8Signature = (w) => (((w >>> 5) & 31) === 8) && STORE_TO_X8_MASKS.includes((w & 0xFFC00000) >>> 0);
+/** launch guard 的期望原指令（官方 1.8.4 基线）：0xb00c 处 MOV W9,#... 形态的启动守卫。 */
+const EXPECTED_LAUNCH_GUARD = { offset: 0xb00c, expect: 0xb9000109, want: NOP_INS, kind: 'launch' };
+
+/** 逐点「期望字节」fail-fast 校验：对 collectGuardSites() 收上来的每个站点，拿 pristine 的原值比对。
+ *  返回格式照 wfcore tools/lib/patch.mjs:180-199 —— `原指令不匹配 file=0x… expected=0x… actual=0x…`。
+ *  @param alreadyNop  Set<offset>：pristine 上**已经是目标值**的偏移（幂等重跑），这些不算不匹配。 */
+function guardSiteMismatches(sites, verifyBytes, bufLen, alreadyNop = null) {
+  const idle = alreadyNop instanceof Set ? alreadyNop : new Set();
+  const bad = [];
+  for (const s of sites) {
+    if (idle.has(s.offset)) continue;
+    if (s.offset + 4 > bufLen) { bad.push(`${s.kind}@${hex(s.offset)} 站点越界（文件 ${bufLen} B）`); continue; }
+    const actual = verifyBytes.readUInt32LE(s.offset);
+    if (actual !== s.expect) bad.push(`${s.kind} 原指令不匹配 file=${hex(s.offset)} expected=${hex(s.expect)} actual=${hex(actual)}`);
+  }
+  return bad;
+}
+
+/** A1c：把站点记录统一成同一套字段与进制，供 build-report 的三处数组共用。
+ *  为什么需要它：改之前 `guardSites.sites` 用 `{offset:'0xb00c', actualBefore:'0x…'}`（hex 字符串），
+ *  而 `guardSites.applied` / `skippedSites` 却是 `{offset:45068, actual:…}`（十进制数字）—— 同一份报告里
+ *  两套口径，人读要换算、机器读要分支。统一后三处数组同构，且全部为 hex 字符串。 */
+function normalizeSite(s) {
+  return {
+    kind: s.kind,
+    offset: hex(s.offset),
+    movzOffset: s.movzOffset === undefined || s.movzOffset === null ? null : hex(s.movzOffset),
+    expect: hex(s.expect), want: hex(s.want),
+    actualBefore: hex(s.actualBefore === undefined ? s.actual : s.actualBefore),
+    applied: !!s.applied,
+    safeFallthrough: s.safeFallthrough === undefined ? null : !!s.safeFallthrough,
+    ...(s.reason ? { reason: s.reason } : {}),
+  };
+}
+
+/** 扫描出**全部**将被 guard 处理的站点（只读，不改一个字节）—— 供断言/报告计数与逐点校验共用。 */
+function collectGuardSites(pristine, mode) {
+  if (mode === 'none') return [];
+  if (mode === 'launch') return [{ ...EXPECTED_LAUNCH_GUARD, actual: pristine.readUInt32LE(EXPECTED_LAUNCH_GUARD.offset), applied: false }];
+  const sites = [];
+  const len = pristine.length & ~3;
+  for (let o = 0; o + 28 <= len; o += 4) {
+    if (pristine.readUInt32LE(o) !== 0xd2800008) continue;         // MOVZ X8,#0
+    for (let k = 1; k <= 3; k++) {
+      const w = pristine.readUInt32LE(o + 4 * k);
+      if (isStoreToX8Signature(w)) {
+        const off = o + 4 * k;
+        sites.push({ kind: 'scan', offset: off, movzOffset: o, expect: w, want: NOP_INS, actual: w, applied: false, safeFallthrough: safeFallthroughAt(pristine, off) });
+        break;
+      }
+      if ((w & 31) === 8) break;                                   // X8 被重载 → 不是空写
+    }
+  }
+  return sites;
+}
+
+/** deguardBuffer 的采集器：只记录"打算改哪、原值多少、改没改"，不参与任何写入判定。 */
+function createGuardCollector(mode) {
+  const sites = [], skippedSites = [];
+  return {
+    mode, sites, skippedSites, applied: 0, alreadyNop: 0,
+    hit(site) {
+      const applied = this.write && this.write(site);
+      if (applied) { this.applied++; site.applied = true; } else { this.alreadyNop++; }
+      sites.push({ ...site, actualBefore: site.actual, applied: !!applied });
+      return applied;
+    },
+    /** 只登记、不写：供 collectGuardSites 之外的"已跳过"路径使用。 */
+    note(site) { sites.push({ ...site, actualBefore: site.actual, applied: false }); },
+    skip(site) { skippedSites.push({ ...site }); },
+    summary() {
+      const appliedList = sites.filter(s => s.applied);
+      return {
+        mode, sites, skippedSites, applied: appliedList,
+        total: appliedList.length, skipped: skippedSites.length, sitesFound: sites.length,
+        alreadyNop: sites.length - appliedList.length,
+        mismatches: sites.filter(s => s.actualBefore !== s.want && s.actualBefore !== s.expect).map(s => s.offset),
+      };
+    },
+  };
+}
+
 
 // 基线六项功能补丁 + 诊断开关的**声明写入窗口**（[start, end)）。偏移是对上面各 patchXxx()
 // 内部常量的**故意重复**：单一来源就无法交叉校验，重复才能发现"改了偏移忘了改断言"。
@@ -430,7 +546,7 @@ function assertOfficialInput(A, bin, label = '输入主二进制') {
 
 /** 补丁结果断言（两条路径共用；ctx 由各自分支提供）。返回 { actual, windows }。 */
 function assertPatchResults(A, ctx) {
-  const { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable } = ctx;
+  const { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable, fprint, guardDetails } = ctx;
   if (REWRITE_ENDPOINT) {
     A.check('URL 站点改写数 = 可改写站点数', r.patched === rewriteable,
       `${r.patched} / ${rewriteable}（过短跳过 ${r.skipped.length} 个：${r.skipped.slice(0, 4).join(' | ') || '无'}）`);
@@ -538,7 +654,108 @@ function assertPatchResults(A, ctx) {
       violated.length === 0,
       violated.length ? `违规段 ${hexRanges(violated, 3)}` : `${changedBytes} 个改动字节全部落在功能补丁/守卫窗口内`);
   }
+  // ── A1c 新增：guard 站点计数 + 逐点「期望字节」fail-fast（吸收 wfcore patchNativeWords() 的三态纪律）──
+  // 为什么必须"逐点"而不是只查 0xb00c：`guard-mode=all` 的扫描会在 14 个站点真写字节，只硬校验其中
+  // 一个 ⇒ 另外 13 个即使原指令已被别的东西改过（基座不对/偏移漂移）也会被当成"已改成功"静默写下去。
+  // verifyAgainst = pristine（官方原始件）：拿 buf 验会永远通过（buf 上已经是 NOP 了）＝等于没验。
+  const gSites = collectGuardSites(pristine, GUARD_MODE);
+  const gAlreadyNop = new Set(gSites.filter(s => pristine.readUInt32LE(s.offset) === s.want).map(s => s.offset));
+  const gBad = guardSiteMismatches(gSites, pristine, pristine.length, gAlreadyNop);
+  A.check(`guard 站点：扫描命中 ${gSites.length} = 已改 ${guardDetails.applied.length} + 已幂等 ${guardDetails.alreadyNop}；另跳过 ${guardDetails.skipped}（guard-mode=${GUARD_MODE}）`,
+    gSites.length === guardDetails.sitesFound && guardDetails.skippedSites.length === guardDetails.skipped,
+    `命中 ${gSites.length} / 已改 ${guardDetails.applied.length} / 已幂等 ${guardDetails.alreadyNop} / 跳过 ${guardDetails.skipped}${guardDetails.skipped ? `（${guardDetails.skippedSites.map(s => `${hex(s.offset)}：${s.reason}`).join('；')}）` : ''}`);
+  A.check(`guard 站点逐点「期望字节」校验（${gSites.length} 个站点，fail-fast）`, gBad.length === 0,
+    gBad.length ? gBad.slice(0, 4).join(' | ') : `${gSites.length}/${gSites.length} 与期望原值一致：${gSites.map(s => `${s.kind}@${hex(s.offset)} ${hex(s.expect)}->${hex(s.want)}`).join('、')}`);
+  // A1c：指纹断言（只在显式豁免且确有差异时新增 1 条；非豁免路径断言数与措辞逐字不变）
+  assertInputFingerprint(A, fprint);
   return { actual, planned, windows, changedBytes, residue, postEndpoints };
+}
+
+/** A1c：内置的**官方输入基线**（与 OFFICIAL_IOS_184 同源，但这里刻意再写一遍字面量）。
+ *  这是"补丁纪律"的数据面：单一来源就无法交叉校验 —— 若哪天 OFFICIAL_IOS_184 被误改，
+ *  下面的启动自检会当场把工具打死，而不是安静地用错误基线放过一份异物。 */
+const OFFICIAL_IPA_FINGERPRINT = {
+  role: 'ipa', label: '输入 IPA',
+  bytes: 139212360,
+  sha256: '5241e51b40bd9d7e2ad92bae9b85e4dc31cd19cd68a637d363c5dcca3eae0a3a',
+};
+const OFFICIAL_BIN_FINGERPRINT = {
+  role: 'bin', label: '输入主二进制',
+  bytes: OFFICIAL.binBytes,
+  sha256: OFFICIAL.binSha256,
+};
+// 启动自检：常量本身必须与任务书/文档写死的值一致（防止"改了基线忘了改校验"）。
+if (OFFICIAL_BIN_FINGERPRINT.bytes !== 108757200 ||
+  OFFICIAL_BIN_FINGERPRINT.sha256 !== 'ccf9d309e55e2824c636a2ef0febf38d898b83a74694a08e69ab79a1e26b3429') {
+  fail(`内置主二进制基线与任务书不一致：bytes=${OFFICIAL_BIN_FINGERPRINT.bytes} sha256=${OFFICIAL_BIN_FINGERPRINT.sha256}`);
+}
+if (OFFICIAL_IPA_FINGERPRINT.bytes !== 139212360 ||
+  OFFICIAL_IPA_FINGERPRINT.sha256 !== '5241e51b40bd9d7e2ad92bae9b85e4dc31cd19cd68a637d363c5dcca3eae0a3a') {
+  fail(`内置 IPA 基线与任务书不一致：bytes=${OFFICIAL_IPA_FINGERPRINT.bytes} sha256=${OFFICIAL_IPA_FINGERPRINT.sha256}`);
+}
+
+/** 逐条差异的打印文本（wfcore 风格 `expected=… actual=…`）。 */
+function fingerprintMismatchText(m) {
+  return `${m.where} ${m.field} 不匹配 expected=${m.expected} actual=${m.actual}`;
+}
+
+/** 只读地采集输入指纹并与内置基线比对（**不写盘、不退出**，便于调用方决定拒绝还是豁免）。
+ *  @param {{ipaPath?:string, ipaBytes?:Buffer, bin?:Buffer}} input */
+function collectInputFingerprint(input) {
+  const allowForeignBase = ALLOW_FOREIGN_BASE;
+  const findings = [], mismatches = [];
+  const add = (where, field, expected, actual) => {
+    const f = { where, field, expected, actual };
+    findings.push(f);
+    if (actual !== expected) mismatches.push(f);
+  };
+  let ipa = null;
+  if (input.ipaBytes) {
+    const sha = sha256Hex(input.ipaBytes);
+    add(OFFICIAL_IPA_FINGERPRINT.label, '字节数', OFFICIAL_IPA_FINGERPRINT.bytes, input.ipaBytes.length);
+    add(OFFICIAL_IPA_FINGERPRINT.label, 'sha256', OFFICIAL_IPA_FINGERPRINT.sha256, sha);
+    ipa = { path: input.ipaPath ? String(input.ipaPath) : null, bytes: input.ipaBytes.length, sha256: sha, expectedBytes: OFFICIAL_IPA_FINGERPRINT.bytes, expectedSha256: OFFICIAL_IPA_FINGERPRINT.sha256 };
+  }
+  let bin = null;
+  if (input.bin) {
+    const sha = sha256Hex(input.bin);
+    const where = `${OFFICIAL_BIN_FINGERPRINT.label}（${MACHO_REL}）`;
+    add(where, '字节数', OFFICIAL_BIN_FINGERPRINT.bytes, input.bin.length);
+    add(where, 'sha256', OFFICIAL_BIN_FINGERPRINT.sha256, sha);
+    bin = { entry: MACHO_REL, bytes: input.bin.length, sha256: sha, expectedBytes: OFFICIAL_BIN_FINGERPRINT.bytes, expectedSha256: OFFICIAL_BIN_FINGERPRINT.sha256 };
+  }
+  return { allowForeignBase, ipa, bin, findings, mismatches: mismatches.length };
+}
+
+/** 前置闸门：在**写入任何字节之前**决定放行还是拒绝。豁免时只 WARN（真正的记录交给断言侧）。 */
+function enforceInputFingerprint(check) {
+  if (check.mismatches === 0) {
+    console.log(`  输入基座指纹 ✓ 与官方 1.8.4 基线一致（IPA ${check.ipa ? check.ipa.bytes + ' B' : '未提供'} / 主二进制 ${check.bin ? check.bin.bytes + ' B' : '未提供'}）`);
+    return check;
+  }
+  if (!check.allowForeignBase) {
+    console.log(`ERROR 输入基座指纹不匹配（${check.mismatches} 项）—— 默认拒绝出包，未写入任何字节：`);
+    for (const m of check.findings.filter(f => f.actual !== f.expected)) console.log(`  - ${fingerprintMismatchText(m)}`);
+    console.log(`  若这确实是你要的合成夹具/自有基座，显式加 --allow-foreign-base 越过本闸（会留一条断言存证）。`);
+    process.exit(1);
+  }
+  console.log(`WARN --allow-foreign-base：跳过输入基座指纹前置校验（${check.mismatches} 项差异）—— 仅供合成夹具使用：`);
+  for (const m of check.findings.filter(f => f.actual !== f.expected)) console.log(`  - ${fingerprintMismatchText(m)}`);
+  return check;
+}
+
+/** A1c：输入基座指纹的断言侧（与 enforceInputFingerprint 的"前置拒绝"互补）。
+ *  只在**显式豁免**且**确有差异**时才新增 1 条断言 ⇒ 既有的 PASS 计数与措辞逐字不变。
+ *  为什么不无条件加一条：非豁免路径上指纹已经一致，"校验通过"这件事由 enforceInputFingerprint 的
+ *  打印行负责；再加一条断言就会改动既有 PASS 计数（红线要求逐字不变）。
+ *  为什么必须先把 `mismatches === 0` 挡掉：`[].every()` 恒真 —— 官方基座 + 该开关同时出现时，
+ *  旧写法会记下一条 FAIL「无差异（该开关此时是空操作）」，等于让"空开关"也能把构建判死。 */
+function assertInputFingerprint(A, check, label = '输入基座') {
+  if (!check || !check.allowForeignBase) return;
+  if (check.mismatches === 0) return;                  // 开关是空操作 ⇒ 不记任何断言
+  A.check(`${label}：显式豁免指纹前置校验（--allow-foreign-base）—— 本次不校验官方 1.8.4 基线`,
+    check.findings.every(f => f.actual !== f.expected),
+    check.findings.map(f => `${f.field} expected=${f.expected} actual=${f.actual}`).join('；'));
 }
 
 /** 断言小结 + 硬失败（退出码 2；产物是否已写出由调用方在消息里说明）。 */
@@ -558,12 +775,15 @@ if (args.bin) {
   const buf = readFileSync(args.bin);
   const pristine = Buffer.from(buf);                // A1b：只读对照（Buffer.from(Buffer) 是拷贝，共享内存的坑不会踩）
   const A = createAssertions();
+  const fprint = enforceInputFingerprint(collectInputFingerprint({ bin: pristine }));
   const mhIn = assertOfficialInput(A, pristine);
   const minLen = minReplacementLength(STAT_HOST_PORT);
   const rewriteable = scanTargets(pristine, { includeBare: false }).sites.filter(s => s.length >= minLen).length;
   const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
   const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
-  const guards = deguardBuffer(buf, GUARD_MODE);
+  const guardCollector = createGuardCollector(GUARD_MODE);
+  const guards = deguardBuffer(buf, GUARD_MODE, guardCollector);
+  const guardDetails = guardCollector.summary();
   const abc = REWRITE_ENDPOINT ? applyApiBaseRewrite(buf, { hostPort: HOST_PORT })
     : { applied: 0, reason: '--endpoint=none：跳过 ABC 常量池改写', offset: null, totalBytes: 0, apiBase: null, diffRanges: [], oldBytes: null, newBytes: null };
   const tip = patchFirstLoginTip(buf);
@@ -580,7 +800,7 @@ if (args.bin) {
   console.log(abc.applied ? `  ABC 池 API 基址 -> ${abc.apiBase}（${abc.totalBytes} B 守恒 @${hex(abc.offset)}）`
     : REWRITE_ENDPOINT ? `  [!] ABC 池改写未生效：${abc.reason}` : `  · ${abc.reason}`);
   if (args['crash-longjmp'] && buf.readUInt32LE(0x57d834c) === 0xb0005190) { buf.writeUInt32LE(0xd4200000, 0x57d834c); console.log('  [诊断] _longjmp 桩 -> BRK'); }
-  const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable });
+  const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable, fprint, guardDetails });
   writeFileSync(OUT, buf);
   console.log(REWRITE_ENDPOINT ? `已改写 ${r.patched} 个 URL 常量 -> ${TARGET}` : 'endpoint=none：URL 常量一处未改（交给越狱 dylib 在运行期接管）');
   console.log(`已清除 ${guards} 个故意中止 guard（0xDEADBEEF 空写入）`);
@@ -615,6 +835,8 @@ if (args.bin) {
   console.log(`  ${args.ipa}：${inBytes.length} B / ${inEntries.length} entries / sha256 ${inSha256}`);
   console.log(`  主二进制 ${mainName}：${pristine.length} B / sha256 ${sha256Hex(pristine)}`);
 
+  // A1c 前置闸门：整包 IPA 与主二进制**两项**都在写盘前过闸（拒绝时一个字节都不写）。
+  const fprint = enforceInputFingerprint(collectInputFingerprint({ ipaPath: String(args.ipa), ipaBytes: inBytes, bin: pristine }));
   const mhIn = assertOfficialInput(A, pristine);
   const scan = scanTargets(pristine, { includeBare: false });
   const minLen = minReplacementLength(STAT_HOST_PORT);
@@ -647,7 +869,9 @@ if (args.bin) {
     : '（--endpoint=none）跳过端点 URL 与 ABC 池，只打六项功能补丁 + 解除 guard');
   const r = REWRITE_ENDPOINT ? patchBuffer(buf) : { patched: 0, skipped: [] };
   const blk = PATCH_SOHU ? patchBlock(buf) : { blocked: 0, hosts: [] };
-  const guards = deguardBuffer(buf, GUARD_MODE);
+  const guardCollector = createGuardCollector(GUARD_MODE);
+  const guards = deguardBuffer(buf, GUARD_MODE, guardCollector);
+  const guardDetails = guardCollector.summary();
   const abc = REWRITE_ENDPOINT ? applyApiBaseRewrite(buf, { hostPort: HOST_PORT })
     : { applied: 0, reason: '--endpoint=none：跳过 ABC 常量池改写', offset: null, totalBytes: 0, apiBase: null, diffRanges: [], oldBytes: null, newBytes: null };
   const tip = patchFirstLoginTip(buf);
@@ -665,7 +889,7 @@ if (args.bin) {
     : REWRITE_ENDPOINT ? `  [!] ABC 池改写未生效：${abc.reason}` : `  · ${abc.reason}`);
   if (!PATCH_SOHU) console.log('  · --sohu-block=false：sohu 外发屏蔽已关闭（该外发 URL 也保持原样）');
   if (args['crash-longjmp'] && buf.readUInt32LE(0x57d834c) === 0xb0005190) { buf.writeUInt32LE(0xd4200000, 0x57d834c); console.log('  [诊断] _longjmp 桩 -> BRK'); }
-  const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable: rewriteableSites.length });
+  const res = assertPatchResults(A, { r, blk, guards, abc, tip, dlg, wel, agr, bid, buf, pristine, mhIn, rewriteable: rewriteableSites.length, fprint, guardDetails });
   console.log(REWRITE_ENDPOINT ? `已改写 ${r.patched} 个 URL 常量 -> ${TARGET}` : 'endpoint=none：URL 常量一处未改（交给越狱 dylib 在运行期接管）');
   console.log(`已清除 ${guards} 个故意中止 guard（0xDEADBEEF 空写入）`);
   if (r.skipped.length) console.log(`已跳过（${r.skipped.length} 个不重要，太短）: ` + r.skipped.slice(0, 8).join(', '));
@@ -677,6 +901,8 @@ if (args.bin) {
       tool: 'client-patch/build/patch-ipa.mjs', generatedAt: new Date().toISOString(),
       input: { ipa: args.ipa, bytes: inBytes.length, sha256: inSha256, entries: inEntries.length },
       binary: { entry: mainName, bytes: pristine.length, sha256Before: sha256Hex(pristine), sha256After: sha256Hex(buf) },
+      inputFingerprint: fprint,
+      guardSites: { mode: guardDetails.mode, sitesFound: guardDetails.sitesFound, applied: guardDetails.applied.map(normalizeSite), skippedSites: guardDetails.skippedSites.map(normalizeSite), mismatches: guardDetails.mismatches.map(hex) },
       assertions: A.list, ok: false,
     });
     finishAssertions(A, { outPath: OUT, wroteOutput: false });
@@ -757,7 +983,21 @@ if (args.bin) {
     A.check(`回读：整包 ${outEntries.length} 条 entry CRC 交叉校验`, crcBad.length === 0 && crcOk === outEntries.length,
       `通过 ${crcOk}/${outEntries.length}${crcBad.length ? `；失败 ${crcBad.slice(0, 3).join(', ')}` : ''}`);
     A.check('输入 IPA 未被改动（sha256 与读取时一致）', sha256Hex(readFileSync(String(args.ipa))) === inSha256, inSha256);
-    readback = { ipa: String(OUT), bytes: outBytes2.length, sha256: sha256Hex(outBytes2), entries: outEntries.length, binSha256: outBinSha, crcOk };
+    // A1c 新增：整包级回读 —— 盘上那份 IPA 必须与**内存里刚拼出来的**字节完全一致。
+    // 为什么需要它：上面那些回读断言都是"从盘上读回来再检查某个性质"，即使 writeFileSync 少写一截、
+    // 或 zip 引擎在第二次解析时得到不同结果，只要性质仍成立就会通过；这里直接比全量字节与 sha256。
+    A.check(`回读：产出 IPA 与内存结果逐字节一致（sha256 ${sha256Hex(outBytes).slice(0, 16)}…）`,
+      outBytes2.equals(outBytes) && sha256Hex(outBytes2) === sha256Hex(outBytes),
+      `${outBytes2.length} B / sha256 ${sha256Hex(outBytes2)}`);
+    readback = {
+      ipa: String(OUT), bytes: outBytes2.length, sha256: sha256Hex(outBytes2), entries: outEntries.length,
+      binSha256: outBinSha, crcOk, matchesInMemory: outBytes2.equals(outBytes),
+      counts: {
+        entries: outEntries.length, crcPassed: crcOk, crcFailed: crcBad.length,
+        entriesAttrBad: attrBad.length, rewriteableResidue: rbResidue, endpointOccurrences: rbEndpoints,
+      },
+      guardSitesOnDisk: collectGuardSites(outBin, GUARD_MODE).map(s => ({ kind: s.kind, offset: hex(s.offset), actualBefore: hex(s.actual) })),
+    };
   }
 
   progress('写构建报告');
@@ -806,7 +1046,26 @@ if (args.bin) {
       urlSites: scan.sites.length, urlSitesRewriteable: rewriteableSites.length, urlSitesTooShort: tooShortSites.length,
       rewritten: r.patched, skipped: r.skipped.length, residueRewriteable: res.residue,
       postOldOccurrences: res.residue, postEndpointOccurrences: res.postEndpoints,
+      // A1c：计数断言（任务 3）—— 命中/跳过站点、断言总数、改动区间与字节数
+      guardSitesFound: guardDetails.sitesFound, guardSitesApplied: guardDetails.applied.length,
+      guardSitesSkipped: guardDetails.skipped, guardSitesAlreadyNop: guardDetails.alreadyNop,
+      assertionsTotal: A.list.length, changedRangeCount: res.actual.length, changedBytes: res.changedBytes,
+      declaredNetworkWindows: res.windows.length,
     },
+    // A1c：输入基座指纹（任务 1）—— 前置校验的完整留档，便于事后回答"这份包是在什么基座上打的"
+    inputFingerprint: fprint,
+    // A1c：guard 站点台账（任务 2/3）—— sites/applied/skippedSites 统一成同一套字段与进制
+    // （原来 sites 用 hex 字符串 + actualBefore、applied/skippedSites 用十进制 + actual，两套口径）
+    guardSites: {
+      mode: guardDetails.mode,
+      sitesFound: guardDetails.sitesFound, total: guardDetails.total,
+      applied: guardDetails.applied.map(normalizeSite), skipped: guardDetails.skipped,
+      skippedSites: guardDetails.skippedSites.map(normalizeSite), alreadyNop: guardDetails.alreadyNop,
+      mismatches: guardDetails.mismatches.map(hex),
+      sites: guardDetails.sites.map(normalizeSite),
+      verifyAgainst: 'pristine（官方原始件）—— 拿 buf 验会永远通过（buf 上已是 NOP），等于没验',
+    },
+    assertionsTotal: A.list.length,
     changedBytes: res.changedBytes, changedRanges: res.actual.map(hexRange), declaredNetworkWindows: res.windows.length,
     assertions: A.list, ok: A.failed.length === 0,
   };
