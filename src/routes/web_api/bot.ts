@@ -181,6 +181,34 @@ function describeOwner(platform: BindingPlatform, uid: string): { username: stri
     return { username: readUsername(occupied.accountId), viewer_id: getViewerIdSync(occupied.accountId) }
 }
 
+/** Player-facing name of a platform identity, used only in bot chat copy. */
+const PLATFORM_LABEL: Record<BindingPlatform, string> = { qq: "QQ", kook: "KOOK" }
+
+/**
+ * Player-readable description of the account that already owns a platform
+ * identity, added to the `ALREADY_BOUND` payload as a pure extension: the
+ * frozen `username` / `viewer_id` pair keeps its meaning untouched.
+ *
+ * The message is written so the bot can render it verbatim, which is what a
+ * repeated `/bind` needs — `describeOwner` legitimately reports `username:
+ * null` / `viewer_id: 0` for an account that has no username or no viewer id
+ * yet, and the bot cannot turn that emptiness into a sentence on its own.
+ * Only the *tail* of the viewer id is surfaced here; the full platform uid
+ * (a QQ / KOOK number) is never echoed back into a chat group.
+ */
+export function buildAlreadyBoundNotice(
+    platform: BindingPlatform,
+    owner: { username: string | null, viewer_id: number },
+): { message: string, viewer_id_tail: string | null } {
+    const tail = owner.viewer_id > 0 ? String(owner.viewer_id).slice(-4) : null
+    const who = owner.username === null ? "游戏账号" : `游戏账号「${owner.username}」`
+    const id = tail === null ? "" : `（ID 尾号 ${tail}）`
+    return {
+        message: `这个 ${PLATFORM_LABEL[platform]} 已经绑定过${who}${id}，无需重复绑定；换号请先在游戏内解绑。`,
+        viewer_id_tail: tail,
+    }
+}
+
 type UnbindResolution =
     | { readonly ok: true, readonly accountId: number, readonly pendingCode: boolean }
     | { readonly ok: false, readonly code: string }
@@ -262,10 +290,11 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
             })
             if (!result.ok) {
                 if (result.code === "ALREADY_BOUND") {
+                    const owner = describeOwner(body.platform, body.uid)
                     return reply.status(200).send({
                         ok: false,
                         code: "ALREADY_BOUND",
-                        data: describeOwner(body.platform, body.uid),
+                        data: { ...owner, ...buildAlreadyBoundNotice(body.platform, owner) },
                     })
                 }
                 return reply.status(200).send({ ok: false, code: result.code })

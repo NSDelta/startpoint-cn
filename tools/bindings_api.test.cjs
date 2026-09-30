@@ -442,7 +442,9 @@ test("已绑定的平台账号可以回填到新增绑定列表里", async () =>
     assert.equal(consumed.body.isPrimary, true)
 
     const codes = await inject("GET", `/api/bindings/codes?accountId=${account.id}`)
-    assert.equal(codes.body.rows.find(row => row.id === code.body.id).status, "pending")
+    // 绑定成功即作废该账号仍 pending 的码（CC-6）：这枚码在这条路径上没被消费，
+    // 绑上之后它已无意义，留着只会在别处被消费、在同一账号上再挂一条非 primary 绑定。
+    assert.equal(codes.body.rows.find(row => row.id === code.body.id).status, "revoked")
 
     const list = await inject("GET", "/api/bindings?state=active&query=p5-bound-state")
     assert.equal(list.body.totalCount, 1)

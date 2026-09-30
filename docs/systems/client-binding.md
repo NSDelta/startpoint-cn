@@ -82,6 +82,16 @@ pending ──(绑定平台成功)──▶ active
 | 设备授权 TTL | 30 天 | `src/data/domains/account-binding.ts:38` |
 
 - **一个账号同时只有一个活码**：发新码时吊销上一枚（`src/lib/signup-code.ts:62-78`）。
+- **绑定成功即作废该账号仍 pending 的码（CC-6）**：账号一旦有了绑定，绑定之前发出的码
+  就失去意义 —— 留在 `pending` 只会在别处被消费掉，并在同一账号上再挂一条非 primary
+  绑定（`consumeSignupCodeSync` 只拦「该 uid 已是别账号的 primary」，**不**拦「该账号已有
+  绑定」，`src/data/domains/account-binding.ts:520-526`）。作废落在共享写路径的成功分支
+  `src/data/domains/account-binding.ts:703`（复用 `revokeSignupCodesForAccountSync`，
+  `src/data/domains/account-binding.ts:371`），所以管理 API 与 bot 消费两条路径都覆盖；
+  `ACCOUNT_NOT_FOUND` / `ALREADY_BOUND` 两个失败出口在 `:703` 之前就 `return`，
+  因此**绑定失败一律不作废**。消费路径里正在被消费的那一枚码最终仍是 `bound`（同一事务内
+  `consumeSignupCodeSync` 随后无条件置位，`src/data/domains/account-binding.ts:540-545`），
+  只是会在 `bind_audit` 里多留一条 `revoke_code`。
 - **重发限流**：`resend` 走 `isWithinCodeIssueWindow`，窗口内返回 `RATE_LIMITED`
   （`src/lib/signup-code.ts:85-96`；话术 `src/lib/sp-auth/contract.ts:44`）。
 - **审计**：每次发码写一条 `bind_audit`，actor 固定 `"sp-auth"`

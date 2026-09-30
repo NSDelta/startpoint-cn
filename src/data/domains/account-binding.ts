@@ -680,6 +680,28 @@ export function bindPlatformAccountSync(
             createdAt: nowIso,
         })
 
+        // Becoming bound is the end of every code this account still has in
+        // flight (CC-6; docs/systems/client-binding.md: one live code per
+        // account). A straggler left pending here could later be handed to a
+        // *different* platform identity and would still pass the
+        // `consumeSignupCodeSync` pre-checks — that path only rejects a uid
+        // that is another account's primary, it does not reject an account
+        // that is already bound — so the code would really take effect as a
+        // fresh non-primary binding. Revoking it here covers both writers:
+        // this function is the shared write path behind the admin API and the
+        // bot consume path.
+        //
+        // On the consume path the caller re-marks the code it just spent with
+        // `status = 'bound'` in this same transaction, after this call
+        // (`consumeSignupCodeSync`), so the spent code still ends up `bound`
+        // and keeps its one-time semantics; only true stragglers stay revoked.
+        // A cosmetic side effect of that ordering: the spent code also leaves
+        // one `revoke_code` audit row behind before being re-marked `bound`.
+        //
+        // The failure exits above return before this point, so a rejected bind
+        // never revokes anything (ACCOUNT_NOT_FOUND / ALREADY_BOUND).
+        revokeSignupCodesForAccountSync(accountId, actor)
+
         const raw = db.prepare(`
             SELECT ${accountBindingColumns} FROM account_bindings WHERE id = ?
         `).get(bindingId) as RawAccountBinding
