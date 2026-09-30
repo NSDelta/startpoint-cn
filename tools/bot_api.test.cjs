@@ -275,12 +275,46 @@ test("POST /api/bot/bind 同一 uid 再过码返回 ALREADY_BOUND 并带已知�
     assert.equal(conflict.status, 200)
     assert.equal(conflict.body.ok, false)
     assert.equal(conflict.body.code, "ALREADY_BOUND")
-    assert.deepEqual(conflict.body.data, { username: "bot-owner", viewer_id: 941_002 })
+    // Contract 3.4 `username` / `viewer_id` keep their exact meaning; `message`
+    // and `viewer_id_tail` are the pure addition that lets the bot answer a
+    // repeated `/bind` with a sentence instead of guessing.
+    assert.deepEqual(conflict.body.data, {
+        username: "bot-owner",
+        viewer_id: 941_002,
+        viewer_id_tail: "1002",
+        message: "这个 QQ 已经绑定过游戏账号「bot-owner」（ID 尾号 1002），无需重复绑定；换号请先在游戏内解绑。",
+    })
+    assert.equal(conflict.body.data.viewer_id_tail, "1002")
+    // The full platform uid (a QQ / KOOK number) is never echoed back.
+    assert.equal(conflict.raw.includes("bot-already-1"), false)
 
     // The intruder's account was not touched.
     const bindings = listBindingsSync({ platform: "qq", platformUid: "bot-already-1" })
     assert.equal(bindings.length, 1)
     assert.equal(bindings[0].accountId, owner.id)
+})
+
+test("POST /api/bot/bind ALREADY_BOUND 在账号无名无 viewer_id 时仍给出可读文案", async () => {
+    // `describeOwner` legitimately reports `username: null` / `viewer_id: 0`
+    // here — that emptiness is exactly what the bot cannot phrase itself.
+    const owner = createAccount()
+    const first = issueCode(owner.id)
+    const bound = await bind({ platform: "kook", uid: "bot-noname-1", code: first.code })
+    assert.equal(bound.body.ok, true)
+
+    const intruder = createAccount({ username: "bot-noname-intruder" })
+    const second = issueCode(intruder.id)
+    const conflict = await bind({ platform: "kook", uid: "bot-noname-1", code: second.code })
+
+    assert.equal(conflict.body.code, "ALREADY_BOUND")
+    // The frozen pair is unchanged — still null / 0, not "fixed up".
+    assert.equal(conflict.body.data.username, null)
+    assert.equal(conflict.body.data.viewer_id, 0)
+    assert.equal(conflict.body.data.viewer_id_tail, null)
+    assert.equal(
+        conflict.body.data.message,
+        "这个 KOOK 已经绑定过游戏账号，无需重复绑定；换号请先在游戏内解绑。",
+    )
 })
 
 test("POST /api/bot/bind 失败码：CODE_INVALID / CODE_EXPIRED / CODE_USED", async () => {
