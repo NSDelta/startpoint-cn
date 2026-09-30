@@ -157,20 +157,22 @@ willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     }
     NSURL *result = [NSURL URLWithString:rewritten];
     if (result == nil) {
-        // 兜底（正常路径走不到）：`absoluteString` 是 NSURL 自己生成的，切出来的 target 必然
-        // 合法。万一失败才用 **percentEncoded** 三件套分段拼装 —— 它们同样是未解码的原文；
-        // 绝不能退回 `url.path` / `url.query`（已解码，会破坏 `%26`/`%3D`/`+`/空格/非 ASCII）。
-        NSMutableString *fallback = [prefix mutableCopy];
-        [fallback appendString:(url.percentEncodedPath.length > 0 ? url.percentEncodedPath : @"/")];
-        if (url.percentEncodedQuery.length > 0) {
-            [fallback appendString:@"?"];
-            [fallback appendString:url.percentEncodedQuery];
-        }
-        if (url.percentEncodedFragment.length > 0) {
-            [fallback appendString:@"#"];
-            [fallback appendString:url.percentEncodedFragment];
-        }
-        result = [NSURL URLWithString:fallback];
+        // 正常路径走不到：target 是 NSURL 自己从 `absoluteString` 里切出来的合法 request-target。
+        // 这里**不做**「percentEncoded* 兜底」——`percentEncodedPath` / `percentEncodedQuery` /
+        // `percentEncodedFragment` 是 **NSURLComponents** 的属性，**NSURL 上没有**（CI 实测：
+        // `error: property 'percentEncodedPath' not found on object of type 'NSURL *'`）。
+        // 也不退回 `url.path` / `url.query`（已百分号解码，会破坏 `%26`/`%3D`/`+`/空格/非 ASCII，
+        // 把签名字节改掉）。宁可当坏 URL 报错（NSURLErrorBadURL），也不发一个签名被改坏的请求。
+        return nil;
+    }
+    // 防御性校验：改写后的 authority 必须还落在我们自己的 host:port 上，且 request-target
+    // 一段不丢（防止目标被拼成 `/`、或 `@`/`#` 之类字符把解析引到别的 host 上去）。
+    NSString *origin = [prefix substringFromIndex:@"http://".length];
+    if (![result.absoluteString hasPrefix:prefix]
+        || ![result.host isEqualToString:url.host]
+        || requestTargetForURL(result).length != target.length) {
+        SPLoginLog(@"[SpLogin] 拒绝改写：目标未落在 %@ 上（target=%@）", origin, rewritten);
+        return nil;
     }
     return result;
 }

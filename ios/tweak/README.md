@@ -179,6 +179,15 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless SP_LOGIN_HOST=<...>  #
 **不是真机验证**——SDK 在真机上到底发什么形态的查询串（是否用 `+` 表示空格、
 是否有 `%2F` 落在路径段）仍需看 `SpLogin.log` 里那行 `rewrite …` 才能确认。
 
+**没有「兜底重编码」这条退路**：`NSURL` **没有** `percentEncodedPath` /
+`percentEncodedQuery` / `percentEncodedFragment`（那是 **NSURLComponents** 的属性；CI run
+`36724884977` 两条腿实测 `error: property 'percentEncodedPath' not found on object of type
+'NSURL *'`，6 errors）。所以 `NSURL URLWithString:` 一旦返回 nil 就直接当坏 URL
+（`NSURLErrorBadURL`）上报 —— 宁可报错，也绝不退回 `url.path` / `url.query` 那种
+「先解码再编码」的写法去发一个签名被改坏的请求。另外每次改写都做一次防御校验：
+产物的 `absoluteString` 必须以 `http://<SP_LOGIN_HOST>` 开头、`host` 必须等于原 host、
+且 request-target 长度一段不丢，否则拒绝改写并写日志。
+
 ## 4. 开关（`SpLogin.plist`）
 
 | 键 | 默认 | 说明 |
