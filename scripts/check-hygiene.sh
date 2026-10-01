@@ -9,10 +9,15 @@ MODE="${1:-staged}"
 fail=0
 note() { echo "  [x] $*"; fail=1; }
 
+# 必须关掉 core.quotepath：默认情况下非 ASCII 文件名会被输出成 "\344\273\223..." 这种
+# 带引号的八进制转义形式，下方 [ -f "$f" ] 判定于是永远失败、文件被静默 continue 掉 ——
+# 中文名文件（本仓文档大量如此）等于完全没被扫过。
+# (2026-10-01 实证：含真实内网地址的 docs/仓库迁移通知.md 提交后 hygiene 仍判 PASS，
+#  根因即此；关掉后同一文件立刻被扫并命中。)
 if [ "$MODE" = "--all" ]; then
-    files=$(git ls-files)
+    files=$(git -c core.quotepath=false ls-files)
 else
-    files=$(git diff --cached --name-only --diff-filter=ACM)
+    files=$(git -c core.quotepath=false diff --cached --name-only --diff-filter=ACM)
 fi
 [ -z "$files" ] && exit 0
 
