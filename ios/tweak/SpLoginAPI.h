@@ -18,7 +18,7 @@ typedef void (^SpLoginResultBlock)(BOOL ok, NSDictionary *_Nullable data, NSStri
 
 + (instancetype)sharedAPI;
 
-/// 当前会话 token（30 天有效，只用于本页轮询/登出；持久化在 NSUserDefaults）
+/// 当前会话 token（15 天不活跃失效、活跃即滑动顺延，只用于本页轮询/登出；持久化在 NSUserDefaults）
 @property (nonatomic, copy, readonly, nullable) NSString *token;
 /// 游戏自己的设备号（= 游戏 /api/index.php/tool/signup 请求体里的 device_id）
 @property (nonatomic, copy, readonly, nullable) NSString *deviceId;

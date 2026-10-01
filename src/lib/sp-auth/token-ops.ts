@@ -16,6 +16,7 @@ import {
     appendBindAuditSync,
     getAccountBindStateSync,
     getPrimaryBindingSync,
+    refreshDeviceGrantExpirySync,
 } from "../../data/domains/account-binding"
 import { getAccountSync, getAccountPlayersSync } from "../../data/domains/account"
 import { getPlayerSync } from "../../data/domains/player"
@@ -51,15 +52,26 @@ interface ResolvedToken {
 /**
  * Resolves `{token, device_id?}` to a live grant. Expired grants are refused so
  * the page falls back to the login screen (C1 `TOKEN_INVALID`).
+ *
+ * Success is a **write** as well as a read: the grant window slides, so any
+ * authenticated call (bind-status / resend / profile) re-arms the expiry to
+ * "now + 15 days" (contract 3.2, revised 2026-10-01). Only the two rejection
+ * branches below — unknown token and expired grant — are pure reads; neither
+ * renews. `logout` reuses this too and then deletes the row outright, so its
+ * renewal is harmless (the grant is gone either way).
  */
 function resolveToken(input: SpAuthTokenBody & { device_id?: unknown }): ResolvedToken | null {
     const resolved = resolveGrantByToken(input.token, input.device_id)
     if (resolved === null) return null
     if (!isGrantActive(resolved.grant)) return null
+    // Slide the TTL *and* the caller's view of the grant: the returned token is
+    // read from the refreshed row, so renewal can never swap the credential.
+    const renewed = refreshDeviceGrantExpirySync(resolved.grant.deviceId)
+    const grant = renewed ?? resolved.grant
     return {
-        accountId: resolved.accountId,
-        deviceId: resolved.grant.deviceId,
-        token: resolved.grant.token,
+        accountId: grant.accountId,
+        deviceId: grant.deviceId,
+        token: grant.token,
     }
 }
 

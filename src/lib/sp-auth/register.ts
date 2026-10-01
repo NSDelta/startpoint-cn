@@ -59,7 +59,7 @@ export interface SpAuthDeviceState {
     accountId: number
     bindState: BindState
     grantExpiresAt: Date
-    /** True when the stored grant itself is past its 30 day window. */
+    /** True when the stored grant itself is past its 15 day inactivity window. */
     grantExpired: boolean
 }
 

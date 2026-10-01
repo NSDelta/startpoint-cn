@@ -18,13 +18,36 @@
 | 标识 | 载体 | 生命周期 | 代码 |
 | --- | --- | --- | --- |
 | 设备标识 `device_id` | 游戏客户端的设备号 | 永久 | `device_grants.device_id`（主键） |
-| 设备授权令牌 `token` | `/sp-auth/*` 请求体 | 30 天 | `src/data/domains/account-binding.ts:38`、`:923-930` |
+| 设备授权令牌 `token` | `/sp-auth/*` 请求体 | 15 天**不活跃**（活跃即滑动顺延） | `src/data/domains/account-binding.ts:45`、`:1028-1047`、`src/lib/sp-auth/token-ops.ts:55-77` |
 | 绑定验证码 `code` | 游戏内公告 → bot | 默认 30 分钟 | `src/data/domains/account-binding.ts:31-34` |
 
 `device_grants` 以 `device_id` 为主键并 `ON CONFLICT(device_id) DO UPDATE`
-（`src/data/domains/account-binding.ts:957-965`），这是「**一设备一账号**」的落地点：
+（`src/data/domains/account-binding.ts:987-998`），这是「**一设备一账号**」的落地点：
 同一台设备再注册只会刷新授权行，不会产生第二个账号；登录名冲突时返回 `DEVICE_TAKEN`
 （错误码与话术见 `src/lib/sp-auth/contract.ts:20,43`）。
+
+### 授权的滑动有效期（契约 3.2，业主 2026-10-01 修订）
+
+窗口语义是「**最后一次活跃 + 15 天**」，不是固定的 15 天签到：
+
+- 常量 `DEVICE_GRANT_TTL_DAYS = 15`（`src/data/domains/account-binding.ts:45`）。
+  契约 3.2 原为固定 30 天，业主 2026-10-01 修订为 15 天 + 活跃滑动续期。
+- 每次带 token 调 `/sp-auth/bind-status`、`/sp-auth/resend`、`/sp-auth/profile`
+  都算一次活跃：三条路径共用 `resolveToken()`
+  （`src/lib/sp-auth/token-ops.ts:55-77`），它在 `isGrantActive` 通过后调用
+  `refreshDeviceGrantExpirySync(deviceId)`
+  （`src/data/domains/account-binding.ts:1028-1047`），把 `expires_at`
+  重写成「现在 + 15 天」，因此持续上线的玩家永远不必重新登录。
+- **续期不得轮换 token**：`refreshDeviceGrantExpirySync` 只 `UPDATE expires_at /
+  updated_at`，刻意不复用 `upsertDeviceGrantSync` —— 后者在不传 token 时会
+  `randomBytes(32)` 新造一个，会把客户端手里的凭据作废。无授权行时返回 `null`
+  （调用方据此判失效），`ttlDays` 必须为正整数。
+- 失效分支是**纯读**：`resolveGrantByToken` 返回 `null` 或 `isGrantActive` 为假时
+  直接返回，绝不续期；连续 15 天不活跃 ⇒ `TOKEN_INVALID`，玩家必须重新登录。
+- 登录（`src/lib/sp-auth/login.ts:128`）与注册走 `issueGrantForDevice`，它们**故意**
+  签发新 token，那是「重新登录」而不是续期。
+- 游戏侧准入读的是同一个 `expires_at`（`src/lib/bind-gate.ts:219-222`），所以滑动续期
+  会同步延长准入 —— 活跃玩家不会在第 15 天被 517 拦下。
 
 ## 账号绑定状态机
 
@@ -79,7 +102,7 @@ pending ──(绑定平台成功)──▶ active
 | TTL 兜底 | 缺失/非法 ⇒ 30；上限 7 天 | `src/lib/signup-code.ts:24,27,42-45` |
 | 同设备重发窗口 | 60 秒 | `src/lib/signup-code.ts:30`、`:90-96` |
 | 连续失败上限 | 5 次 | `src/data/domains/account-binding.ts:36` |
-| 设备授权 TTL | 30 天 | `src/data/domains/account-binding.ts:38` |
+| 设备授权 TTL | 15 天不活跃（活跃滑动续期） | `src/data/domains/account-binding.ts:45` |
 
 - **一个账号同时只有一个活码**：发新码时吊销上一枚（`src/lib/signup-code.ts:62-78`）。
 - **绑定成功即作废该账号仍 pending 的码（CC-6）**：账号一旦有了绑定，绑定之前发出的码

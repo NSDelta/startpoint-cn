@@ -1,10 +1,16 @@
 /**
  * Device-grant token handling for `/sp-auth/*` (contract C1).
  *
- * C1: `token` is 32 random bytes hex, lives in `device_grants.token` with a
- * 30 day TTL, and is used **only** by the login page (poll / resend / profile /
- * logout) — it is never injected into game requests. The grant itself is owned
- * by the P2 data layer; this module only resolves and issues it.
+ * C1: `token` is 32 random bytes hex, lives in `device_grants.token`, and is
+ * used **only** by the login page (poll / resend / profile / logout) — it is
+ * never injected into game requests. The grant itself is owned by the P2 data
+ * layer; this module only resolves and issues it.
+ *
+ * TTL (contract 3.2, revised 2026-10-01): 15 days of **inactivity**, sliding.
+ * Each authenticated `/sp-auth/*` call re-arms it to "last seen + 15 days"
+ * (`src/lib/sp-auth/token-ops.ts`), so an active player never has to log in
+ * again while a device idle for 15 straight days does. Renewal never rotates
+ * the token string.
  *
  * NOTE (fragment for integration): resolving a grant **by token** belongs in
  * the data layer. P2 shipped `getDeviceGrantSync(device_id)` only, so this
@@ -108,15 +114,18 @@ export function resolveGrantByToken(
     return { grant, accountId: grant.accountId, viaDeviceId: deviceId !== null }
 }
 
-/** True when the grant is still inside its 30 day window. */
+/** True when the grant is still inside its 15 day inactivity window. */
 export function isGrantActive(grant: DeviceGrant, nowMs: number = getRealNowMs()): boolean {
     return grant.expiresAt.getTime() > nowMs
 }
 
 /**
  * Issues (or refreshes) the grant a device logs in with. The data layer
- * generates the token (`randomBytes(32).toString("hex")`) and applies the 30 day
- * TTL, so this is a thin wrapper that keeps the TTL policy in one place.
+ * generates the token (`randomBytes(32).toString("hex")`) and applies the 15 day
+ * TTL, so this is a thin wrapper that keeps the TTL policy in one place. This is
+ * the **login** path, which mints a new credential on purpose — activity-based
+ * renewal of an existing token goes through `refreshDeviceGrantExpirySync`
+ * (see `src/lib/sp-auth/token-ops.ts`).
  */
 export function issueGrantForDevice(deviceId: number, accountId: number): DeviceGrant {
     return upsertDeviceGrantSync({ deviceId, accountId })

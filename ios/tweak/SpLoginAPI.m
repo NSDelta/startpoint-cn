@@ -3,7 +3,9 @@
 // 契约权威 = `D:\wfcnmod\分工文档-自研登录页与账号绑定.md` §3.2。要点：
 //   * 统一 POST + application/json；HTTP **一律 200**，成败看 body 里的 ok 字段；
 //   * 成功 {ok:true,data:{...}}；失败 {ok:false,code,message,data?}；
-//   * token = 随机 32 字节 hex、有效期 30 天，只用于本页轮询/登出。
+//   * token = 随机 32 字节 hex、15 天不活跃失效（每次 bind-status/resend/profile
+//     都算活跃并把窗口顺延，服务端滑动续期，见契约 3.2 2026-10-01 修订），
+//     只用于本页轮询/登出。
 //
 // ⚠️ 已知未决项（真机联调必须确认，见报告 §7）：游戏 `/api/index.php/tool/signup` 用的
 //   `device_id` 是**客户端自己生成的**。绑定闸门（result_code 517）查的就是这个键，

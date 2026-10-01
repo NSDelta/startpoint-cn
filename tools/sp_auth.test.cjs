@@ -33,7 +33,8 @@ const spAuthRoutes = require("../src/routes/sp-auth/index.ts").default
 
 // ---------------------------------------------------------------------------
 // clock: the suite freezes Date.now and moves it explicitly, so the 60 s
-// re-issue window and the 30 day grant TTL are deterministic instead of flaky.
+// re-issue window and the 15 day sliding grant TTL are deterministic instead of
+// flaky.
 // ---------------------------------------------------------------------------
 
 const BASE_NOW_MS = Date.UTC(2026, 8, 24, 0, 0, 0)
@@ -300,7 +301,7 @@ test("CC-1：pending 且码已过期 → 复用该 pending 账号，不新建账
     const accountId = deviceGrantRow(deviceId).account_id
     const grantBefore = deviceGrantRow(deviceId)
 
-    // 码 TTL 30 分钟，但 grant 30 天：越过码有效期、留在 grant 有效期内。
+    // 码 TTL 30 分钟，但 grant 15 天：越过码有效期、留在 grant 有效期内。
     advance(31 * MINUTE_MS)
     const { body } = await post("/register", {
         username: "pendingnewname",
@@ -321,7 +322,7 @@ test("CC-1：pending 且码与 grant 都过期 → 仍复用该账号并刷新�
     const { deviceId } = await registerDevice("Passw0rdA1")
     const accountId = deviceGrantRow(deviceId).account_id
 
-    // 越过 30 天 grant 有效期，CC-1 的「已过期」分支。
+    // 越过 15 天 grant 有效期（期间无任何带 token 的活跃），CC-1 的「已过期」分支。
     advance(31 * DAY_MS)
     const { body } = await post("/register", {
         username: "refreshedname",
@@ -742,6 +743,121 @@ test("契约 C1：所有端点 HTTP 一律 200，落库动作写 bind_audit", as
     assert.ok(actions.includes("register"), "缺少 register 审计")
     assert.ok(actions.includes("login"), "缺少 login 审计")
     assert.ok(actions.includes("gate_reject"), "缺少 gate_reject 审计（限流/拒绝）")
+})
+
+// ---------------------------------------------------------------------------
+// 契约 3.2（2026-10-01 修订）：设备授权 15 天 + 活跃滑动续期
+//
+// 语义：窗口是「最后一次活跃 + 15 天」。带 token 调 bind-status / resend /
+// profile 都算一次活跃，窗口顺延；连续 15 天不活跃则授权失效、必须重新登录。
+// 续期只写 expires_at / updated_at，绝不轮换 token（否则客户端手里的凭据
+// 会被自己的一次轮询作废）。
+// ---------------------------------------------------------------------------
+
+/** 数据层读到的到期时刻，换算成「相对 BASE_NOW_MS 的天数」。 */
+function grantExpiryDays(deviceId) {
+    const grant = binding.getDeviceGrantSync(deviceId)
+    assert.ok(grant !== null, `device ${deviceId} 应存在授权行`)
+    return (grant.expiresAt.getTime() - BASE_NOW_MS) / DAY_MS
+}
+
+test("契约 3.2（2026-10-01）：新授权的有效期是 15 天，不再是 30 天", async () => {
+    const { deviceId } = await registerDevice()
+
+    assert.equal(binding.DEVICE_GRANT_TTL_DAYS, 15)
+    assert.equal(grantExpiryDays(deviceId), 15, "签发窗口应为 t0 + 15 天")
+    assert.equal(Date.parse(deviceGrantRow(deviceId).expires_at), BASE_NOW_MS + 15 * DAY_MS)
+})
+
+test("契约 3.2 滑动续期：第 10 天上线一次即顺延，累计 20 天 token 仍有效且到期 = 最后活跃 + 15 天", async () => {
+    const { deviceId, data: registered } = await registerDevice()
+    const accountId = deviceGrantRow(deviceId).account_id
+    bindPrimary(accountId)
+
+    // 第 10 天：一次 bind-status（读路径）即是一次活跃。
+    advance(10 * DAY_MS)
+    const auditsBefore = auditActions().length
+    const first = await post("/bind-status", { token: registered.token, device_id: deviceId })
+    okBody(first.body)
+    assert.equal(grantExpiryDays(deviceId), 25, "第 10 天续期后应到 t0 + 25 天")
+    assert.equal(auditActions().length, auditsBefore, "续期是静默副作用，不写 bind_audit")
+
+    // 累计 20 天：已越过原始 15 天窗口，没有续期这里必然 TOKEN_INVALID。
+    advance(10 * DAY_MS)
+    const second = await post("/profile", { token: registered.token, device_id: deviceId })
+    const profile = okBody(second.body)
+    assert.equal(profile.viewer_id > 0, true, "第 20 天 profile 仍须认出该账号")
+    assert.equal(grantExpiryDays(deviceId), 35, "第 20 天续期后应到 t0 + 35 天")
+
+    // ③ 续期不得改变 token 字符串。
+    assert.equal(deviceGrantRow(deviceId).token, registered.token)
+    assert.equal(binding.getDeviceGrantSync(deviceId).token, registered.token)
+})
+
+test("契约 3.2 滑动续期：resend 也算活跃，第 14 天重发后窗口顺延且 token 不变", async () => {
+    const { deviceId, data: registered } = await registerDevice()
+
+    advance(14 * DAY_MS)
+    const { body } = await post("/resend", { token: registered.token, device_id: deviceId })
+    okBody(body)
+
+    assert.equal(grantExpiryDays(deviceId), 29, "第 14 天续期后应到 t0 + 29 天")
+    assert.equal(deviceGrantRow(deviceId).token, registered.token)
+})
+
+test("契约 3.2 反例：连续 15 天不活跃（第 16 天才带 token 上线）→ TOKEN_INVALID 且不续期", async () => {
+    const { deviceId, data: registered } = await registerDevice()
+    const before = deviceGrantRow(deviceId)
+
+    // 中途一次带 token 的接口都不调，直接推进 16 天。
+    advance(16 * DAY_MS)
+    const { body } = await post("/bind-status", { token: registered.token, device_id: deviceId })
+    failBody(body, "TOKEN_INVALID")
+
+    // 拒绝分支是纯读：过期时间戳原样保留，失败调用不会把它悄悄顺延。
+    assert.equal(deviceGrantRow(deviceId).expires_at, before.expires_at, "过期分支不得续期")
+})
+
+test("契约 3.2 边界：恰好卡在 15 天整、期间无活跃 → 已失效", async () => {
+    const { deviceId, data: registered } = await registerDevice()
+
+    advance(15 * DAY_MS)
+    const { body } = await post("/bind-status", { token: registered.token, device_id: deviceId })
+    failBody(body, "TOKEN_INVALID")
+})
+
+test("TTL 滑动：数据层 refreshDeviceGrantExpirySync 只顺延不轮换；无行 null；非法 ttlDays 抛错", async () => {
+    const { deviceId, data: registered } = await registerDevice()
+    const before = binding.getDeviceGrantSync(deviceId)
+
+    advance(3 * DAY_MS)
+    const refreshed = binding.refreshDeviceGrantExpirySync(deviceId)
+    assert.ok(refreshed !== null, "有授权行时必须返回更新后的 grant")
+    assert.equal(refreshed.token, before.token, "续期不得轮换 token")
+    assert.equal(refreshed.expiresAt.getTime(), BASE_NOW_MS + 3 * DAY_MS + 15 * DAY_MS)
+    assert.equal(refreshed.updatedAt.getTime(), BASE_NOW_MS + 3 * DAY_MS, "updated_at 指向本次续期")
+    assert.equal(refreshed.createdAt.getTime(), before.createdAt.getTime(), "created_at 不动")
+
+    // 显式 ttlDays 覆盖默认值。
+    const custom = binding.refreshDeviceGrantExpirySync(deviceId, 2)
+    assert.ok(custom !== null)
+    assert.equal(custom.expiresAt.getTime(), BASE_NOW_MS + 3 * DAY_MS + 2 * DAY_MS)
+
+    // 无授权行 → null（调用方据此判失效），且不会凭空建行。
+    assert.equal(binding.refreshDeviceGrantExpirySync(999_999_999), null)
+    assert.equal(binding.getDeviceGrantSync(999_999_999), null)
+
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+        assert.throws(
+            () => binding.refreshDeviceGrantExpirySync(deviceId, bad),
+            /positive integer/,
+            `ttlDays=${bad} 必须被拒绝`,
+        )
+    }
+
+    // 数据层续期后，客户端手里的原 token 依旧可用。
+    const { body } = await post("/bind-status", { token: registered.token, device_id: deviceId })
+    okBody(body)
 })
 
 test("测试环境隔离：DATA_DIR 指向临时目录", () => {

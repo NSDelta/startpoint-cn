@@ -34,8 +34,15 @@ export const SIGNUP_CODE_LENGTH = 6
 export const SIGNUP_CODE_TTL_MINUTES = 30
 /** A code is locked after this many failed attempts. */
 export const SIGNUP_CODE_MAX_ATTEMPTS = 5
-/** Device grants are valid for 30 days (contract 3.2). */
-export const DEVICE_GRANT_TTL_DAYS = 30
+/**
+ * Device grants last 15 days of **inactivity** (contract 3.2, revised
+ * 2026-10-01). The window is sliding: every authenticated `/sp-auth/*` call
+ * (bind-status / resend / profile) re-arms it to "last seen + 15 days" via
+ * {@link refreshDeviceGrantExpirySync}. A device that stays away for 15
+ * consecutive days loses the grant and must log in again. The original
+ * contract 3.2 value was a fixed 30 days.
+ */
+export const DEVICE_GRANT_TTL_DAYS = 15
 export const BINDING_PLATFORMS: readonly BindingPlatform[] = ["qq", "kook"]
 
 const DEFAULT_LIST_LIMIT = 100
@@ -1005,6 +1012,38 @@ export function getActiveDeviceGrantSync(deviceId: number): DeviceGrant | null {
     const grant = getDeviceGrantSync(deviceId)
     if (grant === null) return null
     return grant.expiresAt.getTime() <= getRealNow().getTime() ? null : grant
+}
+
+/**
+ * Sliding renewal: pushes the grant's expiry to `now + ttlDays` without
+ * touching anything else.
+ *
+ * Deliberately **not** implemented on top of {@link upsertDeviceGrantSync}:
+ * that function mints a fresh `randomBytes(32)` token whenever no token is
+ * passed, which would invalidate the token the client is currently holding.
+ * Only `expires_at` / `updated_at` are written here, so a renewing client keeps
+ * its credential. Returns the updated grant, or `null` when the device has no
+ * grant row (nothing to renew — the caller should treat that as invalid).
+ */
+export function refreshDeviceGrantExpirySync(
+    deviceId: number,
+    ttlDays: number = DEVICE_GRANT_TTL_DAYS,
+): DeviceGrant | null {
+    const db = getDb()
+    const id = requireSafeId(deviceId, "device id")
+    if (!Number.isSafeInteger(ttlDays) || ttlDays <= 0) {
+        throw new Error("Device grant refresh TTL must be a positive integer number of days")
+    }
+
+    const now = getRealNow()
+    const expiresAt = new Date(now.getTime() + ttlDays * 24 * 60 * 60_000).toISOString()
+    const result = db.prepare(`
+        UPDATE device_grants
+        SET expires_at = ?, updated_at = ?
+        WHERE device_id = ?
+    `).run(expiresAt, now.toISOString(), id)
+    if (result.changes === 0) return null
+    return getDeviceGrantSync(id)
 }
 
 export function clearDeviceGrantSync(deviceId: number): boolean {
