@@ -53,6 +53,87 @@ static BOOL SpLoginSkinEnabled(void)
 
 @end
 
+#pragma mark - 外观构件
+
+/// 自带 `CAGradientLayer` 的容器（走 `layerClass`，不是 `addSublayer:`）。
+///
+/// 为什么必须有这个类：`[view.layer addSublayer:gradient]` 加进去的层是**独立坐标系**，
+/// Auto Layout 改的是 `view.bounds`，那层不会跟着走 —— 上一版面板上下两根装饰条
+/// 就是这么错位的。让渐变成 view 自己的 layer，尺寸自动同步，这一类问题从根上消失。
+@interface SpLoginGradientView : UIView
+@property (nonatomic, strong, readonly) CAGradientLayer *sp_gradient;
+/// 竖向渐变（上 → 下）。构造即定型，调用方只需再上圆角/约束。
++ (instancetype)sp_verticalGradientWithColors:(NSArray<UIColor *> *)colors
+                                    locations:(nullable NSArray<NSNumber *> *)locations;
+@end
+
+@implementation SpLoginGradientView
+
++ (Class)layerClass
+{
+    return [CAGradientLayer class];
+}
+
+- (CAGradientLayer *)sp_gradient
+{
+    return (CAGradientLayer *)self.layer;
+}
+
+/// 竖向渐变（上 → 下）。构造即定型，调用方只需再上圆角/约束。
++ (instancetype)sp_verticalGradientWithColors:(NSArray<UIColor *> *)colors
+                                    locations:(nullable NSArray<NSNumber *> *)locations
+{
+    SpLoginGradientView *view = [[self alloc] initWithFrame:CGRectZero];
+    NSMutableArray *cgColors = [NSMutableArray arrayWithCapacity:colors.count];
+    for (UIColor *color in colors) {
+        [cgColors addObject:(__bridge id)color.CGColor];
+    }
+    view.sp_gradient.colors = cgColors;
+    view.sp_gradient.locations = locations;
+    view.sp_gradient.startPoint = CGPointMake(0.5, 0.0);
+    view.sp_gradient.endPoint = CGPointMake(0.5, 1.0);
+    view.translatesAutoresizingMaskIntoConstraints = NO;
+    return view;
+}
+
+@end
+
+/// 渐变底的主按钮：`layer` 本身就是渐变层，圆角 / 裁切 / 高亮全部照常生效。
+@interface SpLoginGradientButton : UIButton
+@end
+
+@implementation SpLoginGradientButton
+
++ (Class)layerClass
+{
+    return [CAGradientLayer class];
+}
+
+- (void)setHighlighted:(BOOL)highlighted
+{
+    [super setHighlighted:highlighted];
+    // 深色卡片上没有系统自带的高亮反馈，用透明度做按压态（纯视觉，不碰业务）。
+    self.alpha = highlighted ? 0.82 : 1.0;
+}
+
+@end
+
+#pragma mark - 深色卡片色板
+
+// 上一版面板直接照搬官方浅色 token（#FAFAFA 底 + #444444 字），压在游戏彩色画面上
+// 就是「白天面板糊在夜里画面上」：浅底四周漏白、深灰字看不见。这一版整体换成深色卡片，
+// 只有主色仍取官方 token（#2EC4B6），保证和游戏的青色调性一致。
+static UIColor *SpLoginCardColor(void)   { return [UIColor colorWithRed:0.067 green:0.078 blue:0.090 alpha:0.97]; }
+static UIColor *SpLoginInnerColor(void)  { return [UIColor colorWithWhite:1.0 alpha:0.07]; }
+static UIColor *SpLoginInnerBorder(void) { return [UIColor colorWithWhite:1.0 alpha:0.10]; }
+static UIColor *SpLoginFieldColor(void)  { return [UIColor colorWithWhite:1.0 alpha:0.08]; }
+static UIColor *SpLoginFieldBorder(void) { return [UIColor colorWithWhite:1.0 alpha:0.14]; }
+static UIColor *SpLoginPlaceholder(void) { return [UIColor colorWithWhite:1.0 alpha:0.38]; }
+static UIColor *SpLoginHintColor(void)   { return [UIColor colorWithWhite:1.0 alpha:0.62]; }
+/// 主按钮渐变的上下两端（token 主色 #2EC4B6 的亮/暗两档）。
+static UIColor *SpLoginButtonTop(void)    { return [UIColor colorWithRed:0.235 green:0.831 blue:0.780 alpha:1.0]; }
+static UIColor *SpLoginButtonBottom(void) { return [UIColor colorWithRed:0.098 green:0.639 blue:0.596 alpha:1.0]; }
+
 @interface SpLoginViewController () <UITextFieldDelegate>
 
 @property (nonatomic, strong) UIView *panel;
@@ -67,14 +148,14 @@ static BOOL SpLoginSkinEnabled(void)
 @property (nonatomic, strong) UIButton *resendButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 
-// ---- 以下全部是皮肤层新增的装饰视图，不参与任何业务判定 ----
-@property (nonatomic, strong) UIView *titleBar;             // 深色标题铭牌
-@property (nonatomic, strong) UIView *titleAccent;          // 铭牌下沿的橙/红渐变描边
-@property (nonatomic, strong) UIView *codePlate;            // 验证码底板（深色）
-@property (nonatomic, strong) UIView *codeValueView;        // 逐位方块容器
-@property (nonatomic, strong) NSArray<UILabel *> *codeTiles;// 6 个方块，只做显示
-@property (nonatomic, strong) UIView *separator;            // 固定高度的分隔条
-@property (nonatomic, strong) UIView *bottomDecoration;     // 面板底缘装饰条
+// ---- 以下全部是外观构件，不参与任何业务判定 ----
+@property (nonatomic, strong) UIView *titleBar;              // 卡片头部（标题 + 关闭）
+@property (nonatomic, strong) UIView *titleAccent;           // 卡片顶缘渐变高光
+@property (nonatomic, strong) UIView *codePlate;             // 验证码底板
+@property (nonatomic, strong) UIView *codeValueView;         // 逐位方块容器
+@property (nonatomic, strong) NSArray<UILabel *> *codeTiles; // 6 个方块，只做显示
+@property (nonatomic, strong) UIButton *closeButton;         // 右上角关闭（只藏面板）
+@property (nonatomic, strong) UIScrollView *bodyScrollView;  // 内容超高时滚动（小屏兜底）
 @property (nonatomic, strong) UIStackView *contentStack;
 
 @property (nonatomic, assign) SpLoginUIState state;
@@ -122,7 +203,12 @@ static BOOL SpLoginSkinEnabled(void)
         return;
     }
     // 用 center/bounds 算，不用 frame：被 transform 平移过的 frame 会反馈污染（面板来回抖）。
-    CGFloat overlap = CGRectGetMaxY(self.panel.bounds) - keyboardTopY;
+    // 未平移时的卡片底边 = 视图中心（约束里的 centerY 常量为 -8）+ 卡片半高。
+    // 这个 -8.0 必须与 buildViews 里 card.centerY 的常量保持一致，否则避让会差几个点。
+    CGFloat cardHeight = CGRectGetHeight(self.panel.bounds);
+    CGFloat restingCenterY = CGRectGetMidY(self.view.bounds) - 8.0;
+    CGFloat restingMaxY = restingCenterY + cardHeight / 2.0;
+    CGFloat overlap = restingMaxY - keyboardTopY;
     CGFloat offset = (keyboardTopY > 0 && overlap > 0) ? -overlap : 0;
     self.panel.transform = CGAffineTransformMakeTranslation(0, offset);
 }
@@ -202,74 +288,116 @@ static BOOL SpLoginSkinEnabled(void)
     self.countdownTimer = nil;
 }
 
-// 皮肤层固定尺寸：全部是「长什么样」的参数，改它们不影响任何行为。
-static const CGFloat SpLoginPanelWidth      = 320.0;
-static const CGFloat SpLoginPanelMaxWidth   = 360.0;
-static const CGFloat SpLoginTitleBarHeight  = 44.0;
-static const CGFloat SpLoginTitleAccentH    = 3.0;
-static const CGFloat SpLoginFooterHeight    = 30.0;   // 底缘装饰条（decoration-assets）
-static const CGFloat SpLoginCodeTileW       = 40.0;
-static const CGFloat SpLoginCodeTileH       = 50.0;
-static const CGFloat SpLoginButtonHeight    = 48.0;
-static const CGFloat SpLoginSecondaryHeight = 42.0;
-static const CGFloat SpLoginResendHeight    = 30.0;
-static const CGFloat SpLoginFieldHeight     = 44.0;
-static const CGFloat SpLoginSeparatorH      = 1.0;
+// 外观固定尺寸：全部是「长什么样」的参数，改它们不影响任何行为。
+static const CGFloat SpLoginPanelMaxWidth   = 360.0;   // 卡片最大宽度（窄屏按屏宽收缩）
+static const CGFloat SpLoginHeaderHeight    = 58.0;    // 卡片头部高度
+static const CGFloat SpLoginAccentH         = 4.0;     // 卡片顶缘渐变条高度
+static const CGFloat SpLoginCardPad         = 20.0;    // 卡片左右内边距
+static const CGFloat SpLoginCodeTileH       = 50.0;    // 验证码格高度
+static const CGFloat SpLoginButtonHeight    = 50.0;
+static const CGFloat SpLoginSecondaryHeight = 44.0;
+static const CGFloat SpLoginResendHeight    = 32.0;
+static const CGFloat SpLoginFieldHeight     = 46.0;
 
 #pragma mark - 视图
 
 - (void)buildViews
 {
     BOOL skin = SpLoginSkinEnabled();
-    // 小屏（iPhone SE 之类）收紧一点间距，避免面板比屏幕还高。
+
+    // 安全区在 viewDidLoad 里拿不到（view 还没进 window，safeAreaInsets 恒为 0），
+    // 用保守常量：刘海机是 44/34，非刘海机只是多留一点白，不会被切内容。
+    const CGFloat safeTop = 44.0;
+    const CGFloat safeBottom = 34.0;
+    const CGFloat cardMargin = 16.0;
+    CGFloat screenW = CGRectGetWidth([UIScreen mainScreen].bounds);
     CGFloat screenH = CGRectGetHeight([UIScreen mainScreen].bounds);
-    BOOL compact = (screenH > 0.0 && screenH < 700.0);
-    CGFloat topPad     = compact ? 12.0 : 16.0;
-    CGFloat gapBig     = compact ? 14.0 : 20.0;
-    CGFloat gapField   = compact ? 8.0 : 10.0;
+    CGFloat cardWidth = MIN(SpLoginPanelMaxWidth, screenW - cardMargin * 2.0);
+    cardWidth = MAX(cardWidth, 272.0);
+    // 卡片总高上限 = 屏高 − 安全区 − 上下各 12pt 呼吸位；内容再高就滚动（小屏兜底）。
+    CGFloat maxCardHeight = MAX(320.0, screenH - safeTop - safeBottom - 24.0);
+    CGFloat maxBodyHeight = MAX(160.0, maxCardHeight - SpLoginHeaderHeight - SpLoginAccentH - SpLoginCardPad);
 
     self.view.backgroundColor = [SpLoginTheme scrim];
+    // 点卡片外的空白 = 关面板（与「回到游戏」同一个动作，只藏不销毁）。
+    UITapGestureRecognizer *tapOutside =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(sp_scrimTapped:)];
+    tapOutside.cancelsTouchesInView = NO;
+    [self.view addGestureRecognizer:tapOutside];
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.translatesAutoresizingMaskIntoConstraints = NO;
-    [SpLoginTheme applyPanelStyle:panel];
-    self.panel = panel;
-    [self.view addSubview:panel];
+    // ---------- 卡片 ----------
+    UIView *card = [[UIView alloc] initWithFrame:CGRectZero];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = SpLoginCardColor();
+    card.layer.cornerRadius = 22.0;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.10].CGColor;
+    // 阴影要露到卡片外面 ⇒ 这里不能 masksToBounds（顶缘渐变条自己裁圆角，见下）。
+    card.layer.shadowColor = UIColor.blackColor.CGColor;
+    card.layer.shadowOpacity = 0.55;
+    card.layer.shadowRadius = 28.0;
+    card.layer.shadowOffset = CGSizeMake(0.0, 12.0);
+    self.panel = card;
+    [self.view addSubview:card];
 
-    // ---- 深色标题铭牌（token: loading.ui 的 #222222 深底 + panel.ui 的 title 位）----
-    UIView *titleBar = [[UIView alloc] initWithFrame:CGRectZero];
-    titleBar.translatesAutoresizingMaskIntoConstraints = NO;
-    titleBar.backgroundColor = [SpLoginTheme plateDark];
-    titleBar.layer.cornerRadius = [SpLoginTheme radiusPlate];
-    if (@available(iOS 11.0, *)) {
-        titleBar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
-    }
-    titleBar.layer.masksToBounds = YES;
-    self.titleBar = titleBar;
-    [panel addSubview:titleBar];
+    // 顶缘一道细渐变高光（取代上一版的「深色铭牌 + 底缘装饰三件套」整块装饰）。
+    SpLoginGradientView *accent =
+        [SpLoginGradientView sp_verticalGradientWithColors:@[ [SpLoginTheme primary], [SpLoginTheme accent] ]
+                                                  locations:@[ @0.0, @1.0 ]];
+    accent.sp_gradient.startPoint = CGPointMake(0.0, 0.5);   // 横向：左青 → 右橙
+    accent.sp_gradient.endPoint = CGPointMake(1.0, 0.5);
+    accent.layer.cornerRadius = 22.0;
+    accent.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    accent.layer.masksToBounds = YES;
+    self.titleAccent = accent;
+    [card addSubview:accent];
 
-    UIView *titleAccent = [[UIView alloc] initWithFrame:CGRectZero];
-    titleAccent.translatesAutoresizingMaskIntoConstraints = NO;
-    [SpLoginTheme applyVerticalGradient:titleAccent
-                                 colors:@[[SpLoginTheme accent], [SpLoginTheme danger]]
-                              locations:@[@0.0, @1.0]];
-    self.titleAccent = titleAccent;
-    [titleBar addSubview:titleAccent];
+    // ---------- 头部：标题 + 关闭 ----------
+    UIView *header = [[UIView alloc] initWithFrame:CGRectZero];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleBar = header;
+    [card addSubview:header];
 
-    UILabel *title = [self labelWithFont:(skin ? [SpLoginTheme fontTitle]
-                                               : [SpLoginTheme fontOfSize:20 weight:UIFontWeightSemibold])
-                                   color:(skin ? [SpLoginTheme textOnDark] : [SpLoginTheme textPrimary])
+    UIView *titleTick = [[UIView alloc] initWithFrame:CGRectZero];
+    titleTick.translatesAutoresizingMaskIntoConstraints = NO;
+    titleTick.backgroundColor = [SpLoginTheme primary];
+    titleTick.layer.cornerRadius = 2.0;
+    [header addSubview:titleTick];
+
+    UILabel *title = [self labelWithFont:[SpLoginTheme fontOfSize:19.0 weight:UIFontWeightSemibold]
+                                   color:UIColor.whiteColor
                                    lines:1];
     title.text = @"服务器绑定";
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
     self.titleLabel = title;
-    [titleBar addSubview:title];
+    [header addSubview:title];
 
-    // ---- 验证码逐位方块（业务侧只写 codeLabel.text，方块由 sp_syncCodeTiles 跟随）----
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
+    [close setTitle:@"×" forState:UIControlStateNormal];
+    close.titleLabel.font = [SpLoginTheme fontOfSize:24.0 weight:UIFontWeightRegular];
+    [close setTitleColor:SpLoginHintColor() forState:UIControlStateNormal];
+    [close addTarget:self action:@selector(sp_closeTapped:) forControlEvents:UIControlEventTouchUpInside];
+    close.translatesAutoresizingMaskIntoConstraints = NO;
+    self.closeButton = close;
+    [header addSubview:close];
+
+    // ---------- 内容区（超高可滚） ----------
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.backgroundColor = UIColor.clearColor;
+    scroll.showsVerticalScrollIndicator = NO;
+    scroll.alwaysBounceVertical = NO;
+    scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    self.bodyScrollView = scroll;
+    [card addSubview:scroll];
+
+    // ---------- 验证码底板 ----------
     UIView *codePlate = [[UIView alloc] initWithFrame:CGRectZero];
     codePlate.translatesAutoresizingMaskIntoConstraints = NO;
-    [SpLoginTheme applyDarkPlateStyle:codePlate cornerRadius:18.0];
+    codePlate.backgroundColor = SpLoginInnerColor();
+    codePlate.layer.cornerRadius = 16.0;
+    codePlate.layer.borderWidth = 1.0;
+    codePlate.layer.borderColor = SpLoginInnerBorder().CGColor;
     self.codePlate = codePlate;
 
     UIView *codeValue = [[UIView alloc] initWithFrame:CGRectZero];
@@ -277,180 +405,180 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
     self.codeValueView = codeValue;
     [codePlate addSubview:codeValue];
 
+    // 逐位方块用 FillEqually 横排：宽度自适应。上一版写死 6×40 宽，窄屏上会把容器撑爆破约束。
+    UIStackView *tilesRow = [[UIStackView alloc] initWithFrame:CGRectZero];
+    tilesRow.axis = UILayoutConstraintAxisHorizontal;
+    tilesRow.distribution = UIStackViewDistributionFillEqually;
+    tilesRow.spacing = 6.0;
+    tilesRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [codeValue addSubview:tilesRow];
+
+    NSMutableArray<UILabel *> *tiles = [NSMutableArray arrayWithCapacity:6];
+    for (NSInteger i = 0; i < 6; i++) {
+        UILabel *tile = [[UILabel alloc] initWithFrame:CGRectZero];
+        tile.font = [SpLoginTheme monospacedDigitFontOfSize:26.0 weight:UIFontWeightBold];
+        tile.textColor = UIColor.whiteColor;
+        tile.textAlignment = NSTextAlignmentCenter;
+        tile.backgroundColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.18];
+        tile.layer.cornerRadius = 10.0;
+        tile.layer.masksToBounds = YES;
+        tile.layer.borderWidth = 1.0;
+        tile.layer.borderColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.45].CGColor;
+        tile.userInteractionEnabled = NO;
+        tile.hidden = YES;
+        [tilesRow addArrangedSubview:tile];
+        [tiles addObject:tile];
+    }
+    self.codeTiles = tiles;
+
     SpLoginCodeLabel *code = [[SpLoginCodeLabel alloc] initWithFrame:CGRectZero];
-    code.font = [SpLoginTheme monospacedDigitFontOfSize:32.0 weight:UIFontWeightBold];
-    code.textColor = [SpLoginTheme textOnDark];
+    code.font = [SpLoginTheme monospacedDigitFontOfSize:30.0 weight:UIFontWeightBold];
+    code.textColor = UIColor.whiteColor;
     code.textAlignment = NSTextAlignmentCenter;
     code.numberOfLines = 1;
+    code.adjustsFontSizeToFitWidth = YES;
+    code.minimumScaleFactor = 0.6;
     code.text = @"------";
     code.translatesAutoresizingMaskIntoConstraints = NO;
     self.codeLabel = code;
     [codeValue addSubview:code];
 
-    NSMutableArray<UILabel *> *tiles = [NSMutableArray arrayWithCapacity:6];
-    for (NSInteger i = 0; i < 6; i++) {
-        UILabel *tile = [[UILabel alloc] initWithFrame:CGRectZero];
-        tile.font = [SpLoginTheme codeDigitFont];
-        tile.textColor = [SpLoginTheme textOnDark];
-        tile.textAlignment = NSTextAlignmentCenter;
-        tile.backgroundColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.16];
-        tile.layer.cornerRadius = [SpLoginTheme radiusChip];
-        tile.layer.masksToBounds = YES;
-        tile.layer.borderWidth = 1.0;
-        tile.layer.borderColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.55].CGColor;
-        tile.userInteractionEnabled = NO;
-        tile.hidden = YES;
-        tile.translatesAutoresizingMaskIntoConstraints = NO;
-        [codeValue addSubview:tile];
-        [NSLayoutConstraint activateConstraints:@[
-            [tile.widthAnchor constraintEqualToConstant:SpLoginCodeTileW],
-            [tile.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
-        ]];
-        [tiles addObject:tile];
-    }
-    self.codeTiles = tiles;
-    [codeValue addConstraints:@[
-        [code.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor],
-        [code.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor],
-        [code.topAnchor constraintEqualToAnchor:codeValue.topAnchor],
-        [code.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
-    ]];
-
-    // 逐位方块用「懒惰创建 + 横向两端对齐」摆位：完全走约束，不手算 frame。
-    // 首尾两块分别贴住容器两侧，中间四块的间距由 equalSpacing 均分。
-    NSMutableArray<NSLayoutConstraint *> *tileConstraints = [NSMutableArray array];
-    UILabel *previous = nil;
-    for (UILabel *tile in tiles) {
-        [tileConstraints addObject:[tile.centerYAnchor constraintEqualToAnchor:codeValue.centerYAnchor]];
-        [tileConstraints addObject:[tile.topAnchor constraintGreaterThanOrEqualToAnchor:codeValue.topAnchor]];
-        [tileConstraints addObject:[tile.bottomAnchor constraintLessThanOrEqualToAnchor:codeValue.bottomAnchor]];
-        if (previous == nil) {
-            [tileConstraints addObject:[tile.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor]];
-        } else {
-            [tileConstraints addObject:[tile.leadingAnchor constraintGreaterThanOrEqualToAnchor:previous.trailingAnchor
-                                                                                      constant:6.0]];
-        }
-        previous = tile;
-    }
-    [tileConstraints addObject:[previous.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor]];
-    [NSLayoutConstraint activateConstraints:tileConstraints];
-
-    UILabel *countdown = [self labelWithFont:[SpLoginTheme fontCaption]
-                                       color:[SpLoginTheme textSecondary]
+    UILabel *countdown = [self labelWithFont:[SpLoginTheme fontOfSize:13.0 weight:UIFontWeightRegular]
+                                       color:SpLoginHintColor()
                                        lines:1];
     countdown.textAlignment = NSTextAlignmentCenter;
     countdown.text = @"验证码会随公告下发到游戏里";
     self.countdownLabel = countdown;
 
-    UIView *separator = [[UIView alloc] initWithFrame:CGRectZero];
-    separator.translatesAutoresizingMaskIntoConstraints = NO;
-    separator.backgroundColor = [SpLoginTheme hairline];
-    separator.layer.cornerRadius = SpLoginSeparatorH * 0.5;
-    self.separator = separator;
-
     self.accountField = [self textFieldWithPlaceholder:@"QQ 号" secure:NO keyboard:UIKeyboardTypeNumberPad];
     self.passwordField = [self textFieldWithPlaceholder:@"密码" secure:YES keyboard:UIKeyboardTypeDefault];
     self.confirmField = [self textFieldWithPlaceholder:@"确认密码" secure:YES keyboard:UIKeyboardTypeDefault];
 
-    UIButton *primary = [UIButton buttonWithType:UIButtonTypeCustom];
+    // ---------- 按钮 ----------
+    // 注意：不能用 `[SpLoginGradientButton buttonWithType:]` —— 那个方法返回的是 UIButton
+    // 实例而不是子类实例，`primary.layer` 会是普通 CALayer，下一行 setColors: 直接崩。
+    SpLoginGradientButton *primary = [[SpLoginGradientButton alloc] initWithFrame:CGRectZero];
     [primary setTitle:@"创建账号并绑定" forState:UIControlStateNormal];
+    [primary setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    primary.titleLabel.font = [SpLoginTheme fontOfSize:17.0 weight:UIFontWeightSemibold];
     [primary addTarget:self action:@selector(onPrimaryTapped) forControlEvents:UIControlEventTouchUpInside];
-    [SpLoginTheme applyPrimaryButtonStyle:primary];
+    CAGradientLayer *primaryGradient = (CAGradientLayer *)primary.layer;
+    primaryGradient.colors = @[ (__bridge id)SpLoginButtonTop().CGColor,
+                                (__bridge id)SpLoginButtonBottom().CGColor ];
+    primaryGradient.startPoint = CGPointMake(0.5, 0.0);
+    primaryGradient.endPoint = CGPointMake(0.5, 1.0);
+    primary.layer.cornerRadius = 14.0;
+    primary.layer.masksToBounds = YES;
+    primary.translatesAutoresizingMaskIntoConstraints = NO;
     self.primaryButton = primary;
 
     UIButton *secondary = [UIButton buttonWithType:UIButtonTypeCustom];
     [secondary setTitle:@"我已有账号" forState:UIControlStateNormal];
+    [secondary setTitleColor:[SpLoginTheme primary] forState:UIControlStateNormal];
+    secondary.titleLabel.font = [SpLoginTheme fontOfSize:16.0 weight:UIFontWeightMedium];
+    secondary.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+    secondary.layer.cornerRadius = 14.0;
+    secondary.layer.borderWidth = 1.0;
+    secondary.layer.borderColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.50].CGColor;
     [secondary addTarget:self action:@selector(onSecondaryTapped) forControlEvents:UIControlEventTouchUpInside];
-    [SpLoginTheme applySecondaryButtonStyle:secondary];
+    secondary.translatesAutoresizingMaskIntoConstraints = NO;
     self.secondaryButton = secondary;
 
     UIButton *resend = [UIButton buttonWithType:UIButtonTypeCustom];
     [resend setTitle:@"重新获取验证码" forState:UIControlStateNormal];
+    [resend setTitleColor:[[SpLoginTheme primary] colorWithAlphaComponent:0.95] forState:UIControlStateNormal];
+    resend.titleLabel.font = [SpLoginTheme fontOfSize:14.0 weight:UIFontWeightMedium];
     [resend addTarget:self action:@selector(onResendTapped) forControlEvents:UIControlEventTouchUpInside];
-    [SpLoginTheme applyLinkButtonStyle:resend];
+    resend.translatesAutoresizingMaskIntoConstraints = NO;
     self.resendButton = resend;
 
-    UILabel *status = [self labelWithFont:[SpLoginTheme fontCaption]
-                                    color:[SpLoginTheme textSecondary]
+    UILabel *status = [self labelWithFont:[SpLoginTheme fontOfSize:13.0 weight:UIFontWeightRegular]
+                                    color:SpLoginHintColor()
                                     lines:0];
     status.textAlignment = NSTextAlignmentCenter;
     self.statusLabel = status;
 
-    // ---- 纵向内容栈。注意：UITextField 一旦进了 stack view 就会被「零间距填充」，
-    //      间距改由 stack 的 spacing 提供，所以字段没有单独的间距常量。 ----
+    // ---------- 纵向内容栈 ----------
     UIStackView *stack = [[UIStackView alloc] initWithFrame:CGRectZero];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.alignment = UIStackViewAlignmentFill;
-    stack.spacing = gapField;
+    stack.spacing = 12.0;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
     self.contentStack = stack;
-    [panel addSubview:stack];
-    for (UIView *row in @[ codePlate, countdown, separator, self.accountField,
-                           self.passwordField, self.confirmField, primary, secondary, resend, status ]) {
+    [scroll addSubview:stack];
+    for (UIView *row in @[ codePlate, countdown, self.accountField, self.passwordField,
+                           self.confirmField, primary, secondary, resend, status ]) {
         [stack addArrangedSubview:row];
     }
-    [stack setCustomSpacing:gapBig afterView:codePlate];
-    [stack setCustomSpacing:12.0 afterView:separator];
-    [stack setCustomSpacing:gapBig afterView:self.confirmField];
-    [stack setCustomSpacing:6.0 afterView:countdown];
-    [stack setCustomSpacing:5.0 afterView:secondary];
+    [stack setCustomSpacing:10.0 afterView:codePlate];
+    [stack setCustomSpacing:18.0 afterView:countdown];
+    [stack setCustomSpacing:20.0 afterView:self.confirmField];
+    [stack setCustomSpacing:10.0 afterView:secondary];
 
-    // ---- 底缘装饰条（token: decoration-assets/bottom_decoration_part_a|b|c）----
-    UIView *decoration = [SpLoginTheme makeBottomDecorationBarWithWidth:SpLoginPanelWidth];
-    decoration.translatesAutoresizingMaskIntoConstraints = NO;
-    self.bottomDecoration = decoration;
-    [panel addSubview:decoration];
-
-    // 160 = 面板内容的横向内边距合计；用 guide 表达，面板窄了内容跟着窄，不写死。
-    UILayoutGuide *contentGuide = [[UILayoutGuide alloc] init];
-    [panel addLayoutGuide:contentGuide];
-
-    CGFloat panelWidth = MIN(SpLoginPanelMaxWidth, CGRectGetWidth([UIScreen mainScreen].bounds) - 40.0);
-    panelWidth = MAX(panelWidth, 280.0);
-    self.accountField.translatesAutoresizingMaskIntoConstraints = NO;
-    self.passwordField.translatesAutoresizingMaskIntoConstraints = NO;
-    self.confirmField.translatesAutoresizingMaskIntoConstraints = NO;
-
+    // ---------- 约束 ----------
     [NSLayoutConstraint activateConstraints:@[
-        [panel.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [panel.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-8.0],
-        [panel.widthAnchor constraintEqualToConstant:panelWidth],
+        [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [card.widthAnchor constraintEqualToConstant:cardWidth],
+        [card.topAnchor constraintGreaterThanOrEqualToAnchor:self.view.topAnchor
+                                                    constant:safeTop + 12.0],
+        [card.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.bottomAnchor
+                                                    constant:-(safeBottom + 12.0)],
 
-        [titleBar.topAnchor constraintEqualToAnchor:panel.topAnchor],
-        [titleBar.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
-        [titleBar.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
-        [titleBar.heightAnchor constraintEqualToConstant:SpLoginTitleBarHeight],
+        [accent.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [accent.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [accent.topAnchor constraintEqualToAnchor:card.topAnchor],
+        [accent.heightAnchor constraintEqualToConstant:SpLoginAccentH],
 
-        [title.centerXAnchor constraintEqualToAnchor:titleBar.centerXAnchor],
-        [title.centerYAnchor constraintEqualToAnchor:titleBar.centerYAnchor],
-        [title.leadingAnchor constraintGreaterThanOrEqualToAnchor:titleBar.leadingAnchor constant:12.0],
-        [title.trailingAnchor constraintLessThanOrEqualToAnchor:titleBar.trailingAnchor constant:-12.0],
+        [header.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [header.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [header.topAnchor constraintEqualToAnchor:accent.bottomAnchor],
+        [header.heightAnchor constraintEqualToConstant:SpLoginHeaderHeight],
 
-        [titleAccent.leadingAnchor constraintEqualToAnchor:titleBar.leadingAnchor],
-        [titleAccent.trailingAnchor constraintEqualToAnchor:titleBar.trailingAnchor],
-        [titleAccent.bottomAnchor constraintEqualToAnchor:titleBar.bottomAnchor],
-        [titleAccent.heightAnchor constraintEqualToConstant:SpLoginTitleAccentH],
+        [titleTick.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:SpLoginCardPad],
+        [titleTick.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [titleTick.widthAnchor constraintEqualToConstant:4.0],
+        [titleTick.heightAnchor constraintEqualToConstant:18.0],
 
-        [decoration.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
-        [decoration.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
-        [decoration.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor],
-        [decoration.heightAnchor constraintEqualToConstant:SpLoginFooterHeight],
+        [title.leadingAnchor constraintEqualToAnchor:titleTick.trailingAnchor constant:10.0],
+        [title.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [title.trailingAnchor constraintLessThanOrEqualToAnchor:close.leadingAnchor constant:-8.0],
 
-        [contentGuide.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor constant:12.0],
-        [contentGuide.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor constant:-12.0],
-        [contentGuide.topAnchor constraintEqualToAnchor:titleBar.bottomAnchor constant:topPad],
-        [contentGuide.bottomAnchor constraintEqualToAnchor:decoration.topAnchor constant:-topPad],
+        [close.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-12.0],
+        [close.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [close.widthAnchor constraintEqualToConstant:36.0],
+        [close.heightAnchor constraintEqualToConstant:36.0],
 
-        [stack.leadingAnchor constraintEqualToAnchor:contentGuide.leadingAnchor],
-        [stack.trailingAnchor constraintEqualToAnchor:contentGuide.trailingAnchor],
-        [stack.topAnchor constraintEqualToAnchor:contentGuide.topAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [scroll.topAnchor constraintEqualToAnchor:header.bottomAnchor],
 
-        [codeValue.leadingAnchor constraintEqualToAnchor:codePlate.leadingAnchor constant:10.0],
-        [codeValue.trailingAnchor constraintEqualToAnchor:codePlate.trailingAnchor constant:-10.0],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor
+                                            constant:SpLoginCardPad],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor
+                                             constant:-SpLoginCardPad],
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor
+                                           constant:-SpLoginCardPad],
+        [stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor
+                                          constant:-SpLoginCardPad * 2.0],
+
+        [codeValue.leadingAnchor constraintEqualToAnchor:codePlate.leadingAnchor constant:12.0],
+        [codeValue.trailingAnchor constraintEqualToAnchor:codePlate.trailingAnchor constant:-12.0],
         [codeValue.topAnchor constraintEqualToAnchor:codePlate.topAnchor constant:12.0],
         [codeValue.bottomAnchor constraintEqualToAnchor:codePlate.bottomAnchor constant:-12.0],
 
-        [separator.heightAnchor constraintEqualToConstant:SpLoginSeparatorH],
+        [tilesRow.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor],
+        [tilesRow.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor],
+        [tilesRow.topAnchor constraintEqualToAnchor:codeValue.topAnchor],
+        // 上下都钉住：codeValue 的高度才被确定（= 格子高），否则 codePlate 高度欠定
+        // （底板 ↔ 容器的约束成环），UIKit 会解成 0 高，数字被裁掉。
+        [tilesRow.bottomAnchor constraintEqualToAnchor:codeValue.bottomAnchor],
+        [tilesRow.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
+
+        [code.leadingAnchor constraintEqualToAnchor:codeValue.leadingAnchor],
+        [code.trailingAnchor constraintEqualToAnchor:codeValue.trailingAnchor],
+        [code.centerYAnchor constraintEqualToAnchor:codeValue.centerYAnchor],
+        [code.heightAnchor constraintEqualToConstant:SpLoginCodeTileH],
 
         [self.accountField.heightAnchor constraintEqualToConstant:SpLoginFieldHeight],
         [self.passwordField.heightAnchor constraintEqualToConstant:SpLoginFieldHeight],
@@ -460,6 +588,29 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
         [resend.heightAnchor constraintEqualToConstant:SpLoginResendHeight],
     ]];
 
+    // 滚动区高度 = 内容高度（卡片贴着内容长），但不超过 maxBodyHeight（超了就滚）。
+    // 999 而不是 required：让「贴着内容」优先，实在放不下才让步。
+    NSLayoutConstraint *bodyFits =
+        [scroll.heightAnchor constraintEqualToAnchor:stack.heightAnchor constant:SpLoginCardPad * 2.0];
+    bodyFits.priority = 999;
+    NSLayoutConstraint *cardCentered =
+        [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-8.0];
+    cardCentered.priority = 750;   // 让位给上面两条 required 的上下边界
+    [NSLayoutConstraint activateConstraints:@[
+        bodyFits,
+        cardCentered,
+        [scroll.heightAnchor constraintLessThanOrEqualToConstant:maxBodyHeight],
+        [card.bottomAnchor constraintEqualToAnchor:scroll.bottomAnchor constant:SpLoginCardPad],
+    ]];
+
+    // 输入框聚焦描边（纯 layer：不缓存子视图树，所以光标与键盘行为一字不改）
+    for (UITextField *field in @[ self.accountField, self.passwordField, self.confirmField ]) {
+        [field addTarget:self action:@selector(sp_fieldEditingBegan:)
+        forControlEvents:UIControlEventEditingDidBegin];
+        [field addTarget:self action:@selector(sp_fieldEditingEnded:)
+        forControlEvents:UIControlEventEditingDidEnd];
+    }
+
     if (skin) {
         // 逐位方块视觉：codeLabel.text 一变就刷新（业务侧那一行没动）。
         __weak typeof(self) weakSelf = self;
@@ -468,16 +619,8 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
             [strongSelf sp_syncCodeTilesWithText:text];
         };
         [self sp_syncCodeTilesWithText:self.codeLabel.text];
-        // 输入框聚焦描边（纯 layer：不缓存子视图树，所以光标与键盘行为一字不改）
-        for (UITextField *field in @[ self.accountField, self.passwordField, self.confirmField ]) {
-            [field addTarget:self action:@selector(sp_fieldEditingBegan:)
-            forControlEvents:UIControlEventEditingDidBegin];
-            [field addTarget:self action:@selector(sp_fieldEditingEnded:)
-            forControlEvents:UIControlEventEditingDidEnd];
-        }
     } else {
-        // 皮肤关掉：收掉所有装饰，回到「只有标题 + 控件」的通用表单。
-        self.codeLabel.hidden = YES;
+        // 皮肤关掉：收掉纯装饰（顶缘渐变条 + 逐位方块），只留标题 + 控件的通用表单。
         self.codeLabel.sp_onTextChanged = nil;
         for (UILabel *tile in tiles) {
             tile.hidden = YES;
@@ -485,22 +628,41 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
         [self sp_setDecorationsHidden:YES];
     }
 
-    SPLoginLog(@"[SpLogin] panel skin=%@ compact=%@ width=%.0f（纯外观层，业务未变）",
-               skin ? @"on" : @"off", compact ? @"yes" : @"no", panelWidth);
+    SPLoginLog(@"[SpLogin] panel 深色卡片 skin=%@ width=%.0f maxBody=%.0f（纯外观层，业务未变）",
+               skin ? @"on" : @"off", cardWidth, maxBodyHeight);
 }
 
-/// 装饰视图整体开关（皮肤关掉时用）。只切 hidden，不动任何业务控件。
+/// 点卡片外的空白 = 关面板。卡片范围内的点击照旧交给控件。
+- (void)sp_scrimTapped:(UITapGestureRecognizer *)gesture
+{
+    if (self.panel == nil) {
+        return;
+    }
+    CGPoint point = [gesture locationInView:self.view];
+    if (CGRectContainsPoint(self.panel.frame, point)) {
+        return;
+    }
+    [SpLoginViewController dismissIfPresented];
+}
+
+- (void)sp_closeTapped:(UIButton *)sender
+{
+    [SpLoginViewController dismissIfPresented];
+}
+
+/// 装饰整体开关（皮肤关掉时用）。只切 hidden / 颜色，不动任何业务控件。
 - (void)sp_setDecorationsHidden:(BOOL)hidden
 {
-    self.titleBar.backgroundColor = hidden ? [SpLoginTheme primary] : [SpLoginTheme plateDark];
-    self.titleLabel.textColor = hidden ? [SpLoginTheme textOnDark] : self.titleLabel.textColor;
     self.titleAccent.hidden = hidden;
-    self.codePlate.backgroundColor = hidden ? UIColor.clearColor : [SpLoginTheme plateDark];
-    self.bottomDecoration.hidden = hidden;
-    self.separator.hidden = hidden;
+    self.codePlate.backgroundColor = hidden ? [UIColor colorWithWhite:1.0 alpha:0.04] : SpLoginInnerColor();
+    for (UILabel *tile in self.codeTiles) {
+        tile.backgroundColor = hidden ? [UIColor colorWithWhite:1.0 alpha:0.06]
+                                      : [[SpLoginTheme primary] colorWithAlphaComponent:0.18];
+        tile.layer.borderColor = (hidden ? SpLoginInnerBorder()
+                                         : [[SpLoginTheme primary] colorWithAlphaComponent:0.45]).CGColor;
+    }
 }
 
-/// 把 `codeLabel.text` 映射到 6 个方块。等宽字体 + 固定格宽 ⇒ 逐位对齐、不跳动。
 - (void)sp_syncCodeTilesWithText:(NSString *)text
 {
     NSString *digits = @"";
@@ -524,12 +686,15 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
 
 - (void)sp_fieldEditingBegan:(UITextField *)field
 {
-    [SpLoginTheme setFieldFocused:field focused:YES];
+    // 内联深色聚焦态（不再走皮肤层的通用浅色实现）。
+    field.layer.borderColor = [[SpLoginTheme primary] colorWithAlphaComponent:0.85].CGColor;
+    field.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
 }
 
 - (void)sp_fieldEditingEnded:(UITextField *)field
 {
-    [SpLoginTheme setFieldFocused:field focused:NO];
+    field.layer.borderColor = SpLoginFieldBorder().CGColor;
+    field.backgroundColor = SpLoginFieldColor();
 }
 
 - (UILabel *)labelWithFont:(UIFont *)font color:(UIColor *)color lines:(NSInteger)lines
@@ -538,21 +703,32 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
     label.font = font;
     label.textColor = color;
     label.numberOfLines = lines;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
     return label;
 }
 
 - (UITextField *)textFieldWithPlaceholder:(NSString *)placeholder secure:(BOOL)secure keyboard:(UIKeyboardType)keyboard
 {
     UITextField *field = [[UITextField alloc] initWithFrame:CGRectZero];
-    field.placeholder = placeholder;
+    // attributedPlaceholder：系统默认 placeholder 是浅灰，压在这套深色底上几乎看不见。
+    field.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:placeholder
+            attributes:@{ NSForegroundColorAttributeName: SpLoginPlaceholder() }];
     field.secureTextEntry = secure;
     field.keyboardType = keyboard;
     field.autocapitalizationType = UITextAutocapitalizationTypeNone;
     field.autocorrectionType = UITextAutocorrectionTypeNo;
     field.borderStyle = UITextBorderStyleNone;
-    // 外观整体交给皮肤层（底/描边/圆角/内边距/聚焦态）。行为部分（delegate、
-    // returnKeyType、键盘类型、左右视图）仍在下面照旧设置，一个字没改。
-    [SpLoginTheme applyFieldStyle:field];
+    field.translatesAutoresizingMaskIntoConstraints = NO;
+    // 深色输入框外观（纯外观层）。行为部分（delegate、returnKeyType、键盘类型、
+    // 左右视图）仍在下面照旧设置，一个字没改。
+    field.backgroundColor = SpLoginFieldColor();
+    field.layer.cornerRadius = 14.0;
+    field.layer.borderWidth = 1.0;
+    field.layer.borderColor = SpLoginFieldBorder().CGColor;
+    field.textColor = UIColor.whiteColor;
+    field.tintColor = [SpLoginTheme primary];
+    field.font = [SpLoginTheme fontOfSize:16.0 weight:UIFontWeightRegular];
     CGFloat inset = [SpLoginViewController textInsets];
     field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, inset, 0)];
     field.leftViewMode = UITextFieldViewModeAlways;
@@ -597,7 +773,8 @@ static const CGFloat SpLoginSeparatorH      = 1.0;
     } else if (self.state == SpLoginUIStateError) {
         self.statusLabel.textColor = [SpLoginTheme danger];
     } else {
-        self.statusLabel.textColor = [SpLoginTheme textSecondary];
+        // 深色卡片上的提示文字：旧值 textSecondary(#515151) 压在深底上等于看不见。
+        self.statusLabel.textColor = SpLoginHintColor();
     }
     SPLoginLog(@"[SpLogin] ui state=%ld mode=%ld", (long)self.state, (long)self.mode);
 }

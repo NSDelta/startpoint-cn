@@ -350,6 +350,14 @@ static void SpLoginApplyRoundedShadow(UIView *view,
     [self applyVerticalGradient:button
                          colors:@[SpLoginTint(primary, 0.10), SpLoginTint(primary, -0.06)]
                       locations:@[@0.0, @1.0]];
+    // 渐变层是宿主层的子层，而球的 `masksToBounds = NO`（要给光晕与落影留出 bounds 外的位置），
+    // 于是渐变层不会被球的圆角裁掉 —— 真机上表现为圆球背后顶着一块**方形青底**。
+    // 球本来就是正圆，这里让渐变层自己裁圆即可；改的是 layer 不是 frame，不会被 layoutSublayers 冲掉。
+    CALayer *ballGradient = [button.layer valueForKey:kSpLoginGradientKey];
+    if ([ballGradient isKindOfClass:[SpLoginGradientLayer class]]) {
+        ballGradient.cornerRadius = radius;
+        ballGradient.masksToBounds = YES;
+    }
     SpLoginEnsureStrokeLayer(button, @"SpLoginBallGlow", [self glowWidth], -([self glowWidth] * 0.5),
                              [self primaryGlow:0.55]);
     SpLoginEnsureStrokeLayer(button, @"SpLoginBallEdge", 2.0, 1.0, [UIColor colorWithWhite:1.0 alpha:0.85]);
