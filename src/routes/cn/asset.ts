@@ -356,14 +356,27 @@ const routes = async (fastify: FastifyInstance, options: CnAssetRouteOptions) =>
             }
 
             let catalog = contentSnapshot.cdn
-            // iOS 视图不可用时的兜底：先按 Android 目录视图算计划，只为判断"这份计划是否会真的下发归档"。
-            // 空计划（客户端已在快照目标版本）对 iOS 是安全的——不含任何归档，不会把 Android platform
-            // 归档发给 iOS；含归档则维持 503，绝不降级。
+            // iOS 视图的两种状态：
+            //  · ready（可能 degraded）：用 iOS 目录视图算计划。degraded = 部分 edge 没有 iOS platform
+            //    归档，那些 edge 只带 common/quality（视图侧保证绝不出现 Android platform 归档）；
+            //  · unavailable：先按 Android 目录视图算计划，只为判断"这份计划是否会真的下发归档"。
+            //    空计划（客户端已在快照目标版本）对 iOS 是安全的——不含任何归档；含归档则维持 503，绝不降级。
             let iosUnavailableReason: string | null = null
             if (iosEnabled && isIosAssetDevice(device)) {
                 const state = prepareIos(contentSnapshot, provider)
                 if (state.kind === "ready") {
                     catalog = state.catalog
+                    if (state.degraded) {
+                        request.log.warn(
+                            {
+                                missingPlatformEdges: state.missingPlatformEdges,
+                                totalEdges: state.catalog.edges.length,
+                                currentVersion: plannerCurrentVersion,
+                                route: request.routeOptions.url ?? request.url,
+                            },
+                            "ios asset view is degraded: edges without ios platform archives carry common/quality only (android platform archives are never sent to ios)",
+                        )
+                    }
                 } else {
                     iosUnavailableReason = state.reason
                 }

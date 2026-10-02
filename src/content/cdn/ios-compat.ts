@@ -1,8 +1,15 @@
 // iOS 目录视图构建与冻结缓存（ios_medium.csv、archive-ios-full/diff）
 // 由"灰"制作，基于 DontBeAlarmed/startpoint-cn@dev 提交 11d3bcf9。
 // 社区适配：
-//  - 缺失 iOS edge、实体表或目录整体缺失 → iOS 视图标记为明确"不可用"（503），
-//    不回退 Android platform 归档，错误严格限制在 iOS 请求范围（不影响 Android）。
+//  - 实体表或目录整体缺失 → iOS 视图标记为明确"不可用"（503），不回退 Android platform 归档，
+//    错误严格限制在 iOS 请求范围（不影响 Android）。
+//  - **单条 edge 缺 iOS platform 归档不再让整个视图不可用**（真机 m06219：h503 / 进游戏卡在半路 /
+//    资源卡在 5.96%）。旧语义下，社区 CDN 只要有一条 edge 没有 iOS 归档就恒 503——本机快照 110 条
+//    edge 里 100 条没有（archive-ios-diff 只有 10 个 111 字节占位件），iOS 客户端因此永远拿不到计划。
+//    降级策略：该 edge 只带 common/quality（shared）归档，**绝不把 Android platform 归档发给 iOS**；
+//    iOS 视图标记 degraded 并给出 missingPlatformEdges 计数，供路由层打日志。
+//  - 实体表所在目录名与快照清单不一致时（清单 EntityLists/… vs 磁盘 entities/…，不是大小写差异）
+//    扫 cdnRoot 直属子目录取唯一含 iOS 实体表的那个。
 //  - iOS 目录在启动/首次使用扫描一次并冻结（模块级缓存），不在每次请求中重扫磁盘。
 import { createHash } from "node:crypto"
 import fs from "node:fs"
@@ -22,6 +29,12 @@ export type IosCompatState =
         readonly kind: "ready"
         readonly catalog: CdnCatalog
         readonly installedBytes: number
+        /**
+         * true = 至少一条 edge 没有 iOS platform 归档，该 edge 只下发 common/quality。
+         * 视图仍然可用（客户端能拿到 200 计划），但 iOS platform 层不会更新。
+         */
+        readonly degraded: boolean
+        readonly missingPlatformEdges: number
     }
     | {
         readonly kind: "unavailable"
@@ -65,11 +78,17 @@ function matchesDiffEdge(relativePath: string, fromVersion: string, toVersion: s
     return match !== null && match[1] === fromVersion && match[2] === toVersion
 }
 
+interface ReplacedEdge {
+    readonly edge: CatalogEdge
+    /** platform 层没有对应 iOS 归档：该 edge 降级为「只带 shared（common/quality）」。 */
+    readonly missingPlatform: boolean
+}
+
 function replacePlatformArchives(
     edge: CatalogEdge,
     iosFull: ReadonlyArray<CatalogArchive>,
     iosDiff: ReadonlyArray<CatalogArchive>,
-): CatalogEdge | null {
+): ReplacedEdge {
     const shared = edge.archives.filter(candidate => candidate.layer !== "platform")
     const platform = edge.fromVersion === null
         ? iosFull
@@ -78,12 +97,13 @@ function replacePlatformArchives(
             edge.fromVersion as string,
             edge.toVersion,
         ))
-    if (platform.length === 0) {
-        // 缺失 iOS edge：不回退 Android platform 归档（维护侧最小边界：不能回传 Android platform archive），
-        // 由 prepareIosCompat 将整个 iOS 视图标记为"不可用"。
-        return null
+    // 缺 iOS platform 归档时**不再把整个 iOS 视图判为不可用**（旧语义会把 iOS 资源更新变成永久 503）：
+    // 这条 edge 的 platform 层留空，客户端继续使用它已有的 iOS 资源，common/quality 照常下发。
+    // 与旧语义的安全边界完全一致——绝不把 Android platform 归档发给 iOS 客户端。
+    return {
+        edge: Object.freeze({ ...edge, archives: Object.freeze([...shared, ...platform]) }),
+        missingPlatform: platform.length === 0,
     }
-    return Object.freeze({ ...edge, archives: Object.freeze([...shared, ...platform]) })
 }
 
 // 冻结的 iOS 目录视图缓存：key = cdnRoot，扫描一次，之后不再重扫磁盘（含"不可用"状态）。
@@ -131,17 +151,10 @@ export function prepareIosCompat(snapshot: ContentSnapshot, cdnRoot: string): Io
     }
 
     const replaced = snapshot.cdn.edges.map(edge => replacePlatformArchives(edge, iosFull, iosDiff))
-    if (replaced.some(edge => edge === null)) {
-        const state: IosCompatState = Object.freeze({
-            kind: "unavailable",
-            reason: "missing ios archive edge",
-        })
-        iosCompatCache.set(cdnRoot, state)
-        return state
-    }
+    const missingPlatformEdges = replaced.filter(item => item.missingPlatform).length
     const catalog = Object.freeze({
         ...snapshot.cdn,
-        edges: Object.freeze(replaced as ReadonlyArray<CatalogEdge>),
+        edges: Object.freeze(replaced.map(item => item.edge)),
     })
     const installedBytes = readEntityListInstalledBytes(cdnRoot, entityList)
     if (installedBytes === null) {
@@ -152,28 +165,55 @@ export function prepareIosCompat(snapshot: ContentSnapshot, cdnRoot: string): Io
         iosCompatCache.set(cdnRoot, state)
         return state
     }
-    const state: IosCompatState = Object.freeze({ kind: "ready", catalog, installedBytes })
+    const state: IosCompatState = Object.freeze({
+        kind: "ready",
+        catalog,
+        installedBytes,
+        degraded: missingPlatformEdges > 0,
+        missingPlatformEdges,
+    })
     iosCompatCache.set(cdnRoot, state)
     return state
 }
 
-export function resolveIosEntityList(catalog: CdnCatalog, cdnRoot: string): string | null {
-    const androidPath = catalog.entityListsRelativePath
-    const directory = path.posix.dirname(androidPath)
+function listIosEntityLists(cdnRoot: string, directory: string): string[] {
     const absoluteDirectory = path.join(cdnRoot, ...directory.split("/"))
-    let candidates: string[] = []
     try {
-        candidates = fs.readdirSync(absoluteDirectory, { withFileTypes: true })
+        return fs.readdirSync(absoluteDirectory, { withFileTypes: true })
             .filter(entry => entry.isFile()
                 && (entry.name.toLowerCase() === "ios_medium.csv"
                     || /-ios_medium\.csv$/i.test(entry.name)))
             .map(entry => entry.name)
             .sort((left, right) => left.localeCompare(right))
     } catch {
-        // 目录不存在：视为无 iOS 实体表（调用方据此判定不可用，不回落 Android 表）
+        // 目录不存在：该目录没有 iOS 实体表（调用方据此判定不可用或换目录兜底）
+        return []
     }
+}
+
+export function resolveIosEntityList(catalog: CdnCatalog, cdnRoot: string): string | null {
+    const androidPath = catalog.entityListsRelativePath
+    const directory = path.posix.dirname(androidPath)
+    const direct = listIosEntityLists(cdnRoot, directory)
+    if (direct.length === 1) return `${directory}/${direct[0]}`
+    if (direct.length > 1) return null
+    // 目录名漂移兜底（真机 m06219）：快照清单写 EntityLists/10939-android_medium.csv，而社区 CDN
+    // 磁盘上的目录叫 entities/——不是大小写差异，是另一个名字，readdir 直接 ENOENT，整个 iOS 视图
+    // 因此被判"没有 iOS 实体表"。这里扫 cdnRoot 的直属子目录，取唯一含 iOS 实体表的那个。
+    let entries: fs.Dirent[]
+    try {
+        entries = fs.readdirSync(cdnRoot, { withFileTypes: true })
+    } catch {
+        return null
+    }
+    const candidates = entries
+        .filter(entry => entry.isDirectory() && entry.name !== directory)
+        .map(entry => entry.name)
+        .sort((left, right) => left.localeCompare(right))
+        .map(name => ({ name, files: listIosEntityLists(cdnRoot, name) }))
+        .filter(item => item.files.length === 1)
     if (candidates.length !== 1) return null
-    return `${directory}/${candidates[0]}`
+    return `${candidates[0].name}/${candidates[0].files[0]}`
 }
 
 // 与 Android 侧同源：直接复用 catalog-builder 的规范解析器（表头可选、UTF-8 BOM 容忍、

@@ -13,7 +13,7 @@ const Fastify = require("fastify")
 const assetPlugin = require("../src/routes/cn/asset").default
 const assetInTitlePlugin = require("../src/routes/cn/assetInTitle").default
 const cdnFilesPlugin = require("../src/routes/cn/cdnFiles").default
-const { prepareIosCompat } = require("../src/content/cdn/ios-compat")
+const { prepareIosCompat, resolveIosEntityList } = require("../src/content/cdn/ios-compat")
 
 const SHA = "a".repeat(64)
 
@@ -154,8 +154,10 @@ test("version_info returns explicit unavailable when ios assets are missing", as
     assert.equal(response.json().code, "IOS_ASSETS_UNAVAILABLE")
 })
 
-test("version_info returns explicit unavailable when an ios edge is missing (no android fallback)", async t => {
-    // fixture 缺少 1.4.53 -> 1.4.54 的 iOS diff（Catalog 中存在该 diff edge）
+test("degraded ios view: an edge without an ios archive keeps serving a plan (never android platform archives)", async t => {
+    // fixture 缺少 1.4.53 -> 1.4.54 的 iOS diff（Catalog 中存在该 diff edge）。
+    // 旧语义：整条 iOS 视图判 unavailable ⇒ 客户端拿 503（真机 m06219 的「h503 / 卡在半路」）。
+    // 新语义：视图 ready 但 degraded —— 该 edge 只带 common/quality，其余 edge 照常走 iOS 归档。
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cn-ios-edge-"))
     const cn = path.join(tempRoot, "cn")
     fs.mkdirSync(path.join(cn, "archive-ios-full"), { recursive: true })
@@ -174,14 +176,39 @@ test("version_info returns explicit unavailable when an ios edge is missing (no 
     })
     t.after(() => app.close())
 
-    const response = await app.inject({
+    const state = prepareIosCompat(createSnapshot(), cn)
+    assert.equal(state.kind, "ready")
+    assert.equal(state.degraded, true)
+    assert.equal(state.missingPlatformEdges, 1)
+
+    const info = await app.inject({
         method: "POST",
         url: "/asset/version_info",
         headers: { device: "1" },
         payload: {},
     })
-    assert.equal(response.statusCode, 503)
-    assert.equal(response.json().code, "IOS_ASSETS_UNAVAILABLE")
+    assert.equal(info.statusCode, 200)
+    assert.equal(info.json().data.total_size, 3000)
+
+    // 初始客户端（无 RES_VER）：full 带 iOS full 归档；1.4.53→1.4.54 这条 diff 只剩 common 归档。
+    const plan = await app.inject({
+        method: "POST",
+        url: "/asset/get_path",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(plan.statusCode, 200)
+    const data = plan.json().data
+    const locations = [
+        ...(data.full ? data.full.archive : []),
+        ...(data.diff ?? []).flatMap(item => item.archive),
+    ].map(item => item.location)
+    assert.ok(locations.some(location => location.endsWith("archive-ios-full/pinball-1.4.0-1-abc123.zip")))
+    assert.ok(locations.some(location => location.endsWith("archive-ios-diff/pinball-1.4.0-1.4.53-1-def456.zip")))
+    assert.ok(locations.some(location => location.endsWith("archive-common-diff/latest.zip")))
+    // 缺 iOS 归档的那条 edge 不再带 platform 层；任何 Android platform 归档都不得出现在 iOS 计划里
+    assert.ok(!locations.some(location => location.includes("archive-ios-diff/pinball-1.4.53-1.4.54")))
+    assert.ok(!locations.some(location => location.includes("archive-android-")))
 })
 
 test("get_path plans ios-full archives for an iOS device and android archives otherwise", async t => {
@@ -680,6 +707,85 @@ test("a UTF-8 BOM header-less ios entity list is tolerated", async t => {
     })
     assert.equal(info.statusCode, 200)
     assert.equal(info.json().data.total_size, 3000)
+})
+
+// ---------------------------------------------------------------------------
+// 目录名漂移兜底（真机 m06219）：快照清单写 EntityLists/10939-android_medium.csv，
+// 而社区 CDN 磁盘上的目录叫 entities/ —— 不是大小写差异，是另一个名字，
+// readdir 直接 ENOENT ⇒ 整个 iOS 视图被判「没有 iOS 实体表」⇒ iOS 资源更新恒 503。
+// ---------------------------------------------------------------------------
+
+test("entity list directory drift (entities/ instead of EntityLists/) still resolves the ios entity list", async t => {
+    const fixture = buildIosFixture()
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+    fs.renameSync(path.join(fixture.cn, "EntityLists"), path.join(fixture.cn, "entities"))
+
+    assert.equal(resolveIosEntityList(createSnapshot().cdn, fixture.cn), "entities/ios_medium.csv")
+
+    const state = prepareIosCompat(createSnapshot(), fixture.cn)
+    assert.equal(state.kind, "ready")
+    assert.equal(state.installedBytes, 3000)
+
+    const app = await createAssetApp({
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    t.after(() => app.close())
+
+    const info = await app.inject({
+        method: "POST",
+        url: "/asset/version_info",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(info.statusCode, 200)
+    assert.equal(info.json().data.total_size, 3000)
+
+    const plan = await app.inject({
+        method: "POST",
+        url: "/asset/get_path",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(plan.statusCode, 200)
+    assert.ok(
+        plan.json().data.full.archive.some(item =>
+            item.location.includes("archive-ios-full/pinball-1.4.0-1-abc123.zip")),
+        `expected an ios-full archive in the plan, got: ${plan.body}`,
+    )
+})
+
+test("a degraded ios view still allowlists every ios archive it references (cdnFiles 200)", async t => {
+    // 与 degraded 用例同一夹具：缺 1.4.53 -> 1.4.54 的 iOS diff ⇒ 视图 ready+degraded。
+    // 关键：degraded 不得把白名单清空——否则计划里引用的 iOS 归档全部 404（真机就是下到 5.96% 停住）。
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cn-ios-degraded-files-"))
+    const cn = path.join(tempRoot, "cn")
+    fs.mkdirSync(path.join(cn, "archive-ios-full"), { recursive: true })
+    fs.mkdirSync(path.join(cn, "archive-ios-diff"), { recursive: true })
+    fs.mkdirSync(path.join(cn, "EntityLists"), { recursive: true })
+    fs.writeFileSync(path.join(cn, "archive-ios-full", "pinball-1.4.0-1-abc123.zip"), Buffer.from("full-archive"))
+    fs.writeFileSync(path.join(cn, "archive-ios-diff", "pinball-1.4.0-1.4.53-1-def456.zip"), Buffer.from("diff-archive"))
+    fs.writeFileSync(path.join(cn, "EntityLists", "android_medium.csv"), "path,version,size,hash,layer\n")
+    fs.writeFileSync(path.join(cn, "EntityLists", "ios_medium.csv"), IOS_ENTITY_LIST)
+    t.after(() => fs.rmSync(tempRoot, { recursive: true, force: true }))
+
+    const app = Fastify({ logger: false })
+    app.register(cdnFilesPlugin, {
+        getSnapshot: () => createSnapshot(),
+        paths: { cdnRoot: cn, patchesRoot: path.join(tempRoot, "patches") },
+        iosCompat: IOS_COMPAT,
+    })
+    await app.ready()
+    t.after(() => app.close())
+
+    const full = await app.inject({ method: "GET", url: "/patch/cn/archive-ios-full/pinball-1.4.0-1-abc123.zip" })
+    assert.equal(full.statusCode, 200)
+    assert.equal(full.body, "full-archive")
+
+    const diff = await app.inject({ method: "GET", url: "/patch/cn/archive-ios-diff/pinball-1.4.0-1.4.53-1-def456.zip" })
+    assert.equal(diff.statusCode, 200)
+    assert.equal(diff.body, "diff-archive")
 })
 
 test("invalid ios entity list rows yield unavailable(invalid ios entity list), never a throw", async t => {
