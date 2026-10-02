@@ -449,6 +449,23 @@ test("契约 C1：弱密码 → PASSWORD_WEAK，且不建账号", async () => {
     assert.equal(after, before, "弱密码不得留下账号")
 })
 
+test("契约 C1（v5.5）：符号密码可用 —— 可打印 ASCII 放开，空格/中文仍拒", async () => {
+    // 业主 m05850「密码强度判断有问题」：旧口径 `[A-Za-z0-9]{8,64}` 把 `Aa123456!` 这类
+    // 常见密码判弱，而报错文案从没说不能用符号。现在放开到 `[!-~]`（0x21-0x7E）。
+    const { data } = await registerDevice("Aa123456!@#")
+    assert.equal(typeof data.token, "string", "符号密码注册应成功并下发令牌")
+
+    // 放宽的边界：空格与中文不在可打印 ASCII 里，必须继续被拒（否则上面那条弱密码表会失守）。
+    for (const stillWeak of ["Aa12345 6!", "Aa1234中文56!"]) {
+        const { body } = await post("/register", {
+            username: username("symbol"),
+            password: stillWeak,
+            device_id: nextDeviceId(),
+        })
+        failBody(body, "PASSWORD_WEAK")
+    }
+})
+
 test("密码只存哈希：明文绝不落库，注册响应也不回传哈希", async () => {
     const password = "Passw0rdA1"
     const { deviceId, data: payload } = await registerDevice(password)

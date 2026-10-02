@@ -17,7 +17,6 @@
  * identity, because iOS reports the same synthetic UDID for every device.
  */
 
-import bcrypt from "bcryptjs"
 import {
     appendBindAuditSync,
     getAccountByDeviceSync,
@@ -49,6 +48,7 @@ import type {
     SpAuthDeviceTakenData,
     SpAuthRegisterData,
 } from "./contract"
+import { hashPassword } from "./password"
 import { fail, ok } from "./result"
 import type { SpAuthResult } from "./result"
 import { ensureViewerSession } from "./session-viewer"
@@ -158,7 +158,7 @@ export async function spRegister(
     let created = false
 
     if (state === null) {
-        const passwordHash = bcrypt.hashSync(password, 10)
+        const passwordHash = hashPassword(password)
         const account = createPendingAccount(deviceId, username, passwordHash)
         accountId = account.id
         created = true
@@ -176,7 +176,7 @@ export async function spRegister(
             updateAccountSync({
                 id: accountId,
                 username,
-                passwordHash: bcrypt.hashSync(password, 10),
+                passwordHash: hashPassword(password),
             })
         }
     }

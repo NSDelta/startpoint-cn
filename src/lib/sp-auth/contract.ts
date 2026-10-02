@@ -39,7 +39,7 @@ export type SpAuthErrorCode = typeof SP_AUTH_ERROR_CODES[number]
 export const SP_AUTH_ERROR_MESSAGES: Record<SpAuthErrorCode, string> = {
     USERNAME_TAKEN: "该登录名已被使用，请换一个。",
     USERNAME_INVALID: "登录名格式不合法（4-20 位字母/数字/下划线，且不能以数字开头）。",
-    PASSWORD_WEAK: "密码强度不足（8-64 位，需同时含大写字母、小写字母和数字）。",
+    PASSWORD_WEAK: "密码强度不足（8-64 位，字母/数字/符号都行，但不能有空格或中文，且需同时含大写字母、小写字母和数字）。",
     DEVICE_TAKEN: "本机已经注册过账号，请用账号密码登录。",
     RATE_LIMITED: "操作太频繁，请稍后再试。",
     BAD_CREDENTIALS: "登录名或密码不正确。",
@@ -168,8 +168,16 @@ export interface SpAuthTokenBody {
 /** Login name shape. Reserved loosely: at least one letter, no leading digit. */
 export const SP_AUTH_USERNAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{3,19}$/
 
-/** Existing repo password policy (`src/routes/cn/takeOver.ts:53-61`). */
-export const SP_AUTH_PASSWORD_PATTERN = /^[A-Za-z0-9]{8,64}$/
+/**
+ * Password charset. v5.5（业主 m05850「密码强度判断有问题」）：
+ * 旧口径是 `[A-Za-z0-9]{8,64}` —— 符号一律判弱，但错误文案从来没说过「不能用符号」，
+ * 玩家拿 `Aa123456!` 一看提示「需含大写字母、小写字母和数字」只会觉得判定坏了。
+ * 现在放开到**可打印 ASCII**（`!`–`~`，即 0x21–0x7E）：空格、中文、emoji 仍然不行，
+ * 但 `!@#$%^&*` 这类常见符号都可以用。`tools/sp_auth.test.cjs:438-450` 的弱密码表
+ * （`short1A` / `alllowercase1` / `ALLUPPERCASE1` / `NoDigitsHere` / `带符号 Passw0rd`）
+ * 在放宽后**依然全部被拒**（长度、大小写数字齐备性、空格+CJK 三条各自拦得住）。
+ */
+export const SP_AUTH_PASSWORD_PATTERN = /^[!-~]{8,64}$/
 
 /** Random grant tokens / idle windows kept in one place for readability. */
 export const SP_AUTH_TOKEN_BYTES = 32
@@ -178,7 +186,8 @@ export function isValidUsername(value: unknown): value is string {
     return typeof value === "string" && SP_AUTH_USERNAME_PATTERN.test(value)
 }
 
-/** Same policy as `takeOver.ts`: 8-64 ASCII alnum with upper+lower+digit. */
+/** Same policy as `takeOver.ts`, plus the v5.5 symbol allowance: 8-64 printable ASCII
+ *  (no spaces / CJK) with at least one upper, one lower and one digit. */
 export function isStrongPassword(value: unknown): value is string {
     return typeof value === "string"
         && value.length >= 8

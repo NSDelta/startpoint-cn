@@ -12,7 +12,6 @@
  *   - `active`   → issue the device grant and answer `{bound:true}`
  */
 
-import bcrypt from "bcryptjs"
 import {
     appendBindAuditSync,
     getAccountBindStateSync,
@@ -20,7 +19,7 @@ import {
 } from "../../data/domains/account-binding"
 import { updateAccountSync } from "../../data/domains/account"
 import { insertDeviceBindingSync } from "../../data/domains/session"
-import type { Account, BindState } from "../../data/types"
+import type { BindState } from "../../data/types"
 import {
     SP_AUTH_AUDIT_ACTOR,
     activeCodeViewForAccount,
@@ -30,6 +29,7 @@ import {
 import { getRealNow } from "../../runtime/time/game-time"
 import { parseDeviceId } from "./contract"
 import type { SpAuthCodeView, SpAuthLoginData } from "./contract"
+import { verifyPasswordHash } from "./password"
 import { fail, ok } from "./result"
 import type { SpAuthResult } from "./result"
 import { resolveDeviceState } from "./register"
@@ -70,7 +70,7 @@ export async function spLogin(
         return fail("BAD_CREDENTIALS")
     }
 
-    if (!verifyPassword(password, account)) {
+    if (!verifyPasswordHash(password, account.passwordHash)) {
         auditReject(account.id, { reason: "bad_password" })
         return fail("BAD_CREDENTIALS")
     }
@@ -148,17 +148,6 @@ export async function spLogin(
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-function verifyPassword(password: string, account: Account): boolean {
-    const hash = account.passwordHash
-    if (typeof hash !== "string" || hash.length === 0) return false
-    try {
-        return bcrypt.compareSync(password, hash)
-    } catch {
-        // A malformed stored hash must never turn into a 500 on the login page.
-        return false
-    }
-}
 
 /** `pending` is the safe default when the column is unreadable. */
 function bindStateOf(accountId: number): BindState {

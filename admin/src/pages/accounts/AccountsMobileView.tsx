@@ -11,7 +11,7 @@ import {
     Tag,
     Typography,
 } from "antd"
-import { ArrowLeft, Ellipsis, Pencil, Plus, Trash2 } from "lucide-react"
+import { ArrowLeft, Ellipsis, KeyRound, Pencil, Plus, Trash2 } from "lucide-react"
 
 import type { AccountRow, PlayerBrief } from "./types"
 
@@ -24,6 +24,7 @@ interface AccountsMobileViewProps {
     onBack: () => void
     onOpenPlayer: (playerId: number) => void
     onNewSave: (accountId: number) => Promise<unknown>
+    onChangePassword: (accountId: number) => void
     onDeleteAccount: (accountId: number) => Promise<unknown>
     onActivateSave: (playerId: number) => Promise<unknown>
     onCloneSave: (playerId: number, accountId: number) => Promise<unknown>
@@ -41,6 +42,7 @@ export function AccountsMobileView({
     onBack,
     onOpenPlayer,
     onNewSave,
+    onChangePassword,
     onDeleteAccount,
     onActivateSave,
     onCloneSave,
@@ -205,6 +207,9 @@ export function AccountsMobileView({
                             <div className="admin-mobile-actions">
                                 <Button type="primary" onClick={() => onSelectAccount(account.id)}>管理存档</Button>
                                 <Button icon={<Plus size={15} />} onClick={() => onNewSave(account.id)}>新建存档</Button>
+                                <Button icon={<KeyRound size={15} />} onClick={() => onChangePassword(account.id)}>
+                                    改密码
+                                </Button>
                                 <Popconfirm
                                     title={`删除账号 ${account.id} 及所有存档？`}
                                     okText="删除"

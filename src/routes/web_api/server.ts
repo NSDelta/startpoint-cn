@@ -3,7 +3,10 @@ import { getServerDate } from "../../utils";
 import { ServerTimeService, ServerTimeServiceError } from "../../runtime/server-time/service";
 import { validateServerTimePackage } from "../../runtime/server-time/store";
 import type { ServerTimePackage, ServerTimeSnapshot } from "../../runtime/server-time/types";
-import { deleteAccountSync, getAccountPlayersSync, getAllAccountsSync } from "../../data/domains/account"
+import { deleteAccountSync, getAccountPlayersSync, getAllAccountsSync, getAccountSync, updateAccountSync } from "../../data/domains/account"
+import { resolveAccountByLoginNameSync } from "../../data/domains/account-binding"
+import { SP_AUTH_ERROR_MESSAGES, isValidUsername, isStrongPassword } from "../../lib/sp-auth/contract"
+import { hashPassword } from "../../lib/sp-auth/password"
 import { deletePlayerSync, getPlayerSync, insertDefaultPlayerSync, updatePlayerSync } from "../../data/domains/player"
 import {
     getAllAdminPlayerSummariesSync,
@@ -238,6 +241,8 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
             const defaultPlayer = players.find(player => player.id === defaultPid)
             return {
                 id: acc.id,
+                username: acc.username ?? null,
+                hasPassword: typeof acc.passwordHash === "string" && acc.passwordHash.length > 0,
                 adminNote: acc.adminNote ?? null,
                 cleanupPolicy: acc.cleanupPolicy ?? "retain",
                 cleanupDueAt: acc.cleanupDueAt?.toISOString() ?? null,
@@ -263,6 +268,83 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         })
         return reply.send(result)
     })
+
+    // === Account password (admin-set credentials, contract C1) ===
+
+    /**
+     * `POST /api/server/accounts/:id/password`
+     *
+     * The hash is written through the one shared helper
+     * (`src/lib/sp-auth/password.ts`) and the new password is checked against the
+     * one shared rule set (`src/lib/sp-auth/contract.ts`), so an account repaired
+     * here can immediately log in through `POST /sp-auth/login` with it. A second
+     * hash implementation is exactly the bug this reuse prevents: it would not
+     * throw, it would just make `bcrypt.compareSync` answer false forever.
+     *
+     * `username` is optional, but it is what makes the reset usable for an account
+     * the game created itself: `spLogin` resolves a login name through
+     * `account_bindings.platform_uid` first and `accounts.username` second, so an
+     * account with a NULL username cannot be reached by name at all.
+     *
+     * Every check runs before the write, so a rejected request never leaves a
+     * half-updated account (renamed, but still holding the old password) behind.
+     *
+     * Like the rest of `/api`, this route carries no admin authentication: the
+     * panel lives inside the trusted network boundary (docs/admin/README.md).
+     */
+    fastify.post<{ Params: { id?: string } }>(
+        "/accounts/:id/password",
+        async (request: FastifyRequest<{ Params: { id?: string } }>, reply: FastifyReply) => {
+            const accountId = Number(request.params.id)
+            if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+                return reply.status(400).send({ error: "Invalid accountId" })
+            }
+
+            const body = (request.body ?? {}) as { password?: unknown; username?: unknown }
+            if (!isStrongPassword(body.password)) {
+                return reply.status(400).send({ error: SP_AUTH_ERROR_MESSAGES.PASSWORD_WEAK })
+            }
+
+            const account = getAccountSync(accountId)
+            if (account === null) {
+                return reply.status(404).send({ error: "Account not found" })
+            }
+
+            // A password reset must not rename an account by omission: the login
+            // name only moves when the caller explicitly sends one.
+            let nextUsername: string | null = null
+            if (body.username !== undefined && body.username !== null) {
+                const wanted = typeof body.username === "string" ? body.username.trim() : ""
+                if (!isValidUsername(wanted)) {
+                    return reply.status(400).send({ error: SP_AUTH_ERROR_MESSAGES.USERNAME_INVALID })
+                }
+                if (wanted !== account.username) {
+                    const owner = resolveAccountByLoginNameSync(wanted)
+                    if (owner !== null && owner.id !== accountId) {
+                        return reply.status(409).send({ error: SP_AUTH_ERROR_MESSAGES.USERNAME_TAKEN })
+                    }
+                    nextUsername = wanted
+                }
+            }
+
+            const patch: Parameters<typeof updateAccountSync>[0] = {
+                id: accountId,
+                passwordHash: hashPassword(body.password),
+            }
+            if (nextUsername !== null) patch.username = nextUsername
+            updateAccountSync(patch)
+
+            const updated = getAccountSync(accountId)
+            return reply.status(200).send({
+                ok: true,
+                data: {
+                    id: accountId,
+                    username: updated?.username ?? null,
+                    hasPassword: typeof updated?.passwordHash === "string" && updated.passwordHash.length > 0,
+                },
+            })
+        },
+    )
 
     fastify.get("/accountCleanup", async (_request: FastifyRequest, reply: FastifyReply) => {
         return reply.send({

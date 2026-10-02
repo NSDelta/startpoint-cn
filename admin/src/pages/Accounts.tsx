@@ -1,6 +1,6 @@
 import { useState } from "react"
-import { Alert, Card, Table, Button, Space, Popconfirm, Input, message, Tag, Grid } from "antd"
-import { PlusOutlined, CopyOutlined, DeleteOutlined, SwapOutlined, EditOutlined, LeftOutlined } from "@ant-design/icons"
+import { Alert, Card, Table, Button, Space, Popconfirm, Input, message, Tag, Grid, Form, Modal } from "antd"
+import { PlusOutlined, CopyOutlined, DeleteOutlined, SwapOutlined, EditOutlined, LeftOutlined, KeyOutlined } from "@ant-design/icons"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 import { apiGet, apiPost } from "../api/client"
@@ -9,6 +9,23 @@ import { AccountsMobileView } from "./accounts/AccountsMobileView"
 import type { AccountRow, PlayerBrief } from "./accounts/types"
 
 const { useBreakpoint } = Grid
+
+/**
+ * Login name and password rules, copied from the server's single source of truth
+ * (`src/lib/sp-auth/contract.ts`, `isValidUsername` / `isStrongPassword`). The
+ * server re-checks both and rejects with the identical wording; this copy only
+ * exists so the owner sees the problem before the round trip.
+ */
+const USERNAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{3,19}$/
+const USERNAME_MESSAGE = "登录名格式不合法（4-20 位字母/数字/下划线，且不能以数字开头）。"
+const PASSWORD_PATTERN = /^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])[!-~]{8,64}$/
+const PASSWORD_MESSAGE = "密码强度不足（8-64 位，字母/数字/符号都行，但不能有空格或中文，且需同时含大写字母、小写字母和数字）。"
+
+interface PasswordForm {
+    username?: string
+    password: string
+    confirmPassword: string
+}
 
 export default function Accounts() {
     const qc = useQueryClient()
@@ -20,11 +37,18 @@ export default function Accounts() {
     const [renameName, setRenameName] = useState("")
     const [renameDeviceId, setRenameDeviceId] = useState<number | null>(null)
     const [renameDeviceName, setRenameDeviceName] = useState("")
+    const [passwordAccountId, setPasswordAccountId] = useState<number | null>(null)
+    const [passwordForm] = Form.useForm<PasswordForm>()
 
     const { data: accounts = [], isLoading } = useQuery({
         queryKey: ["accounts"],
         queryFn: () => apiGet<AccountRow[]>("/api/server/accounts"),
     })
+
+    const passwordAccount = accounts.find(a => a.id === passwordAccountId)
+    const openPassword = (account: AccountRow) => {
+        setPasswordAccountId(account.id)
+    }
 
     const selectedAccount = accounts.find(a => a.id === selectedAccountId)
     const savePlayers = selectedAccount?.players ?? []
@@ -85,6 +109,23 @@ export default function Accounts() {
         onSuccess: ({ name }) => {
             message.success(name === null ? "设备名称已清除" : "设备名称已更新")
             setRenameDeviceId(null)
+            refresh()
+        },
+        onError: showMutationError,
+    })
+
+    // The login name travels only when the owner actually typed one; sending an
+    // empty string would be read by the server as an invalid rename attempt.
+    const setPassword = useMutation({
+        mutationFn: ({ accountId, password, username }: { accountId: number; password: string; username: string }) =>
+            apiPost<{ ok: boolean; data: { id: number; username: string | null; hasPassword: boolean } }>(
+                `/api/server/accounts/${accountId}/password`,
+                username === "" ? { password } : { password, username },
+            ),
+        onSuccess: (_result, { accountId }) => {
+            message.success(`账号 ${accountId} 的密码已更新`)
+            setPasswordAccountId(null)
+            passwordForm.resetFields()
             refresh()
         },
         onError: showMutationError,
@@ -154,11 +195,21 @@ export default function Accounts() {
             ),
         },
         {
-            title: "操作", width: 250,
+            title: "登录名", width: 190,
+            render: (_: unknown, row: AccountRow) => row.username ? (
+                <Space size={4}>
+                    <Tag color="blue">{row.username}</Tag>
+                    <Tag color={row.hasPassword ? "green" : "orange"}>{row.hasPassword ? "有密码" : "无密码"}</Tag>
+                </Space>
+            ) : <Tag>未设置</Tag>,
+        },
+        {
+            title: "操作", width: 320,
             render: (_: unknown, row: AccountRow) => (
                 <div className="admin-action-row">
                     <Button size="small" type="primary" onClick={() => setSelectedAccountId(row.id)}>管理存档</Button>
                     <Button size="small" icon={<PlusOutlined />} onClick={() => newSave.mutate(row.id)}>新建存档</Button>
+                    <Button size="small" icon={<KeyOutlined />} onClick={() => openPassword(row)}>改密码</Button>
                     <Popconfirm title={`删除账号 ${row.id} 及所有存档？`} onConfirm={() => deleteAccount.mutate(row.id)} okText="确认" cancelText="取消" okButtonProps={{ danger: true }}>
                         <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
                     </Popconfirm>
@@ -258,6 +309,7 @@ export default function Accounts() {
                         onDeleteSave={playerId => deleteSave.mutateAsync(playerId)}
                         onRenameSave={(playerId, name) => renameSave.mutateAsync({ playerId, name })}
                         onRenameDevice={(deviceId, name) => renameDevice.mutateAsync({ deviceId, name })}
+                        onChangePassword={accountId => setPasswordAccountId(accountId)}
                     />
                 </Card>
             ) : selectedAccount ? (
@@ -298,6 +350,85 @@ export default function Accounts() {
             )}
 
         </Space>
+
+        <Modal
+            title={passwordAccount ? `账号 ${passwordAccount.id} 改密码` : "改密码"}
+            open={passwordAccountId !== null}
+            okText="保存"
+            cancelText="取消"
+            confirmLoading={setPassword.isPending}
+            onCancel={() => setPasswordAccountId(null)}
+            onOk={() => {
+                void passwordForm.validateFields()
+                    .then(values => setPassword.mutate({
+                        accountId: passwordAccountId as number,
+                        password: values.password,
+                        username: values.username?.trim() ?? "",
+                    }))
+                    .catch(() => undefined)
+            }}
+        >
+            <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="新密码用于客户端「账号登录」"
+                description="规则与游戏内注册一致：8-64 位，需同时包含大写字母、小写字母和数字，可用符号但不能有空格。账号还需在「账号绑定」页完成 QQ / KOOK 绑定并处于已激活状态，否则登录会停在待绑定。"
+            />
+            <Form<PasswordForm>
+                form={passwordForm}
+                layout="vertical"
+                key={passwordAccountId ?? "password-none"}
+                initialValues={{ username: passwordAccount?.username ?? "", password: "", confirmPassword: "" }}
+            >
+                <Form.Item
+                    name="username"
+                    label="登录名"
+                    rules={[
+                        { required: !passwordAccount?.username, message: "该账号还没有登录名，请一并设置" },
+                        {
+                            validator: (_rule, value) => {
+                                const text = typeof value === "string" ? value.trim() : ""
+                                if (text === "") return Promise.resolve()
+                                return USERNAME_PATTERN.test(text)
+                                    ? Promise.resolve()
+                                    : Promise.reject(new Error(USERNAME_MESSAGE))
+                            },
+                        },
+                    ]}
+                >
+                    <Input
+                        maxLength={20}
+                        placeholder={passwordAccount?.username ? "留空表示不修改" : "该账号还没有登录名，请设置一个"}
+                    />
+                </Form.Item>
+                <Form.Item
+                    name="password"
+                    label="新密码"
+                    rules={[
+                        { required: true, message: "请输入新密码" },
+                        { pattern: PASSWORD_PATTERN, message: PASSWORD_MESSAGE },
+                    ]}
+                >
+                    <Input.Password maxLength={64} autoComplete="new-password" placeholder="8-64 位，含大写、小写字母和数字，可用符号" />
+                </Form.Item>
+                <Form.Item
+                    name="confirmPassword"
+                    label="确认新密码"
+                    dependencies={["password"]}
+                    rules={[
+                        { required: true, message: "请再次输入新密码" },
+                        ({ getFieldValue }) => ({
+                            validator: (_rule, value) => (!value || value === getFieldValue("password")
+                                ? Promise.resolve()
+                                : Promise.reject(new Error("两次输入的密码不一致"))),
+                        }),
+                    ]}
+                >
+                    <Input.Password maxLength={64} autoComplete="new-password" placeholder="再次输入新密码" />
+                </Form.Item>
+            </Form>
+        </Modal>
         </AdminPage>
     )
 }
