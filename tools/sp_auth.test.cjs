@@ -437,7 +437,9 @@ test("契约 C1：用户名非法 → USERNAME_INVALID，且不建账号", async
 
 test("契约 C1：弱密码 → PASSWORD_WEAK，且不建账号", async () => {
     const before = getDb().prepare("SELECT COUNT(*) AS total FROM accounts").get().total
-    for (const weak of ["short1A", "alllowercase1", "ALLUPPERCASE1", "NoDigitsHere", "带符号 Passw0rd"]) {
+    // v5.6 口径：四类（小写/大写/数字/符号）里至少两类 + 8-64 位可打印 ASCII。
+    // 这张表换成新口径下**真正**的弱密码：太短、只有一类、含空格、含中文。
+    for (const weak of ["short1A", "12345678", "abcdefgh", "ABCDEFGH", "!!!!!!!!", "qq 123456", "带符号 Passw0rd"]) {
         const { body } = await post("/register", {
             username: username("weak"),
             password: weak,
@@ -464,6 +466,19 @@ test("契约 C1（v5.5）：符号密码可用 —— 可打印 ASCII 放开，�
         })
         failBody(body, "PASSWORD_WEAK")
     }
+})
+
+test("契约 C1（v5.6）：四类里两类即可 —— 纯小写+数字能注册（业主真机 17 次被拒的场景）", async () => {
+    // 业主 m06468 的 SpLogin(5).log：08:51:34–08:52:55 连发 17 次注册全被 PASSWORD_WEAK 挡回，
+    // 因为他用的是 `qq123456!` 这类「小写+数字+符号」密码，旧口径非要三类里含大写。
+    const { data } = await registerDevice("qq123456!")   // lower + digit + symbol
+    assert.equal(typeof data.token, "string", "小写+数字+符号 应能注册")
+
+    const { data: plain } = await registerDevice("qq12345678")   // lower + digit
+    assert.equal(typeof plain.token, "string", "小写+数字 也应能注册")
+
+    const { data: upper } = await registerDevice("QQ12345678")   // upper + digit
+    assert.equal(typeof upper.token, "string", "大写+数字 也应能注册")
 })
 
 test("密码只存哈希：明文绝不落库，注册响应也不回传哈希", async () => {

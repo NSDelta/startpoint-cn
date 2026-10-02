@@ -18,8 +18,19 @@ const { useBreakpoint } = Grid
  */
 const USERNAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{3,19}$/
 const USERNAME_MESSAGE = "登录名格式不合法（4-20 位字母/数字/下划线，且不能以数字开头）。"
-const PASSWORD_PATTERN = /^(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])[!-~]{8,64}$/
-const PASSWORD_MESSAGE = "密码强度不足（8-64 位，字母/数字/符号都行，但不能有空格或中文，且需同时含大写字母、小写字母和数字）。"
+/**
+ * v5.6（业主 m06468）：四类字符里至少两类 —— 旧口径强制「大写+小写+数字」三类齐备，
+ * 玩家 17 次注册全被 PASSWORD_WEAK 挡回。服务端 `isStrongPassword` 已同步放宽。
+ */
+const PASSWORD_PATTERN = /^[!-~]{8,64}$/
+const PASSWORD_CLASSES = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/]
+const PASSWORD_MIN_CLASSES = 2
+const PASSWORD_MESSAGE = "密码强度不足（8-64 位，字母/数字/符号都行，不能有空格或中文；大写、小写、数字、符号四类里至少要有两类）。"
+
+function passwordIsStrong(value: string): boolean {
+    if (!PASSWORD_PATTERN.test(value)) return false
+    return PASSWORD_CLASSES.filter(re => re.test(value)).length >= PASSWORD_MIN_CLASSES
+}
 
 interface PasswordForm {
     username?: string
@@ -373,7 +384,7 @@ export default function Accounts() {
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="新密码用于客户端「账号登录」"
-                description="规则与游戏内注册一致：8-64 位，需同时包含大写字母、小写字母和数字，可用符号但不能有空格。账号还需在「账号绑定」页完成 QQ / KOOK 绑定并处于已激活状态，否则登录会停在待绑定。"
+                description="规则与游戏内注册一致：8-64 位可打印字符（字母/数字/符号都行，不能有空格或中文），大写、小写、数字、符号四类里至少两类。账号还需在「账号绑定」页完成 QQ / KOOK 绑定并处于已激活状态，否则登录会停在待绑定。"
             />
             <Form<PasswordForm>
                 form={passwordForm}
@@ -407,10 +418,16 @@ export default function Accounts() {
                     label="新密码"
                     rules={[
                         { required: true, message: "请输入新密码" },
-                        { pattern: PASSWORD_PATTERN, message: PASSWORD_MESSAGE },
+                        {
+                            validator: (_rule, value: string) => (
+                                !value || passwordIsStrong(value)
+                                    ? Promise.resolve()
+                                    : Promise.reject(new Error(PASSWORD_MESSAGE))
+                            ),
+                        },
                     ]}
                 >
-                    <Input.Password maxLength={64} autoComplete="new-password" placeholder="8-64 位，含大写、小写字母和数字，可用符号" />
+                    <Input.Password maxLength={64} autoComplete="new-password" placeholder="8-64 位，字母/数字/符号都行，四类里至少两类" />
                 </Form.Item>
                 <Form.Item
                     name="confirmPassword"
