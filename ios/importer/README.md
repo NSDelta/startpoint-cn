@@ -80,6 +80,20 @@
   因为 release 资产对公开仓库**匿名可取**，而 artifact 下载必须带 token。稳定直链：
   `https://github.com/NSDelta/startpoint-cn/releases/download/cdn-importer-latest/CdnImporter.dylib`
   （同目录还挂着 `clang.log` 与 `inject-report.json`）。
+- **兜底通道（不依赖 release 写权限）**：同一次构建还会用同一个 token 把产物提交到一次性分支
+  `cdn-artifacts/<run_id>`，`raw` 直链无需任何凭据即可下载，且 `run_id` 保证不会命中 CDN 缓存：
+  ```
+  https://raw.githubusercontent.com/NSDelta/startpoint-cn/cdn-artifacts/<run_id>/CdnImporter.dylib
+  # 同分支：clang.log / inject-report.json / meta.txt（含 dylib 字节数与 sha256）
+  ```
+  该分支与 `ci-diag/*` 一样滚动清理（新的一次构建会删掉旧的），所以**取到就本地保存**。
+  命令行取回（不需要 token、不需要 SSH 私钥）：
+  ```bash
+  curl -fLO https://raw.githubusercontent.com/NSDelta/startpoint-cn/cdn-artifacts/<run_id>/CdnImporter.dylib
+  shasum -a 256 CdnImporter.dylib   # 与 meta.txt 里的 dylib_sha256 对照
+  ```
+  注：**SSH 密钥不能用来下载 artifact/release**——SSH 只对 `git` 传输生效，artifact 与 release 走 HTTPS
+  API（artifact 必须带 token；release 与 `raw` 分支匿名可取）。
 - 派发时可传 `patch_base`（写进 `info.json` 的 `baseUrl`；默认是 hygiene 占位地址 `http://192.168.1.10:8001/patch/cn/`，
   真实局域网地址只在派发参数里传，不要写进仓库文件）。
 
