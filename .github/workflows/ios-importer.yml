@@ -258,22 +258,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          set -uo pipefail
           DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
           if [ ! -f "$DYLIB" ]; then
             echo "没有产物（编译未通过），跳过发布"
             exit 0
           fi
           TAG="cdn-importer-latest"
-          files=("$DYLIB")
-          if [ -f "$RUNNER_TEMP/clang.log" ]; then
-            cp "$RUNNER_TEMP/clang.log" "$RUNNER_TEMP/out/clang.log"
-            files+=("$RUNNER_TEMP/out/clang.log")
-          fi
-          if [ -f "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" ]; then
-            cp "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" "$RUNNER_TEMP/out/inject-report.json"
-            files+=("$RUNNER_TEMP/out/inject-report.json")
-          fi
           SHA="$(shasum -a 256 "$DYLIB" | awk '{print $1}')"
           SIZE="$(stat -f "%z" "$DYLIB")"
           NOTES="CI 自动发布的注入用 dylib（滚动标签，每次 build 覆盖）。
@@ -284,68 +274,24 @@ jobs:
           - sha256：\`${SHA}\`
           - 部署：先 \`client-patch/build/patch-ipa.mjs\` 改服务器地址，再 \`ios/importer/tools/inject-dylib.mjs\` 注入，最后 Sideloadly 重签侧载（见 \`ios/importer/README.md\`）。"
           echo "::notice title=release-env::gh=$(gh --version 2>&1 | head -1)；GH_TOKEN=${GH_TOKEN:+已注入}；repo=$GITHUB_REPOSITORY"
-          # 探针：token 到底能不能写（403 = 仓库 Actions 权限被设成只读）
-          probe_code="$(curl -sS -o "$RUNNER_TEMP/probe.json" -w '%{http_code}' \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY")"
-          write_code="$(curl -sS -o "$RUNNER_TEMP/probe-write.json" -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases" \
-            -d '{"tag_name":"cdn-importer-probe-delete-me","draft":true,"name":"probe"}')"
-          echo "::notice title=release-probe::读 repo HTTP $probe_code；建草稿 release HTTP $write_code；$(tr '\n' ' ' < "$RUNNER_TEMP/probe-write.json" | cut -c1-200)"
-          probe_id="$(sed -n 's/.*"id": *\([0-9][0-9]*\).*/\1/p' "$RUNNER_TEMP/probe-write.json" | head -1)"
-          if [ -n "$probe_id" ]; then
-            curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$probe_id" >/dev/null 2>&1
-            curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/tags/cdn-importer-probe-delete-me" >/dev/null 2>&1
-            echo "::notice title=release-probe::探针 release 已删除（写权限可用）"
-          fi
+          # 清掉早期写权限探针留下的草稿 release（id 402292023，若还存在）
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/402292023" >/dev/null 2>&1
           publish_log="$RUNNER_TEMP/release.log"
           : > "$publish_log"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${files[@]}" --clobber >>"$publish_log" 2>&1
-            up=$?
+            gh release upload "$TAG" "$DYLIB" --clobber >>"$publish_log" 2>&1
+            published=$?
             gh release edit "$TAG" --notes "$NOTES" >>"$publish_log" 2>&1
-            published=$((up + $?))
           else
-            gh release create "$TAG" "${files[@]}" \
+            gh release create "$TAG" "$DYLIB" \
               --title "CDN 导入器 dylib（滚动发布）" --notes "$NOTES" --target "$GITHUB_SHA" >>"$publish_log" 2>&1
             published=$?
           fi
-          if [ "$published" != "0" ]; then
-            echo "::warning title=release-gh-failed::gh 退出码 $published；输出：$(tr '\n' ' ' < "$publish_log" | cut -c1-600)"
-          fi
           if [ "$published" = "0" ]; then
             echo "::notice title=release::https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/CdnImporter.dylib （匿名可下载，sha256 ${SHA}）"
-            exit 0
+          else
+            echo "::warning title=release-gh-failed::gh 退出码 ${published}；输出：$(tr '\n' ' ' < "$publish_log" | cut -c1-600)"
           fi
-
-          # gh 失败（token 权限/gh 行为差异等）⇒ 退回 REST API，用一次性标签（不需要覆盖逻辑）
-          FALLBACK_TAG="cdn-importer-run-${{ github.run_id }}"
-          echo "::notice title=release-rest-fallback::改走 REST 回退，标签 $FALLBACK_TAG"
-          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
-          curl -sS -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$api/releases" \
-            -d "{\"tag_name\":\"$FALLBACK_TAG\",\"target_commitish\":\"$GITHUB_SHA\",\"name\":\"CDN 导入器 dylib（run ${{ github.run_id }}）\",\"body\":\"sha256 ${SHA}\"}" \
-            > "$RUNNER_TEMP/release-rest.json" 2>>"$publish_log"
-          rel_id="$(sed -n 's/.*"id": *\([0-9][0-9]*\).*/\1/p' "$RUNNER_TEMP/release-rest.json" | head -1)"
-          if [ -z "$rel_id" ]; then
-            echo "::error title=release-failed::REST 建 release 也失败：$(tr '\n' ' ' < "$RUNNER_TEMP/release-rest.json" | cut -c1-300)"
-            exit 0
-          fi
-          for f in "${files[@]}"; do
-            curl -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@$f" \
-              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$rel_id/assets?name=$(basename "$f")" \
-              >> "$publish_log" 2>&1
-          done
-          echo "::notice title=release::https://github.com/$GITHUB_REPOSITORY/releases/download/$FALLBACK_TAG/CdnImporter.dylib （sha256 ${SHA}）"
           exit 0
 
       # 兜底通道（不依赖 release 写权限）：产物 + 发布诊断一起提交到一次性分支，raw 直链匿名可取。
