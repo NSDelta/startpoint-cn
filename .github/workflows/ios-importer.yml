@@ -281,11 +281,46 @@ jobs:
           - 大小：${SIZE} 字节
           - sha256：\`${SHA}\`
           - 部署：先 \`client-patch/build/patch-ipa.mjs\` 改服务器地址，再 \`ios/importer/tools/inject-dylib.mjs\` 注入，最后 Sideloadly 重签侧载（见 \`ios/importer/README.md\`）。"
+          echo "::notice title=release-env::gh=$(gh --version 2>&1 | head -1)；GH_TOKEN=${GH_TOKEN:+已注入}；repo=$GITHUB_REPOSITORY"
+          publish_log="$RUNNER_TEMP/release.log"
+          : > "$publish_log"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${files[@]}" --clobber
-            gh release edit "$TAG" --notes "$NOTES"
+            gh release upload "$TAG" "${files[@]}" --clobber >>"$publish_log" 2>&1
+            up=$?
+            gh release edit "$TAG" --notes "$NOTES" >>"$publish_log" 2>&1
+            published=$((up + $?))
           else
             gh release create "$TAG" "${files[@]}" \
-              --title "CDN 导入器 dylib（滚动发布）" --notes "$NOTES" --target "${{ github.sha }}"
+              --title "CDN 导入器 dylib（滚动发布）" --notes "$NOTES" --target "$GITHUB_SHA" >>"$publish_log" 2>&1
+            published=$?
           fi
-          echo "::notice title=release::https://github.com/${{ github.repository }}/releases/download/$TAG/CdnImporter.dylib （匿名可下载，sha256 ${SHA}）"
+          if [ "$published" = "0" ]; then
+            echo "::notice title=release::https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/CdnImporter.dylib （匿名可下载，sha256 ${SHA}）"
+            exit 0
+          fi
+
+          # gh 失败（fork 上 token 权限/gh 缺失等）⇒ 退回 REST API，用一次性标签（不需要覆盖逻辑）
+          echo "::warning title=release-gh-failed::gh 发布失败，改走 REST 回退：$(tr '\n' ' ' < "$publish_log" | cut -c1-300)"
+          FALLBACK_TAG="cdn-importer-run-${{ github.run_id }}"
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api/releases" \
+            -d "{\"tag_name\":\"$FALLBACK_TAG\",\"target_commitish\":\"$GITHUB_SHA\",\"name\":\"CDN 导入器 dylib（run ${{ github.run_id }}）\",\"body\":\"sha256 ${SHA}\"}" \
+            > "$RUNNER_TEMP/release-rest.json" 2>>"$publish_log"
+          rel_id="$(sed -n 's/.*"id": *\([0-9][0-9]*\).*/\1/p' "$RUNNER_TEMP/release-rest.json" | head -1)"
+          if [ -z "$rel_id" ]; then
+            echo "::error title=release-failed::REST 建 release 也失败：$(tr '\n' ' ' < "$RUNNER_TEMP/release-rest.json" | cut -c1-300)"
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            curl -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$rel_id/assets?name=$(basename "$f")" \
+              >> "$publish_log" 2>&1
+          done
+          echo "::notice title=release::https://github.com/$GITHUB_REPOSITORY/releases/download/$FALLBACK_TAG/CdnImporter.dylib （sha256 ${SHA}）"
+          exit 0
