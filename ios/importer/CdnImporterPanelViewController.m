@@ -90,6 +90,8 @@ static const NSUInteger kCdnPanelMaxLogLines = 400;
         @[@"开始导入", @"handleImport:"],
         @[@"取消", @"handleCancel:"],
         @[@"关闭", @"handleClose:"],
+        @[@"深度校验", @"handleToggleDeepVerify:"],
+        @[@"导出日志", @"handleExportLog:"],
     ];
     for (NSArray *spec in specs) {
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -106,6 +108,7 @@ static const NSUInteger kCdnPanelMaxLogLines = 400;
     }
     // 「开始导入」用醒目色
     self.actionButtons[3].backgroundColor = [UIColor colorWithRed:0.15 green:0.47 blue:0.85 alpha:1.0];
+    [self updateDeepVerifyButton];
 
     [self appendLog:[NSString stringWithFormat:@"导入计划：%@ → %@，%lu 个归档，压缩态 %@",
                      [CdnImportPlan sharedPlan].baselineVersion,
@@ -143,7 +146,7 @@ static const NSUInteger kCdnPanelMaxLogLines = 400;
                                                      y + row * (buttonHeight + gap),
                                                      columnWidth, buttonHeight);
     }
-    y += 3 * (buttonHeight + gap) + 2.0;
+    y += ((self.actionButtons.count + 1) / 2) * (buttonHeight + gap) + 2.0;
 
     self.logView.frame = CGRectMake(pad, y, contentWidth, MAX(60.0, height - y - pad));
 }
@@ -223,6 +226,7 @@ static const NSUInteger kCdnPanelMaxLogLines = 400;
         if ((index == 2 || index == 3) && self.inputURLs.count == 0 && !self.busy) {
             enabled = NO;
         }
+        if (index == 7) enabled = YES;   // 「导出日志」任何时刻可用（导入中也能抓日志）
         self.actionButtons[index].enabled = enabled;
         self.actionButtons[index].alpha = enabled ? 1.0 : 0.45;
     }
@@ -314,6 +318,45 @@ static const NSUInteger kCdnPanelMaxLogLines = 400;
 
 - (void)handleClose:(UIButton *)sender {
     if (self.closeHandler != nil) self.closeHandler();
+}
+
+#pragma mark - 开关与日志导出
+
+- (void)updateDeepVerifyButton {
+    if (self.actionButtons.count < 8) return;
+    BOOL on = CdnImporterDeepVerifyEnabled();
+    [self.actionButtons[6] setTitle:(on ? @"深度校验(开)" : @"深度校验(关)") forState:UIControlStateNormal];
+    self.actionButtons[6].backgroundColor = on
+        ? [UIColor colorWithRed:0.55 green:0.33 blue:0.10 alpha:1.0]
+        : [UIColor colorWithWhite:0.30 alpha:1.0];
+}
+
+- (void)handleToggleDeepVerify:(UIButton *)sender {
+    if (self.busy) {
+        [self appendLog:@"导入进行中，深度校验开关在下次导入生效"];
+    }
+    BOOL now = !CdnImporterDeepVerifyEnabled();
+    [[NSUserDefaults standardUserDefaults] setBool:now forKey:CdnImporterDeepVerifyKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self updateDeepVerifyButton];
+    [self appendLog:[NSString stringWithFormat:@"深度校验（逐包整包 sha256）已%@%@",
+                     now ? @"开启" : @"关闭",
+                     now ? @"：每个归档会完整读两遍，导入时间约翻倍" : @""]];
+}
+
+- (void)handleExportLog:(UIButton *)sender {
+    NSString *path = CdnImporterLogPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self appendLog:[NSString stringWithFormat:@"日志文件还不存在：%@", path]];
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                                                          applicationActivities:nil];
+    activity.popoverPresentationController.sourceView = sender;
+    activity.popoverPresentationController.sourceRect = sender.bounds;
+    [self appendLog:[NSString stringWithFormat:@"导出日志：%@", path]];
+    [self presentViewController:activity animated:YES completion:nil];
 }
 
 - (void)runWithDryRun:(BOOL)dryRun {

@@ -87,7 +87,7 @@ jobs:
             "-DCDN_IMPORT_PATCH_BASE=$DEF_PATCH_BASE" \
             -install_name @executable_path/Frameworks/CdnImporter.dylib \
             ios/importer/*.m \
-            -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -lz \
+            -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -framework CoreGraphics -lz \
             -o "$RUNNER_TEMP/out/CdnImporter.dylib" 2>&1 | tee "$RUNNER_TEMP/clang.log"
 
       - name: 产物取证（file/lipo/otool/符号表）
@@ -164,7 +164,7 @@ jobs:
 
           # ② 错误摘录：按类别抓关键行 + 上下文（±6 行）
           #    注意：grep 无匹配会返回 1，必须 || true；循环体里也不能用 `[ … ] && …` 收尾（-e 下会中止步骤）。
-          grep -nE 'error:|fatal error|no member named|no visible @interface|use of undeclared identifier|cannot find interface|expected .* before' "$log" \
+          grep -nE 'error:|fatal error|no member named|no visible @interface|use of undeclared identifier|cannot find interface|expected .* before|Undefined symbols|ld: |linker command failed|library not found' "$log" \
             | head -20 > "$RUNNER_TEMP/errors.txt" || true
           idx=0
           while IFS= read -r hit; do

@@ -103,6 +103,8 @@ node ios/importer/tools/inject-dylib.mjs --ipa step1.ipa --dylib CdnImporter.dyl
 2. 进游戏（导入器随进程加载，屏幕边缘会出现一个蓝色悬浮球「CDN」；拖动可换位置，位置记在 `NSUserDefaults`）。
 3. 点球打开面板 → **选文件夹**（推荐，一次授权整棵子树）或**选文件**（可多选）。
 4. 点**预检**：只做索引与匹配，不动任何文件；会列出「识别到的归档数 / 缺失清单 / 目标目录现状 / 可用空间」。
+   面板另有 **深度校验(开/关)**（切到「开」后每个归档会整包比一遍 sha256，导入时间约翻倍，见第 6 节）
+   与 **导出日志**（弹分享面板，可 AirDrop / 存到文件 App，见第 7 节）两个按钮。
 5. 确认无误后点**开始导入**并保持游戏在前台（面板会自动禁用息屏）。进度条显示归档进度、已写文件数、
    压缩态已读字节与预估剩余时间；导入期间可**取消**（取消保留 partial 标记，游戏下次会自己走下载流）。
 6. 完成后面板显示终态统计。若显示 `137820 个文件 / 10191161030 字节` 即与权威终态完全一致；
@@ -143,7 +145,8 @@ node ios/importer/tools/inject-dylib.mjs --ipa step1.ipa --dylib CdnImporter.dyl
 
 - 日志文件：`<容器>/Library/Application Support/CdnImporter/CdnImporter.log`（同一份内容也走 `NSLog`，
   可用 `idevicesyslog` 或 Xcode 看）。超过 4MB 轮转为 `.log.1`。
-- 面板右侧就是实时日志，可**导出日志**（存到 `CdnImporter/` 目录）后从文件 App 取回。
+- 面板右侧就是实时日志，可点**导出日志**（弹系统分享面板：AirDrop 到 Mac、或存进「文件」App）取回
+  `<容器>/Library/Application Support/CdnImporter/CdnImporter.log`。
 - 常见问题：
   - 「没识别到任何归档」：确认选的是**文件夹**（不要选到只有外层压缩包的父目录）或直接多选 zip/tar 文件；
     若归档被重命名过，看日志里是否有「按字节数认领」记录。
@@ -188,7 +191,7 @@ node tools/test-workflow/run.cjs --group quick:ios-importer
 | `CdnArchiveIndex.{h,m}` | 把用户选择的输入识别成「计划基名 → 归档句柄」（散装 zip / tar 成员 / 整包 zip 成员） |
 | `CdnImportEngine.{h,m}` | 四阶段导入：索引 → 缺包检查 → 按计划顺序解压 → 写 `info.json` + 清 partial |
 | `CdnImporterOverlay.{h,m}` | 穿透式覆盖窗口 + 可拖动悬浮球 + 保活看门狗 |
-| `CdnImporterPanelViewController.{h,m}` | 面板 UI：选文件夹/选文件/预检/开始/取消/导出日志/关闭 |
+| `CdnImporterPanelViewController.{h,m}` | 面板 UI：选文件夹/选文件/预检/开始/取消/关闭/深度校验开关/导出日志 |
 | `CdnImporterEntry.m` | `__attribute__((constructor))` 入口（非越狱线没有 MobileSubstrate 的 `%ctor`） |
 | `tools/verify-plan.mjs` + `tools/plan-lib.mjs` | 计划推导/核对/生成（Node，跨平台） |
 | `tools/inject-dylib.mjs` | 非越狱注入器（LC_LOAD_DYLIB + dylib 入 bundle，16 条断言） |
