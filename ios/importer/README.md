@@ -73,7 +73,9 @@
 - `test` 作业：ObjC 静态自检 + `quick:ios-importer` 测试组（计划一致性、注入器断言、lint 自身）。
 - `build` 作业：用 iPhoneOS SDK 编译 `CdnImporter.dylib` → ad-hoc 签名 → 合成迷你 IPA 端到端冒烟注入 →
   产物上传 artifact（`CdnImporter-dylib` / `clang-log` / `injection-smoke`），同时把日志与产物推到
-  `ci-diag/<run_id>` 一次性分支，编译失败时把 clang 错误按 `::error` 注解贴到运行页。
+  `ci-diag/<run_id>` 一次性分支（只保留最近一条，新的一条推送时会自动删掉旧的），编译失败时把 clang
+  错误按 `::error` 注解贴到运行页；成功时也会 emit `::notice`：`dylib-evidence`（架构/字节数/sha256）
+  与 `inject-smoke`（注入断言条数）。**从运行页下载 `CdnImporter-dylib` artifact 即得可侧载的 dylib**。
 - 派发时可传 `patch_base`（写进 `info.json` 的 `baseUrl`；默认是 hygiene 占位地址 `http://192.168.1.10:8001/patch/cn/`，
   真实局域网地址只在派发参数里传，不要写进仓库文件）。
 
@@ -85,7 +87,7 @@ xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
   -isysroot "$SDK" -miphoneos-version-min=14.0 -fobjc-arc -O2 -Wall \
   -install_name @executable_path/Frameworks/CdnImporter.dylib \
   ios/importer/*.m \
-  -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -lz \
+  -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -framework CoreGraphics -lz \
   -o CdnImporter.dylib
 codesign --force --sign - CdnImporter.dylib
 ```
