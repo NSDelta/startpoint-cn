@@ -64,6 +64,8 @@ static double score_at(const am_gray *roi, const am_gray *tpl, int x, int y)
 
 int main(int argc, char **argv)
 {
+    /* 无缓冲：崩溃时未刷新的 stdout 会把已经跑过的用例全吞掉（test_engine 上真踩过）。 */
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) { fprintf(stderr, "usage: test_matcher <golden_dir>\n"); return 2; }
     const char *dir = argv[1];
     char path[1024];

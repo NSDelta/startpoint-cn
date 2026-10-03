@@ -1,0 +1,379 @@
+# ios-autoclick.yml —— 构建两个交付物：越狱 deb + 非越狱 dylib（自动点击）
+#
+# 为什么必须在这里编译：开发机是 Windows，没有 clang/Xcode/Theos，也没有 WSL。
+# 本工作流同时承担**iOS 平台层唯一的编译验证**（ios/auto/ios/*.m 在本机从未编过）
+# 与 **core 的交叉编译器验证**（同一份 C99 在 clang 下再跑一遍 371 个用例）。
+#
+# ── 三条诊断通道（都不需要仓库凭据即可读回）──────────────────────────────
+#   ① refs/heads/ci-diag/<run_id>/<leg>   完整构建日志 + meta.txt
+#   ② refs/heads/ci-out/<run_id>/<leg>    产物本身（.deb / .dylib）
+#   ③ check-run annotations（::notice 分块 + ::error 分类）——纯匿名 HTTP 可读
+# 通道 ①/② 的写法与坑来自 .github/workflows/ios-tweak.yml 的真实运行教训，
+# 直接沿用，不要"顺手改好"：
+#   · 推送 URL 必须用 ${{ secrets.GITHUB_TOKEN }}（$GITHUB_TOKEN 不是 Actions 的
+#     默认环境变量，在 set -u 下展开未定义变量会让 bash 立刻退出）；
+#   · 诊断步骤一律显式 exit 0，绝不能让取证本身改变 job 结论；
+#   · 逐文件 git add -f（目录级 add 遇到被忽略的路径会整体失败）。
+
+name: ios-autoclick
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/auto/**"
+      - ".github/workflows/ios-autoclick.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.pkg }} (${{ matrix.scheme || 'rootful' }})
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [tweak, dylib]
+        # rootless = Dopamine / 无根越狱（目标机 iPhone 7 Plus / iOS 15.8.3 走这个）
+        scheme: ["rootless", ""]
+    env:
+      PKG: ${{ matrix.pkg }}
+      SCHEME: ${{ matrix.scheme }}
+      LEG: ${{ matrix.pkg }}-${{ matrix.scheme || 'rootful' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 环境信息（取证）
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version || true
+          uname -m
+          clang --version
+
+      - name: 安装 ldid / xz
+        run: |
+          set -euo pipefail
+          brew install ldid xz || true
+          which ldid || brew link --overwrite ldid || true
+          ldid -h >/dev/null || true
+
+      - name: 克隆 Theos
+        run: |
+          set -euo pipefail
+          export THEOS="$RUNNER_TEMP/theos"
+          ok=0
+          for i in 1 2 3 4 5; do
+            rm -rf "$THEOS"
+            if git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"; then ok=1; break; fi
+            echo "::warning::克隆 Theos 第 $i 次失败，退避 $((i * 10))s 后重试"
+            sleep $((i * 10))
+          done
+          [ "$ok" = "1" ] || { echo "::error::克隆 Theos 连续 5 次失败"; exit 1; }
+          test -f "$THEOS/makefiles/common.mk" || { echo "::error::Theos 克隆不完整"; exit 1; }
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "Theos HEAD: $(git -C "$THEOS" rev-parse HEAD)"
+
+      # ── core 的编译 + 回归（跨编译器验证）────────────────────────────────
+      # 这 371 个用例平时在 Windows/MSVC 上跑。clang 下再跑一遍能同时抓到两类问题：
+      #   · core 里 MSVC 容忍而 clang 不容忍的写法（隐式声明、窄化、变长数组…）
+      #   · golden 夹具在两套浮点/整型规则下是否给出同样的峰值
+      # 期望值来自本机 MSVC 实测：119/84/56/13/18/21/60。计数对不上就失败 ——
+      # 用例数变少同样意味着有东西没编进去。
+      - name: core 编译（clang，-Wall -Wextra）
+        run: |
+          set -euo pipefail
+          cd ios/auto
+          mkdir -p tests/build
+          INC="-Icore -Itests -Imatcher_golden -Imatcher_golden_neg -Imatcher_golden_pkg"
+          CORE="core/auto_script.c core/am_json.c core/am_container.c core/auto_match.c core/am_fft.c"
+          CF="-std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -D_CRT_SECURE_NO_WARNINGS"
+          : > "$RUNNER_TEMP/build.log"
+          for t in test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine; do
+            extra=""
+            [ "$t" = "test_engine" ] && extra="core/auto_engine.c"
+            echo "=== clang $t" | tee -a "$RUNNER_TEMP/build.log"
+            # shellcheck disable=SC2086
+            clang $CF $INC -o "tests/build/$t" "tests/$t.c" $CORE $extra 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+          done
+
+      - name: core 回归（371 例，计数硬校验）
+        run: |
+          set -euo pipefail
+          cd ios/auto
+          # 用例名 : 夹具目录参数 : 期望的 "N passed" 行
+          run() {  # $1=exe $2=dir $3=期望
+            local exe="$1" dir="$2" want="$3" out rc
+            out=$(./tests/build/"$exe" $dir 2>&1); rc=$?
+            echo "$out" | tail -3
+            if [ "$want" != "-" ]; then
+              echo "$out" | grep -q "$want" || { echo "::error::$exe 期望 '$want' 但没出现（rc=$rc）"; return 1; }
+            fi
+            [ "$rc" -eq 0 ] || { echo "::error::$exe 退出码 $rc"; return 1; }
+            return 0
+          }
+          run test_fft          ""                    "119 passed"
+          run test_json         "matcher_golden_pkg"  "84 passed"
+          run test_script       "matcher_golden_pkg/pkg" "56 passed"
+          run test_matcher      "matcher_golden"      "13 passed"
+          run test_matcher_neg  "matcher_golden_neg"  "18 passed"
+          run test_package      "matcher_golden_pkg"  "21 passed"
+          run test_engine       "matcher_golden_pkg/pkg" "60 passed"
+          echo "core 回归全部通过（371 例）"
+
+      # ── 交付物 ①/②：Theos 编译 ──────────────────────────────────────────
+      - name: 构建 ${{ matrix.pkg }}
+        working-directory: ios/auto/${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SCHEME" ]; then export THEOS_PACKAGE_SCHEME="$SCHEME"; fi
+          echo "=== pkg=$PKG scheme=${THEOS_PACKAGE_SCHEME:-<rootful>} THEOS=$THEOS"
+          set -o pipefail
+          make FINALPACKAGE=1 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      # dylib 工程的产物是裸 .dylib，没有 deb（它不装进系统，是被注入 app 包的）。
+      # tweak 工程才走打包 —— Theos 对 library 目标也能 package，但产物没意义。
+      - name: 打包 deb（仅 tweak）
+        if: matrix.pkg == 'tweak'
+        working-directory: ios/auto/tweak
+        run: |
+          set -euo pipefail
+          if [ -n "$SCHEME" ]; then export THEOS_PACKAGE_SCHEME="$SCHEME"; fi
+          set -o pipefail
+          make package FINALPACKAGE=1 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      # ── 结构断言：光"编过了"不够，要证明产物是对的东西 ──────────────────
+      # 这是本工作流真正的价值所在：把 deb/dylib 里那些**只有当链接或安装路径写错
+      # 时才会出现的症状**变成硬失败，而不是等到真机上才发现。
+      - name: 产物结构断言
+        working-directory: ios/auto/${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          echo "=== .theos/obj 树"
+          find .theos/obj -name '*.dylib' | sort
+          dylib=$(find .theos/obj -name '*.dylib' | head -1)
+          [ -n "$dylib" ] || { echo "::error::没有产出任何 .dylib"; exit 1; }
+          ls -l "$dylib"
+          file "$dylib"
+          echo "=== 架构必须是 arm64"
+          lipo -info "$dylib" | grep -q arm64 || { echo "::error::不是 arm64：$(lipo -info "$dylib")"; exit 1; }
+          echo "=== otool -L（确认链了什么）"
+          otool -L "$dylib"
+          if [ "$PKG" = "tweak" ]; then
+            # 越狱版：必须有 substrate 依赖，且**不能**链 substrate 本身
+            # （它是 Tweak.x 的 %hook 展开依赖，由宿主进程提供）。
+            echo "=== tweak：确认 Tweak.x 的 logos 展开真的进来了"
+            nm -u "$dylib" | grep -q '_MSHookMessageEx' \
+              || { echo "::error::tweak 里没有 _MSHookMessageEx —— %hook 没被展开，Tweak.x 可能没编进去"; exit 1; }
+          else
+            # 非越狱版：**绝不能**引用 substrate（App 进程里没有 libsubstrate/ellekit）。
+            if nm -u "$dylib" | grep -qE 'MSHookMessageEx|MSHookFunction|_MSGetImageByName'; then
+              echo "::error::dylib 引用了 substrate 符号 —— 在非越狱 App 里会 dyld 报错"
+              nm -u "$dylib" | grep -E 'MSHook|_MSGet' || true
+              exit 1
+            fi
+            echo "=== dylib：确认没有 %hook 展开（应为空）"
+            if grep -qE '%hook|%orig|MSHook' dylib.x; then
+              echo "::error::dylib.x 里出现 logos 宏 —— 非越狱侧不能用"
+              exit 1
+            fi
+          fi
+
+      - name: deb 结构断言（仅 tweak）
+        if: matrix.pkg == 'tweak'
+        working-directory: ios/auto/tweak
+        run: |
+          set -euo pipefail
+          deb=$(ls packages/*.deb | head -1)
+          [ -n "$deb" ] || { echo "::error::没有产出 .deb"; exit 1; }
+          echo "=== $deb"
+          dpkg-deb -I "$deb"
+          echo "=== 内容清单"
+          dpkg-deb -c "$deb"
+          # 过滤器 plist 必须和 dylib 同目录 —— 少了它 substrate 不知道往哪个进程注入。
+          lst=$(dpkg-deb -c "$deb")
+          echo "$lst" | grep -q 'AMAutoClick\.dylib' || { echo "::error::deb 里没有 AMAutoClick.dylib"; exit 1; }
+          echo "$lst" | grep -q 'AMAutoClick\.plist' || { echo "::error::deb 里没有过滤器 plist"; exit 1; }
+          if [ -n "$SCHEME" ]; then
+            echo "$lst" | grep -q '/var/jb/' \
+              || { echo "::error::rootless 构建的 deb 里没有 /var/jb/ 前缀"; exit 1; }
+            echo "rootless：安装路径已落在 /var/jb/"
+          fi
+          # 过滤器内容必须是目标 bundle id（写错就是"装上了但什么都不发生"）。
+          tmp=$(mktemp -d); dpkg-deb -x "$deb" "$tmp"
+          plist=$(find "$tmp" -name 'AMAutoClick.plist' | head -1)
+          echo "=== $plist"
+          cat "$plist"
+          grep -q 'com.leiting.wf' "$plist" || { echo "::error::过滤器里没有目标 bundle id"; exit 1; }
+
+      # ── 诊断通道 ①：完整日志 ─────────────────────────────────────────────
+      - name: 诊断日志（失败时也可无凭据取回）
+        if: always()
+        run: |
+          set -uo pipefail
+          DIAG_REF="ci-diag/${GITHUB_RUN_ID}/${LEG}"
+          DIAG_DIR="ci-diag/${GITHUB_RUN_ID}/${LEG}"
+          mkdir -p "$DIAG_DIR"
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "leg=${LEG}"
+            echo "pkg=${PKG}"
+            echo "scheme=${SCHEME:-rootful}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "theos=${THEOS:-<unset>}"
+            echo "build_log_bytes=$(wc -c < "$RUNNER_TEMP/build.log" 2>/dev/null || echo 0)"
+          } > "$DIAG_DIR/meta.txt"
+          cp "$RUNNER_TEMP/build.log" "$DIAG_DIR/build.log" 2>/dev/null \
+            || echo "build.log 不存在或为空（构建步骤可能从未开始）" > "$DIAG_DIR/build.log"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for f in "$DIAG_DIR/meta.txt" "$DIAG_DIR/build.log"; do
+            git add -f -- "$f" || echo "::warning::诊断文件无法加入索引：$f"
+          done
+          if ! git commit -q -m "ci-diag: ${LEG} run ${GITHUB_RUN_ID}"; then
+            echo "::warning::诊断提交失败（可能索引为空）"; git status --short | head -20; exit 0
+          fi
+          if git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+                "HEAD:refs/heads/${DIAG_REF}" 2>&1; then
+            echo "诊断日志已推送：refs/heads/${DIAG_REF}"
+          else
+            echo "::warning title=diag-push::诊断分支推送失败（fork 可能未授予 Actions 写权限）"
+          fi
+          exit 0
+
+      # ── 诊断通道 ②：产物出仓（无凭据可下载，真机验证靠它）───────────────
+      - name: 产物出仓
+        if: always()
+        working-directory: ios/auto/${{ matrix.pkg }}
+        run: |
+          set -uo pipefail
+          OUT_REF="ci-out/${GITHUB_RUN_ID}/${LEG}"
+          OUT_DIR="${GITHUB_WORKSPACE}/ci-out/${GITHUB_RUN_ID}/${LEG}"
+          mkdir -p "$OUT_DIR"
+          dylib=$(find .theos/obj -name '*.dylib' 2>/dev/null | head -1 || true)
+          deb=""
+          for f in packages/*.deb; do [ -f "$f" ] && deb="$f" && break; done
+          dylib_bytes=0; dylib_sha="(none)"
+          deb_bytes=0;   deb_sha="(none)"
+          if [ -n "$dylib" ]; then dylib_bytes=$(wc -c < "$dylib"); dylib_sha=$(shasum -a 256 "$dylib" | cut -d' ' -f1); fi
+          if [ -n "$deb" ];   then deb_bytes=$(wc -c < "$deb");     deb_sha=$(shasum -a 256 "$deb" | cut -d' ' -f1); fi
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "leg=${LEG}"
+            echo "head_sha=${GITHUB_SHA}"
+            echo "dylib=${dylib:-（没有产物）}"
+            echo "dylib_bytes=${dylib_bytes}"
+            echo "dylib_sha256=${dylib_sha}"
+            echo "deb=${deb:-（没有产物）}"
+            echo "deb_bytes=${deb_bytes}"
+            echo "deb_sha256=${deb_sha}"
+          } > "$OUT_DIR/meta.txt"
+          [ -n "$dylib" ] && cp "$dylib" "$OUT_DIR/AMAutoClick.dylib"
+          [ -n "$deb" ]   && cp "$deb"   "$OUT_DIR/"
+          printf '::notice title=ci-out(%s)::dylib=%s bytes sha=%s; deb=%s bytes sha=%s\n' \
+            "$LEG" "$dylib_bytes" "$dylib_sha" "$deb_bytes" "$deb_sha"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          staged=0
+          for f in "$OUT_DIR/meta.txt" "$OUT_DIR/AMAutoClick.dylib" "$OUT_DIR"/*.deb; do
+            [ -f "$f" ] || continue
+            if git add -f -- "$f"; then staged=$((staged + 1)); else echo "::warning::产物无法加入索引：$f"; fi
+          done
+          if [ "$staged" -eq 0 ]; then
+            echo "::warning title=ci-out::没有任何产物可推送（构建可能从未产出 dylib/deb）"; exit 0
+          fi
+          if ! git commit -q -m "ci-out: ${LEG} run ${GITHUB_RUN_ID}"; then
+            echo "::warning::产物提交失败（可能索引为空）"; git status --short | head -20; exit 0
+          fi
+          if git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+                "HEAD:refs/heads/${OUT_REF}" 2>&1; then
+            echo "产物已推送：refs/heads/${OUT_REF}"
+          else
+            echo "::warning title=ci-out-push::产物分支推送失败（fork 可能未授予 Actions 写权限）"
+          fi
+          exit 0
+
+      # ── 诊断通道 ③：编译器要害 → check-run 注解（纯匿名 HTTP 可读）──────
+      - name: 错误注解
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ ! -s "$RUNNER_TEMP/build.log" ]; then
+            echo "::notice title=autoclick(${LEG})::该腿未产生构建输出（编译步骤可能未开始）"
+            exit 0
+          fi
+          echo "::notice title=build.log(${LEG})::共 $(wc -l < "$RUNNER_TEMP/build.log") 行 / $(wc -c < "$RUNNER_TEMP/build.log") 字节"
+          total_lines=$(wc -l < "$RUNNER_TEMP/build.log")
+          max_lines=750
+          [ "$total_lines" -le "$max_lines" ] || echo "::warning title=build.log(${LEG})::日志共 ${total_lines} 行，只发前 ${max_lines} 行（其余靠 ci-diag 分支）"
+          if [ "$total_lines" -le "$max_lines" ]; then emit_to=$total_lines; else emit_to=$max_lines; fi
+          start=1; chunk=0
+          while [ "$start" -le "$emit_to" ]; do
+            end=$((start + 29)); [ "$end" -gt "$emit_to" ] && end=$emit_to
+            chunk=$((chunk + 1))
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              printf '::notice title=build-log(%s)-%02d::%s\n' "${LEG}" "$chunk" "${line:0:400}"
+            done < <(sed -n "${start},${end}p" "$RUNNER_TEMP/build.log")
+            start=$((end + 1))
+          done
+          echo "::notice title=build-log(${LEG})::全文通道已发 ${chunk} 块"
+          n=0
+          emit() {  # $1=类别 $2=正则 [$3=上下文行数]
+            local ctx="${3:-5}" hits ln from to
+            hits=$(grep -nEi "$2" "$RUNNER_TEMP/build.log" 2>/dev/null | cut -d: -f1 | head -3 || true)
+            [ -n "$hits" ] || return 0
+            for ln in $hits; do
+              [ "$n" -ge 8 ] && break
+              from=$(( ln > ctx ? ln - ctx : 1 )); to=$(( ln + ctx ))
+              while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                n=$((n + 1))
+                printf '::error title=%s-%02d(%s)::%s\n' "$1" "$n" "${LEG}" "${line:0:400}"
+                [ "$n" -ge 8 ] && break
+              done < <(sed -n "${from},${to}p" "$RUNNER_TEMP/build.log")
+            done
+            # 必须以 0 结尾：`[ "$n" -ge 8 ] && break` 在 n<8 时为假（退出码 1），
+            # 会把 emit 的返回码带成 1（实测过一次，注解反而变少）。
+            return 0
+          }
+          emit clang-error 'error:|fatal error|no member named|no visible @interface|expected ' 6
+          [ "$n" -ge 8 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8
+          [ "$n" -ge 8 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4
+          echo "::notice title=autoclick(${LEG})::分类注解 ${n} 条"
+          exit 0
+
+      - name: 通过性摘要（notice）
+        if: success()
+        working-directory: ios/auto/${{ matrix.pkg }}
+        run: |
+          set -uo pipefail
+          dylib=$(find .theos/obj -name '*.dylib' 2>/dev/null | head -1)
+          deb=$(ls packages/*.deb 2>/dev/null | head -1)
+          echo "::notice title=autoclick(${LEG})::pkg=${PKG} scheme=${SCHEME:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
+          [ -n "$dylib" ] && echo "::notice title=autoclick(${LEG})::dylib 大小 $(wc -c < "$dylib") 字节"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autoclick-log-${{ env.LEG }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      # 产物上传拆成两步：把 packages/*.deb 与 .theos/obj/**/*.dylib 写在同一个 path 里时，
+      # 只要第一个 glob 无匹配（构建失败即如此），upload-artifact 会直接失败。
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autoclick-${{ env.LEG }}
+          path: |
+            ios/auto/tweak/packages/*.deb
+            ios/auto/dylib/.theos/obj/**/*.dylib
+            ios/auto/tweak/.theos/obj/**/*.dylib
+          if-no-files-found: warn
+          retention-days: 30

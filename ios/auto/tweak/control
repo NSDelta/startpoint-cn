@@ -1,0 +1,9 @@
+Package: com.amauc.auto
+Name: 自动点击（世界弹射物语）
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: 读取「自动化编辑器」导出的 .auto 脚本，在游戏内自动识别界面并点击。兼容 Android 端「自动化编辑器 v4.3.8」的脚本格式（script_version 7）。
+Depends: mobilesubstrate
+Maintainer: ama
+Author: ama
+Section: Tweaks

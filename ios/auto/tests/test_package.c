@@ -73,12 +73,35 @@ static int contains(const unsigned char *hay, size_t hlen, const char *needle)
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: test_package <golden_pkg_dir>\n"); return 2; }
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 崩溃别吞输出 */
     const char *dir = argv[1];
     char path[1024];
     int pass = 0, fail = 0;
 
     /* ── 第 1 部分：ZIP 读 .auto，端到端 ──────────────────────────────── */
-    snprintf(path, sizeof(path), "%s/sample.auto", dir);
+    /*
+     * sample.auto 的位置随 <dir> 指哪儿而变，所以按**能打开的那个**来定，
+     * 不靠猜。三个候选覆盖真实用到的三种调用方式：
+     *   <dir>/sample.auto              <dir> = matcher_golden_pkg/pkg   （扁平夹具，历史用法）
+     *   <dir>/../sample.auto           <dir> = matcher_golden_pkg/pkg
+     *   <dir>/sample.auto              <dir> = matcher_golden_pkg
+     * 只认一种时，换一个参数就报 "打不开 .../pkg/sample.auto" —— 那看起来像产品
+     * bug，其实只是路径不对（真的这么误判过一次），而 test_package 的其余 17 个
+     * 用例依赖 <dir>/pkg/，所以不能让调用方换参数去迁就它。
+     */
+    {
+        static const char *const cand[] = { "%s/sample.auto", "%s/../sample.auto", "%s/../../sample.auto" };
+        int found = 0;
+        for (size_t ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++) {
+            snprintf(path, sizeof(path), cand[ci], dir);
+            FILE *probe = fopen(path, "rb");
+            if (probe) { fclose(probe); found = 1; break; }
+        }
+        if (!found) {
+            printf("FAIL 找不到 sample.auto（试过 %s/sample.auto、%s/../sample.auto）\n", dir, dir);
+            return 1;
+        }
+    }
     am_auto *zip = NULL;
     int rc = am_auto_open(path, &zip);
     if (rc != AM_OK) {

@@ -43,6 +43,7 @@ static unsigned char *read_file(const char *path, size_t expect)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 同 test_matcher：崩溃别吞输出 */
     if (argc < 2) { fprintf(stderr, "usage: test_matcher_neg <golden_dir>\n"); return 2; }
     const char *dir = argv[1];
     char path[1024];

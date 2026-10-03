@@ -1,0 +1,8 @@
+Package: com.amauc.auto.dylib
+Name: 自动点击（世界弹射物语）dylib
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: 非越狱注入用 dylib。不装到系统里 —— 由 inject-dylib.mjs 放进目标 App 的 Frameworks/ 目录并侧载重签。
+Maintainer: ama
+Author: ama
+Section: Tweaks

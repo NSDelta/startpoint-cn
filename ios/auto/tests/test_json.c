@@ -425,6 +425,7 @@ static void test_real_script(const char *dir)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* 崩溃别吞输出 */
     const char *dir = (argc > 1) ? argv[1] : "matcher_golden_pkg";
     printf("== am_json test (dir=%s) ==\n", dir);
 
