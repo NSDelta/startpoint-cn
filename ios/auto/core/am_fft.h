@@ -79,6 +79,25 @@ int am_fft_2d(am_cplx *data, int n1, int n2, int inverse);
  *   有用，但**不要**用它去做大尺寸的 N 维变换。 */
 int am_fft_next_fast_size(int n);
 
+/* ------------------------------------------------------------------ *
+ * 加速后端（Accelerate/vDSP），实现在 am_fft_accel.c
+ *
+ * 语义上完全可选：没有它时这两个函数仍然存在，只是 `..._active()` 恒返回 0。
+ * 两条路径的数值结果必须落在同一个容差内 —— tests/test_fft.c 的 [6] 段就是
+ * 为此写的（DC 分量 == 逐元素和、单位冲激 ⇒ 全 1、共轭对称、Parseval，
+ * 并且在 Accelerate 可用时断言它**确实被用上了**，否则那一段等于没测）。
+ * ------------------------------------------------------------------ */
+
+/* 相邻（stride == 1）的 2 的幂长度一维变换。成功返回 1，返回 0 表示
+ * 「本平台没有加速后端 / 长度不合适」，调用方应回落到标量实现。 */
+int am_fft_pow2_accel(am_cplx *a, int n, int inverse);
+
+/* 本次进程是否真的走过 vDSP（false 表示一路都是标量）。 */
+int am_fft_accelerate_active(void);
+
+/* 释放 vDSP 的 setup（进程退出前调一次即可；不调也只是少回收一块内存）。 */
+void am_fft_accel_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

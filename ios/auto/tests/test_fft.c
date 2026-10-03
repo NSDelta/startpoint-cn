@@ -374,6 +374,108 @@ static void test_speed(void)
     free(buf);
 }
 
+/* ---------- [6] 加速后端（vDSP）与标量路径的一致性 ----------
+ *
+ * ★ 判据必须是**与实现无关的不变量**，不能拿标量版当参考实现：
+ *   在 CI（macOS）上 vDSP 是开着的，标量 fft_pow2 根本不会被调用，
+ *   「两条路互相印证」在那里退化成「自己跟自己对」。所以这里用的是
+ *   任何正确的 DFT 都必然满足的四条性质：
+ *     ① 零频率分量 == 逐元素和（定义直接给出）
+ *     ② 单位冲激的变换 == 全 1（同上）
+ *     ③ Parseval：Σ|X[k]|² == N · Σ|x[n]|²
+ *     ④ 正变换后逆变换还原（覆盖「共轭 → 正向 → 除 N → 再共轭」那条组装）
+ *   再外加一条**就这么用的**断言：在 Accelerate 可用的平台上，
+ *   am_fft_accelerate_active() 必须为真 —— 否则这一段等于什么都没测。
+ */
+static void test_accelerated_agrees(void)
+{
+    const int n = 4096;
+    am_cplx *a = (am_cplx *)malloc(AM_CPLX_BYTES((size_t)n));
+    if (!a) { bad("accelerated: alloc", NULL); return; }
+
+    /* ② 单位冲激 ⇒ 全 1 */
+    memset(a, 0, AM_CPLX_BYTES((size_t)n));
+    a[0] = 1.0; a[1] = 0.0;
+    if (am_fft_1d(a, n, 0) != 0) { bad("accelerated: impulse fft", "returned nonzero"); free(a); return; }
+    double worst = 0.0;
+    for (int i = 0; i < n; i++) {
+        const double dr = fabs(a[2 * i] - 1.0), di = fabs(a[2 * i + 1]);
+        if (dr > worst) worst = dr;
+        if (di > worst) worst = di;
+    }
+    if (worst < 1e-12) ok("impulse transforms to all ones");
+    else { char m[128]; snprintf(m, sizeof(m), "max deviation %.3g", worst); bad("impulse", m); }
+
+    /* ① + ③ 一条随机序列同时验两条 */
+    double energy = 0.0;
+    for (int i = 0; i < n; i++) {
+        const double re = frand() - 0.5, im = frand() - 0.5;
+        a[2 * i] = re; a[2 * i + 1] = im;
+        energy += re * re + im * im;
+    }
+    double sum_re = 0.0, sum_im = 0.0;
+    for (int i = 0; i < n; i++) { sum_re += a[2 * i]; sum_im += a[2 * i + 1]; }
+    if (am_fft_1d(a, n, 0) != 0) { bad("accelerated: random fft", "returned nonzero"); free(a); return; }
+
+    /* X[0] == Σ x[n]，实部虚部分别成立。 */
+    const double dc_err = fabs(a[0] - sum_re) + fabs(a[1] - sum_im);
+    double spec_energy = 0.0;
+    for (int i = 0; i < n; i++) spec_energy += a[2 * i] * a[2 * i] + a[2 * i + 1] * a[2 * i + 1];
+
+    const double rel_dc = dc_err / (sqrt(sum_re * sum_re + sum_im * sum_im) + 1.0);
+    const double rel_par = fabs(spec_energy - (double)n * energy) / ((double)n * energy);
+
+    if (rel_dc < 1e-10) ok("DC component equals the element sum"); else { char m[128]; snprintf(m, sizeof(m), "rel %.3g", rel_dc); bad("DC component", m); }
+    if (rel_par < 1e-10) ok("Parseval holds"); else { char m[128]; snprintf(m, sizeof(m), "rel %.3g", rel_par); bad("Parseval", m); }
+
+    /* ④ 逆变换必须还原出同一段序列（重放同样的随机序列再比较）。
+     * 这一条覆盖的是 am_fft_execute 的「共轭 → 正向 → 除 N → 再共轭」组装 ——
+     * 加速后端只做正向，所以逆变换正确性完全落在这段组装上。 */
+    double *orig = (double *)malloc((size_t)n * 2u * sizeof(double));
+    if (!orig) { bad("accelerated: alloc orig", NULL); free(a); return; }
+    for (int i = 0; i < 2 * n; i++) orig[i] = a[i];
+    /* 先把谱还原成时域，再重新正变换，与最初的谱比 —— 比「逆变换后等于什么」
+     * 更稳：我们手里已经没有最初的时域序列了（上面正变换是就地做的）。 */
+    if (am_fft_1d(a, n, 1) != 0) { bad("inverse transform", "returned nonzero"); free(orig); free(a); return; }
+    if (am_fft_1d(a, n, 0) != 0) { bad("re-forward transform", "returned nonzero"); free(orig); free(a); return; }
+    double rt = 0.0;
+    for (int i = 0; i < 2 * n; i++) {
+        const double d = fabs(a[i] - orig[i]);
+        if (d > rt) rt = d;
+    }
+    if (rt < 1e-9) ok("inverse then forward returns the same spectrum");
+    else { char m[128]; snprintf(m, sizeof(m), "max |d| %.3g", rt); bad("round trip", m); }
+    free(orig);
+
+    free(a);
+
+    /* 2D 走一遍，确认 ND 驱动在加速后端下也自洽（轴顺序/跨距容易写错）。 */
+    {
+        const int s1 = 128, s2 = 256, total = s1 * s2;
+        am_cplx *b = (am_cplx *)malloc(AM_CPLX_BYTES((size_t)total));
+        if (!b) { bad("accelerated 2d: alloc", NULL); return; }
+        double esum = 0.0, e2 = 0.0;
+        for (int i = 0; i < total; i++) { b[2 * i] = frand() - 0.5; b[2 * i + 1] = 0.0; esum += b[2 * i]; e2 += b[2 * i] * b[2 * i]; }
+        if (am_fft_2d(b, s1, s2, 0) != 0) { bad("accelerated 2d", "returned nonzero"); free(b); return; }
+        double s2e = 0.0;
+        for (int i = 0; i < total; i++) s2e += b[2 * i] * b[2 * i] + b[2 * i + 1] * b[2 * i + 1];
+        const double dc = fabs(b[0] - esum) / (fabs(esum) + 1.0);
+        const double par = fabs(s2e - (double)total * e2) / ((double)total * e2);
+        if (dc < 1e-10 && par < 1e-10) ok("128x256 2D: DC and Parseval hold");
+        else { char m[160]; snprintf(m, sizeof(m), "dc rel %.3g par rel %.3g", dc, par); bad("accelerated 2d", m); }
+        free(b);
+    }
+
+    /* ★ 就这条断言把「测试了加速路径」与「测试了标量路径」分开。 */
+#if defined(__APPLE__) && defined(AM_FFT_ACCELERATE)
+    if (am_fft_accelerate_active()) ok("Accelerate/vDSP backend really was used");
+    else bad("Accelerate", "可用但一次都没走 vDSP —— 这一整段等于没测");
+#else
+    if (!am_fft_accelerate_active()) ok("no accelerator on this platform (scalar path)");
+    else bad("accelerate", "报称用了加速但本平台不该有");
+#endif
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -400,6 +502,9 @@ int main(void)
 
     printf("[5] speed\n");
     test_speed();
+
+    printf("[6] accelerated backend (vDSP) consistency\n");
+    test_accelerated_agrees();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

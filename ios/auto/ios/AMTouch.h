@@ -41,8 +41,13 @@
 //  这两步的合体（内部 sleep），给不需要精细控制的调用方用。
 //
 
-#import <Foundation/Foundation.h>
-#import <CoreGraphics/CoreGraphics.h>
+// 为什么直接 import UIKit 而不是 Foundation + `@class UIWindow;`：
+//   本头的接口签名里有 `UIWindow *`、`CGPoint`、`CGFloat`；只 import Foundation 时
+//   UIWindow 是个未知标识符，clang 会报 `error: expected a type`（**MSVC 不编 Objective-C，
+//   这个错误直到第一次真实 iOS 编译才暴露**）。前向声明 `@class UIWindow;` 也不够，
+//   因为 AMTouch.m 要访问 `window.windowScene.screen.nativeScale`。
+//   本头只被平台层的 .m 引用，不存在「纯 Foundation 环境 include 它」的场景。
+#import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 

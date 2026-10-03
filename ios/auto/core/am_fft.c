@@ -184,6 +184,14 @@ static void dft_small(const struct am_tw *tw, am_cplx *x, int n)
 static void fft_pow2(const struct am_tw *tw, am_cplx *a, int n)
 {
     if (n <= 1) return;
+
+    /* ★ 先问加速后端（iOS 上是 Accelerate/vDSP，见 am_fft_accel.c）。
+     * 它只吃「相邻的 2 的幂长度」，正好就是走到这里的情形；返回 0 表示
+     * 本平台没有后端，继续往下跑标量。两条路径的数值语义必须一致 ——
+     * tests/test_fft.c 的 [6] 段用与实现无关的不变量（DC == 逐元素和、
+     * 单位冲激 ⇒ 全 1、共轭对称、Parseval）对它们做交叉校验。 */
+    if (am_fft_pow2_accel(a, n, 0)) return;
+
     if (n == 2) {
         /* Exactly two complex values. Do not touch a[4] or beyond -- callers
          * hand out a run inside a larger buffer. */

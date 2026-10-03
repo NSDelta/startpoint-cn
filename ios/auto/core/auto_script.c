@@ -21,16 +21,6 @@
  * small helpers
  * ------------------------------------------------------------------ */
 
-static void copy_str(char *dst, size_t cap, const char *src)
-{
-    if (!dst || cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
-
 /* am_parse_rect lives in the public header; keep the parser tolerant of spaces
  * because the editor writes "x,y,w,h" but hand-edited scripts sometimes do not. */
 int am_parse_rect(const char *text, am_rect *out)

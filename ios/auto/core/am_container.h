@@ -68,7 +68,7 @@ int am_auto_has(const am_auto *zip, const char *name);
 /* ── PNG 解码 ───────────────────────────────────────────────────────────── */
 /* 解码 8bit RGB / RGBA PNG 到调用方缓冲区。
  *   channels 传入期望的通道数（3 或 4）；实际 PNG 颜色类型不符时返回 AM_ERR_UNSUPPORTED，
- *   并把 *out_w/*out_h 填好（便于调用方判断是"尺寸不对"还是"格式不对"）。
+ *   并把 out_w 与 out_h 填好（便于调用方判断是"尺寸不对"还是"格式不对"）。
  *   buf == NULL 时只回填尺寸。
  * 只支持 bitdepth=8、colortype=2(RGB)/6(RGBA)、无隔行（interlace=0）——
  * 这正是 .auto 里实际出现的形态（全部模板都是 colortype=2）。 */

@@ -58,6 +58,7 @@ tests/                七套测试（MSVC，见 §3）；build/ 与 decomp/ 都�
   test_package.c       21 例：ZIP/PNG 断言 + 17 个真实匹配用例
   test_script.c        56 例：场景/条件/变体选择/坐标适配/点击矩形/ZIP 路径
   test_engine.c        60 例：条件折叠/场景派发/超时/缓存/合成夹具自检
+  audit_caps.c        ★ 把真脚本装进引擎，量出每个编译期上限（AM_MAX_*）用了多少 + 溢出计数
   bench_fft.c         FFT 孤立计时（pad 策略的依据）
   bench_pkg.c         9 个真实 crop 搜索区计时
   pg_guard.[ch]       页守护分配器（没有调试器时的越界检测手段）
@@ -66,9 +67,19 @@ matcher_golden/       9 个正样本夹具（golden_cases.h + raw/*.bin）
 matcher_golden_neg/   18 个负样本夹具（golden_neg_cases.h + raw/*.bin）
 matcher_golden_pkg/   sample.auto + pkg/（54 张平铺 PNG + script.json）+ 17 个真实匹配用例
 sample/               从「幻想连战.auto」解出的 script.json 与结构报告（人读用）
-tools/                生成夹具的 python 脚本（cv2 参考实现）
-  check-test-patterns.mjs  拿真实测试输出核对 CI 里的 grep 模式
-  lint-workflow.mjs        工作流 YAML 体检（TAB / 缩进 / 关键锚点）
+tools/                CI 与夹具工具（python 用 cv2 做参考实现；node/mjs 做各种体检）
+  make_*.py                 生成夹具（matcher golden / 负样本 / package golden / bench cases）
+  build-and-test-matcher.ps1 本机一键编 + 跑 matcher 两套
+  ci-push.mjs               ★ 把 ios/auto 整棵树推成**一个**轻量提交触发 CI（不碰 dev）
+  ci-poll.ps1               轮询某个 sha 的 CI 直到结束（PowerShell 5.1，需 BOM）
+  lint-workflow.mjs         工作流 YAML 体检 + `--selftest` 阳性对照（5 个变异）
+  check-run-shell.mjs       ★ 把每个 `run:` 块喂 `bash -n` + `--selftest`（2 个变异）
+  check-test-patterns.mjs   拿真实测试输出核对 CI 里的 grep 模式
+  check-objc.mjs            ObjC 结构体检（不是编译器）
+  selftest-check-objc.mjs   同上，阳性对照（4 个变异）
+  check-plist.sh            过滤器 plist 三级降级校验（0 命中 / 1 用法 / 3 未命中 / 4 解析失败）
+  make-hostile-plist.py     造敌意 plist 夹具（`$Binary`、反引号、glob、块标量脱出文本）
+  tsan-sanitize.sh          注解通道净化链的自检（含「原样文本确实会炸」的阳性对照）
 *.py                  格式逆向与坐标模型的验证脚本（coord_model / extract_auto / verify_format …）
 ```
 
@@ -137,12 +148,24 @@ tests\build\test_engine.exe       matcher_golden_pkg\pkg   # 60 passed, 0 failed
 本机**没有 clang**，所以进 CI 之前先把能在 Windows 上做的检查做掉：
 
 ```powershell
-node tools\lint-workflow.mjs ..\..\.github\workflows\ios-autoclick.yml  # 工作流 YAML 体检
+node tools\lint-workflow.mjs ..\..\.github\workflows\ios-autoclick.yml --selftest  # 工作流 YAML 体检 + 阳性对照
+node tools\check-run-shell.mjs ..\..\.github\workflows\ios-autoclick.yml --selftest # 每个 run 块喂 bash -n
 node tools\selftest-check-objc.mjs .   # ★ 先证明检查器自己有效
 node tools\check-objc.mjs .            # 再拿它查真代码
 ```
 （第三道 `sh tools/tsan-sanitize.sh` 只在 macOS / Git-bash 下能跑，它验证**注解通道的
-净化器**是否还有效 —— 见 §6 里「注解文本会被回灌成 shell」那条。）
+净化器**是否还有效 —— 见 §6 里「注解文本会被回灌成 shell」那条。`check-plist.sh`
+的回归也在 CI 里跑五例，见下。）
+
+这四道滤网各自负责一类**只有真跑一次才会暴露**的问题：
+
+| 工具 | 抓什么 | 为什么别的工具抓不到 |
+|---|---|---|
+| `lint-workflow.mjs` | 块标量脱出（内容顶到第 0 列 ⇒ PyYAML 报 `while scanning a simple key`）、顶层键白名单、目录级 `git add`、`${{ }}` 不配对 | PyYAML 对「合法但语义错」的文件不报错 |
+| `check-run-shell.mjs` | **YAML 合法但 shell 坏了** —— 例如 `edit` 结尾换行不对称把 `if …; then` 与下一行粘成 `if …; then echo x          while …` | PyYAML 通过、lint 也通过，**只有 `bash -n` 报** |
+| `selftest-*.mjs` / `--selftest` | 检查器自己坏了 | 「什么都报不出来」与「代码很干净」在输出上无法区分 |
+| `tsan-sanitize.sh` / `check-plist.sh` | 注解回灌、plist 格式/退出码 | 把日志当 shell 源码喂给下游，本机不会复现 |
+| `check-test-patterns.mjs` | CI 里 `grep -q "<N> passed"` 的模式写错（会让该步**永远通过**或**永远失败**，在 CI 上只是"一条日志"） | 要跑真实测试才有输出；**且它的阳性结论「0 个不匹配」正是它失配时也会打印的东西** |
 
 `check-objc.mjs` **不是编译器**（不做类型检查），只做三件能在本机抓住的事：
 ① 结构配平（`@interface`/`@implementation`/`@protocol` 与 `@end`、括号、CRLF）；
@@ -154,6 +177,17 @@ node tools\check-objc.mjs .            # 再拿它查真代码
 > 这个自检第一次跑就抓到了它自己的 bug：探针里写的声明与头文件里逐字存在的声明不一致
 > （真身是 `- (NSString *)backendName;`，探针写成 `- (nullable NSString *)backendName;`）
 > ⇒ 替换没生效 ⇒ 报 "MISS"。**探针本身也要有判据。**
+> 同理，`lint-workflow.mjs --selftest` 注入 5 个已知必错的变异（两种块标量脱出、顶层键、
+> 目录级 `git add`、`${{ }}` 不配对），`check-run-shell.mjs --selftest` 注入 2 个
+> （两行粘连、未闭合的 `if`）。**这两组阳性对照都真的抓到过东西**：块标量脱出那条规则
+> 第一版把 `$` 写成了 `\$`（JS 正则里 = 字面美元符），一条都没匹配到而照样打印「体检通过」。
+
+`check-plist.sh`（过滤器 plist 的三级降级校验，退出码 0 命中 / 1 用法错 / 3 未命中 / 4 解析失败）
+在 CI 里用五例回验：真 `tweak/AMAutoClick.plist`、`make-hostile-plist.py` 造的
+good/nobundle/notplist、以及一个不存在的路径。**为什么值得写一个脚本**：我们的 plist 是
+**NeXTSTEP 旧 ASCII 格式**（Cydia/Substrate 的老写法），`plistlib` 只认 XML 与 binary，
+对它会一律 `InvalidFileException` —— 当初那段内联 python 在真文件上直接 rc=4，
+CI 里只显示一行「plist 检查失败」，**看起来像内容不对，其实只是格式不在支持列表里**。
 
 推送到 `ios/auto/**` 或手动触发 `.github/workflows/ios-autoclick.yml`：2×2 矩阵
 （`tweak|dylib` × `rootless|rootful`），除编译外还跑上面 377 例并**逐个校验 `"N passed"` 数值**
@@ -161,6 +195,14 @@ node tools\check-objc.mjs .            # 再拿它查真代码
 `lipo -info` 必须 arm64、tweak 必须 `nm -u` 到 `_MSHookMessageEx`（证明 logos 展开了）、
 dylib **绝不能**出现 `MSHook*` 符号（非越狱 App 里会 dyld 报错）、
 deb 里 dylib 与过滤器 plist 同目录、rootless 落在 `/var/jb`、过滤器里必须有 `com.leiting.wf`。
+
+工作流共 18 步，其中**四步是"验证验证者"**（都在为「结论本身可能是假的」这一类失败兜底）：
+`--selftest` 的两个（工作流体检 5 个变异、run 块 shell 检查 2 个变异）、
+`check-objc.mjs` 的 4 个植入错误、以及 `grep 模式校验` 的阴性对照
+（把 7 个期望值全改成 `1 passed`，断言它**确实报错**）。
+另有 `core 回归` 末尾的**能力上限审计**（`tests/audit_caps.c`）：量出真脚本在每个
+`AM_MAX_*` 上的实际用量并要求一个都不溢出 —— 上限估小了只会置 `s->overflow_*` 计数，
+脚本照样"加载成功"，现场表现是「有些按钮不点」而日志里什么都看不出。
 
 ---
 
@@ -289,6 +331,42 @@ python coord_model.py                         # 复算点击点模型（cv2 参�
   ⚠️ `sanitize()` 里**不要写反斜杠**：`tr '$`[]*?\' '…'` 末尾的裸反斜杠会让 GNU tr 警告
   `an unescaped backslash at end of string is not portable`，而 BSD tr（macOS）的解释
   未定义 —— 反斜杠改用八进制 `\134` 在**删除**那一步处理掉。
+  ⚠️ `cut` 那一步也**必须带 `LC_ALL=C`**：第 16 次 CI 的 `cut: stdin: Illegal byte sequence`
+  就是它在 UTF-8 locale 下按字符计数、遇到孤立高位字节直接报错退出（C locale 下 `-c`
+  就是按字节数且不校验编码）。
+- **我们的过滤器 plist 是 NeXTSTEP 旧 ASCII 格式，`plistlib` 不认**。
+  `tweak/AMAutoClick.plist` 只有 148 B、10 行（`{ Filter = { Bundles = ( "com.leiting.wf" ); … }; }`），
+  这是 Cydia/Substrate 一直在用的老写法，而 `plistlib`（CPython 3.x）**只认 XML 与 binary**
+  ⇒ 对它一律 `InvalidFileException: Invalid file`（`Get-ChildItem` 之类也会报
+  `Invalid file`，**不是文件坏了**）。用 `tools/check-plist.sh`（三级降级：旧 ASCII 走
+  `awk`+grep、XML/binary 走 `plistlib`、兜底走 macOS 的 `plutil -convert json`），
+  退出码 0 命中 / 1 用法错 / 3 未命中 / 4 三种格式都解析失败。
+  **判据要求 Bundles 与 Executables 两条都命中** —— 只判一条会让「Executables 写错但
+  Bundles 对」漏过去，那正是「装上了但什么都不发生」的经典成因。
+- **管道会吞掉退出码**：`cmd | tr …; rc=$?` 拿到的 `$?` 是**管道最后一段的**。
+  `check-plist.sh` 第一版就是 `"$PY" … | tr -cd …` 之后 `rc=$?` ⇒ **恒为 0**，
+  于是「未命中」（应 3）与「不是 plist」（应 4）都报 rc=0 还打 `ok` ——
+  **判据全绿、事实全错，而 CI 上只看到一行 ok**。
+  正解：先把 python 输出落进 `mktemp` 文件、拿到**真实退出码**，再做文本净化。
+- **清理脚本不要 `rm` 自己目录里的东西**。`tsan-sanitize.sh` 的探针会在工作目录造出
+  怪名文件（`>?Binary?id`，用来复现注解回灌的重定向），所以它加了个 `trap cleanup EXIT`
+  删掉「跑之前不存在」的文件。第一版用
+  `case "$before" in *"|$f|"*) continue ;; esac` —— **`case` 的 glob 是「包含」不是「等于」**，
+  而 `|` 在路径里极常见 ⇒ `|build-and-test-matcher.ps1|` 作为子串命中，**把 1584 B 的真实
+  源文件删了**（已 `git checkout HEAD --` 恢复，隔离目录里复现过）。
+  修后：快照保留换行、`grep -qxF` 逐行**精确**比较，且探针脚本一律写进私有 `mktemp -d`。
+  **教训：任何「跑完清理」的逻辑，都要先在隔离目录里对真实邻居文件跑一遍。**
+- **危险数据必须从文件读，不能经 `python -c "…"` 传**。`tools/make-hostile-plist.py`
+  的存在就是为了这个：PowerShell 里反引号是**转义字符**、`$` 会插值 ⇒
+  `python -c "...$Binary\`id\`..."` 里的载荷**根本到不了 python**（实测拿到的是 `'\\id['`）
+  ⇒ 那次「危险数据通过了测试」是**假的**，测的是一个被改写过的字符串。
+- **`|` 收尾的模式最怕上游改写法**：`check-test-patterns.mjs` 原来用
+  `^\s*run\s+(\S+)\s+"([^"]*)"\s+"([^"]+)"\s*$` 解析工作流里的
+  `run test_fft "" "125 passed"`。后来为了绕开 `bash -e` 的守卫陷阱给每行加了
+  `|| true` ⇒ **7 行一条都匹配不上**，而脚本打印的是
+  「0 个不匹配 / 工作流里的 grep 模式与真实输出一致」——**全绿而什么都没验**。
+  现在两处都补了：正则去掉 `$` 锚，并断言**至少解析出 7 条**。
+  **通用规则：任何「解析另一个文件」的检查器，都要对「解析到几条」本身设下界。**
 - **GitHub 的 job 级日志 API 是能用的**（之前记的"匿名 403"只针对 `runs` 端点）：
   `GET /repos/<owner>/<repo>/actions/runs/<run_id>/jobs` 拿 `steps[].conclusion` 与 `job.id`，
   再 `GET /repos/<owner>/<repo>/actions/jobs/<job_id>/logs` 取完整控制台日志（带 BOM，

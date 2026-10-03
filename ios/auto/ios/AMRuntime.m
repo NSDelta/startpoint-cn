@@ -56,11 +56,19 @@
 
     os_unfair_lock _stateLock;   /* 护 _tapLog 与 _scene */
 }
+
+/* 这三个在 AMRuntime.h 里是 readonly，实现里要往它们赋值，所以必须在 class extension
+ * 里「升级」成 readwrite —— clang 允许这种升级，而且只有 extension 能看见 setter。
+ *   ★ 但**修饰符必须与头里逐字一致**，多一个少一个都会报：
+ *        error: illegal redeclaration of 'readwrite' property in class extension 'AMRuntime'
+ *     `scriptPath` / `scriptName` 头里写的是 `readonly, nullable`（**没有 copy**），
+ *     所以这里也不能写 copy；`lastError` 头里有 copy，这里就得有 copy。
+ *   ★ `paused` **不在这里**：它在头里已经是 readwrite，重复声明同一个修饰符同样触发
+ *     上面这条错误（第一次真实 iOS 编译时报的就是 paused 那一行）。 */
 @property (nonatomic, readwrite) AMRuntimeState state;
 @property (nonatomic, readwrite, copy, nullable) NSString *lastError;
-@property (nonatomic, readwrite, copy, nullable) NSString *scriptPath;
-@property (nonatomic, readwrite, copy, nullable) NSString *scriptName;
-@property (nonatomic, readwrite) BOOL paused;
+@property (nonatomic, readwrite, nullable) NSString *scriptPath;
+@property (nonatomic, readwrite, nullable) NSString *scriptName;
 @end
 
 @implementation AMRuntime
@@ -221,10 +229,23 @@
         [self log:@"警告：脚本超出容量上限，部分内容被丢弃（模板组/变体/变量/场景/事件/条件/动作）"];
     }
 
-    [self log:@"已加载 %@：%d 个模板组 / %d 个变量 / %d 个场景，loop_interval=%.0fms（录制于 %dx%d @%.0f）",
-          self.scriptName, s->template_group_count, s->var_count, s->scene_count,
-          s->header.loop_interval * 1000.0,
-          s->header.screen.width, s->header.screen.height, s->header.screen.density];
+    /* 「录制屏幕」取自模板组/裁切各自的 screen_info —— **不是** script.header，
+       也不是 script.screen：
+         · am_script_header 里根本没有 screen 字段（写 header.screen 是编译错误）；
+         · am_script.screen 是**当前**屏幕（am_script_load_auto 传进去的那个），
+           am_script_set_screen 会直接覆盖它，所以它永远不是录制值。
+       录制信息在 am_template_variant::screen / am_crop::screen 里（am_screen_info）。
+       一个模板组都没有时就不打这一段 —— 宁可不打，也不要打一个错的数字。 */
+    if (s->template_group_count > 0) {
+        const am_screen_info *rec = &s->groups[0].variants[0].screen;
+        [self log:@"已加载 %@：%d 个模板组 / %d 个变量 / %d 个场景，loop_interval=%.0fms（录制于 %dx%d @%.0f，取自模板组 0）",
+              self.scriptName, s->template_group_count, s->var_count, s->scene_count,
+              s->header.loop_interval * 1000.0,
+              rec->width, rec->height, rec->density];
+    } else {
+        [self log:@"已加载 %@：0 个模板组 / %d 个变量 / %d 个场景，loop_interval=%.0fms",
+              self.scriptName, s->var_count, s->scene_count, s->header.loop_interval * 1000.0];
+    }
 
     /* 等第一帧来定屏幕参数；在那之前不算 Running。 */
     self.state = AMRuntimeStateWaitingFrame;
@@ -267,10 +288,17 @@
     am_screen_make(&cur, _frameW, _frameH, (int)(_density + 0.5));
     am_script_set_screen(_script, &cur);
 
-    [self log:@"屏幕参数：%dx%d 像素，合成 density=%.1f（脚本录制于 %dx%d @%.0f）",
-          _frameW, _frameH, _density,
-          _script->header.screen.width, _script->header.screen.height,
-          _script->header.screen.density];
+    /* 这一行打的是**当前**屏幕（_frameW/_frameH/_density 就是刚算出来的），录制屏幕
+       另取模板组里的 screen_info —— script.header 没有 screen 字段，script.screen
+       又刚被 am_script_set_screen 覆盖成当前值（见上面的注释）。 */
+    if (_script->template_group_count > 0) {
+        const am_screen_info *rec = &_script->groups[0].variants[0].screen;
+        [self log:@"屏幕参数：%dx%d 像素，合成 density=%.1f（脚本录制于 %dx%d @%.0f）",
+              _frameW, _frameH, _density, rec->width, rec->height, rec->density];
+    } else {
+        [self log:@"屏幕参数：%dx%d 像素，合成 density=%.1f（脚本没有模板组，取不到录制分辨率）",
+              _frameW, _frameH, _density];
+    }
     return YES;
 }
 
@@ -593,10 +621,24 @@ static void am_rt_trace(void *ctx, const char *msg)
 - (NSString *)environmentSummary
 {
     const AMRuntimeStatus st = [self status];
-    return [NSString stringWithFormat:
-            @"取帧：%@\n触摸：%@\n帧：%dx%d @ density %.1f\n状态：%ld  轮数：%d  场景：%d/%d  点击：%d%@",
+    const AMCaptureStats cs = [[AMCapture shared] stats];
+    const AMTouchStats   ts = [[AMTouch shared] stats];
+    // 取帧的三个计数各自回答一个不同的问题，缺一个就会把原因猜错：
+    //   frames      —— 真的读到多少帧
+    //   dropped     —— 读到了但没人取走（渲染快于消费；不是错误）
+    //   readSkips   —— 被时间节流跳过（见 AMCapture.minReadIntervalMs）
+    // presentCalls 与 frames 的差值 = 「present 了但一帧都没读」，
+    // 那是真的出问题了（视口取不到、realloc 失败、GL 上下文不对）。
+    // glReadPixels 那一段会阻塞渲染线程，所以它必须单独报出来。
+    NSString *cap = [NSString stringWithFormat:
+            @"%@（present %llu / 读 %llu / 丢 %llu / 节流跳过 %llu；读 %.1f ms 其中 glReadPixels %.1f ms，峰值 %.1f ms）",
             [[AMCapture shared] backendName],
-            [[AMTouch shared] backendName],
+            [[AMCapture shared] presentCalls], cs.frames, cs.dropped, cs.readSkips,
+            cs.lastReadMs, cs.lastGLReadMs, cs.maxReadMs];
+    return [NSString stringWithFormat:
+            @"取帧：%@\n触摸：%@（发 %llu / 失败 %llu / 被拒 %llu）\n帧：%dx%d @ density %.1f\n状态：%ld  轮数：%d  场景：%d/%d  点击：%d%@",
+            cap,
+            [[AMTouch shared] backendName], ts.sent, ts.failed, ts.refused,
             st.frameWidth, st.frameHeight, st.density,
             (long)st.state, st.rounds, st.currentScene, st.sceneCount, st.tapCount,
             st.unsupportedConditions > 0

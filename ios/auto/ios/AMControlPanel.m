@@ -94,7 +94,11 @@
 #pragma mark - 控制板
 
 @interface AMControlPanel () <UITableViewDataSource, UITableViewDelegate>
-@property (nonatomic, readwrite) BOOL visible;
+/* `visible` 在 AMControlPanel.h 里**已经是 readwrite**，所以这里不能再声明一次 ——
+ * 重复声明同一个修饰符是编译错误：
+ *   error: illegal redeclaration of 'readwrite' property in class extension 'AMControlPanel'
+ * 它在这里曾经存在，正是第一次真实 iOS 编译报出来的那一类问题（一次报了 AMRuntime
+ * 的 paused 与这里的 visible 两处）。实现里 `self.visible = ...` 直接可用。 */
 @end
 
 @implementation AMControlPanel

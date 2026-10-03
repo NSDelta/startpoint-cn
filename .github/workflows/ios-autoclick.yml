@@ -2,7 +2,7 @@
 #
 # 为什么必须在这里编译：开发机是 Windows，没有 clang/Xcode/Theos，也没有 WSL。
 # 本工作流同时承担**iOS 平台层唯一的编译验证**（ios/auto/ios/*.m 在本机从未编过）
-# 与 **core 的交叉编译器验证**（同一份 C99 在 clang 下再跑一遍 377 个用例）。
+# 与 **core 的交叉编译器验证**（同一份 C99 在 clang 下再跑一遍 377 个用例，外加一次能力上限审计）。
 #
 # ── 三条诊断通道（都不需要仓库凭据即可读回）──────────────────────────────
 #   ① refs/heads/ci-diag/<run_id>/<leg>   完整构建日志 + meta.txt
@@ -89,15 +89,41 @@ jobs:
         run: |
           set -euo pipefail
           cd ios/auto
-          node tools/lint-workflow.mjs ../../.github/workflows/ios-autoclick.yml
-          # 先证明检查器自己有效（对 4 个植入错误都能报出来），再拿它查真代码 ——
-          # 一个"什么都报不出来"的检查器与"代码很干净"在输出上无法区分。
+          # `--selftest` 会往内存副本里注入 5 个已知必错的变异（块标量脱出、
+          # 顶层键白名单、目录级 git add、${{ }} 不配对），断言体检**确实报了出来**。
+          # 没有这一步，下面那句「结构体检通过」什么都证明不了 ——
+          # 「什么都报不出来」与「工作流很干净」在输出上无法区分。
+          node tools/lint-workflow.mjs ../../.github/workflows/ios-autoclick.yml --selftest
+          # YAML 合法 ≠ shell 合法：`edit` 结尾换行不对称会把两行粘成
+          # `if …; then echo x          while …`，PyYAML 与 lint-workflow 都看不见，
+          # **只有 bash -n 会报**。本机有 Git 自带的 bash，所以这一步能在推之前跑。
+          node tools/check-run-shell.mjs ../../.github/workflows/ios-autoclick.yml --selftest
+          # 先证明检查器自己有效（对 4 个植入错误都能报出来），再拿它查真代码。
           node tools/selftest-check-objc.mjs .
           node tools/check-objc.mjs .
           # 同上：注解通道的净化器（step「错误注解」里的 sanitize）也要自证有效。
           # 它坏掉的后果是**整条腿变红而构建其实是全绿的** —— 第 15 次 CI 就是
           # `Binary: unbound variable`。这个探针同时验证「原样文本确实会炸」。
           sh tools/tsan-sanitize.sh
+          # ── check-plist.sh 的三级降级 + 退出码，用真文件/敌意文件各验一遍 ──
+          # ★ 为什么必须验：这个脚本第一版的退出码被管道吞掉（拿到的是 `tr` 的 0），
+          #   「没命中」和「不是 plist」两种情形都报 rc=0 还打 ok —— **判据全绿、
+          #   事实全错**，而 CI 上只看到一行 ok。第二版才发现**我们的 plist 是
+          #   NeXTSTEP 旧 ASCII 格式，plistlib 根本不认**。
+          echo "── check-plist.sh 回归"
+          for k in good nobundle notplist; do
+            python3 tools/make-hostile-plist.py "$RUNNER_TEMP/hp-$k.plist" --kind=$k
+          done
+          expect_rc() {   # $1=期望退出码  $2=文件  $3=说明
+            sh tools/check-plist.sh "$2" >/dev/null 2>&1
+            got=$?
+            if [ "$got" = "$1" ]; then echo "  ok  $3  rc=$got"; else echo "  FAIL $3  期望 rc=$1 实际 rc=$got"; exit 1; fi
+          }
+          expect_rc 0 tweak/AMAutoClick.plist          "真 plist（旧 ASCII 格式）判为命中"
+          expect_rc 0 "$RUNNER_TEMP/hp-good.plist"     "binary plist 命中"
+          expect_rc 3 "$RUNNER_TEMP/hp-nobundle.plist" "binary plist 未命中"
+          expect_rc 4 "$RUNNER_TEMP/hp-notplist.plist" "不是 plist"
+          expect_rc 1 "$RUNNER_TEMP/hp-missing.plist"  "路径不存在"
 
       # ── core 的编译 + 回归（跨编译器验证）────────────────────────────────
       # 这 377 个用例平时在 Windows/MSVC 上跑。clang 下再跑一遍能同时抓到两类问题：
@@ -122,9 +148,11 @@ jobs:
           CF="$CF -DAM_FFT_ACCELERATE=1"
           LD="-framework Accelerate"
           : > "$RUNNER_TEMP/build.log"
-          for t in test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine; do
+          for t in test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine audit_caps; do
             extra=""
             [ "$t" = "test_engine" ] && extra="core/auto_engine.c"
+            # audit_caps 要真的把脚本装进引擎（am_engine_*），所以也要 auto_engine.c。
+            [ "$t" = "audit_caps" ] && extra="core/auto_engine.c"
             echo "=== clang $t" | tee -a "$RUNNER_TEMP/build.log"
             # shellcheck disable=SC2086
             clang $CF $INC $LD -o "tests/build/$t" "tests/$t.c" $CORE $extra 2>&1 | tee -a "$RUNNER_TEMP/build.log"
@@ -167,9 +195,39 @@ jobs:
           run test_matcher_neg  "matcher_golden_neg"  "18 passed" || true
           run test_package      "matcher_golden_pkg"  "21 passed" || true
           run test_engine       "matcher_golden_pkg/pkg" "60 passed" || true
-          if [ "$rc" -eq 0 ]; then echo "core 回归全部通过（377 例）"; fi
+          # ── 能力上限审计（不是用例，是一条独立的断言）────────────────────
+          # core/auto_script.h 里的 AM_MAX_* 是当初按最坏情况估的，**估小了会静默
+          # 丢东西**（只置 s->overflow_* 计数，脚本照样"加载成功"）⇒ 现场表现是
+          # 「有些按钮不点」而日志里什么都看不出。所以这里量出真脚本在每一个
+          # 编译期上限上用了多少，并要求**一个都没溢出**。
+          # 只在 .auto 压缩包形态上跑一次：目录形态读的是同一份 script.json，
+          # 本机实测两份数字完全一致，跑两遍只是浪费时间。
+          echo "--- audit_caps (dir='matcher_golden_pkg/sample.auto')"
+          audit_out=$(./tests/build/audit_caps matcher_golden_pkg/sample.auto 2>&1); audit_rc=$?
+          printf '%s\n' "$audit_out" | grep -E '模板组|变量 |场景 |单场景|单事件|单变量|单组|溢出计数|没有任何溢出|加载失败' || true
+          if [ "$audit_rc" -ne 0 ]; then
+            printf '%s\n' "$audit_out" | tail -12
+            bad "audit_caps 退出码 $audit_rc（脚本没装进引擎，或有维度溢出了）"
+          fi
+          printf '%s\n' "$audit_out" | grep -q "没有任何溢出" || bad "audit_caps 没说『没有任何溢出』"
+          if [ "$rc" -eq 0 ]; then echo "core 回归全部通过（377 例）+ 能力上限审计无溢出"; fi
           exit $rc
           } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      # ── grep 模式的阴性对照 ──────────────────────────────────────────────
+      # 上面的 run() 用 `grep -q "<N> passed"` 判成败：模式一旦写错（大小写、
+      # 空格、行尾被加了 `|| true`），这一步会**永远通过**或**永远失败**，而两种
+      # 情况在 CI 上都只是"一条日志"。这个脚本拿真实输出对一遍，并且：
+      #   · 模式**从工作流现读**（不另抄一份会漂的表）
+      #   · 少于 7 条就报错 —— **全绿而什么都没验，正是它自己失配时的样子**
+      #     （真发生过：给工作流加 `|| true` 之后 `\s*$` 一条都匹配不上，
+      #      而脚本打印的是「0 个不匹配 / 模式与真实输出一致」）
+      #   · `--selftest` 把 7 个期望值全改成 `1 passed`，断言它**确实报错**
+      - name: grep 模式校验（读自工作流，含阴性对照）
+        run: |
+          set -euo pipefail
+          cd ios/auto
+          node tools/check-test-patterns.mjs . ../../.github/workflows/ios-autoclick.yml --selftest
 
       # ── 交付物 ①/②：Theos 编译 ──────────────────────────────────────────
       - name: 构建 ${{ matrix.pkg }}
@@ -349,16 +407,26 @@ jobs:
           echo "=== 解包后的文件树"
           find "$tmp" -type f | sort
           plist=$(find "$tmp" -name 'AMAutoClick.plist' | head -1)
-          echo "=== $plist（下面用 python 打成文本；**不要 cat**，它是 bplist00 二进制）"
-          # ★ 为什么要绕这一下（第 15 次 CI 的真实教训）：这一段的 stdout 经 tee 进
+          echo "=== 过滤器 plist（**不要 cat**，它是 plist 不是文本）"
+          # ★ 为什么要绕这一下（第 15/16 次 CI 的真实教训）：这一段的 stdout 经 tee 进
           #   build.log，而 step「错误注解」会把 build.log 的每行原样发成 `::notice`。
           #   GitHub 再把注解文本回灌进下一步的临时脚本 —— 于是 binary plist 里的
-          #   `$Binary` 变成了 shell 的未定义变量，`set -u` 下整条腿判红
-          #   （`line 43: Binary: unbound variable`），而真正的构建其实是全绿的。
-          #   **凡是会进 build.log 的二进制，都要在源头换成文本。**
-          python3 -c 'import plistlib,sys;print(plistlib.load(open(sys.argv[1],"rb")))' "$plist" 2>/dev/null \
-            || { echo "（python 解析失败，退回 strings 视图）"; strings "$plist" | head -20; }
-          grep -q 'com.leiting.wf' "$plist" 2>/dev/null || bad "过滤器里没有目标 bundle id"
+          #   `$Binary` 变成了 shell 的未定义变量（`Binary: unbound variable`），
+          #   同一批字节还会让 `cut` 报 `Illegal byte sequence`，
+          #   两次都是**整条腿判红而构建其实是全绿的**。
+          #   **凡是会进 build.log 的东西，都要在源头换成纯文本。**
+          # ★ 判据本身也搬进了脚本（tools/check-plist.sh），不再内联在 run 里：
+          #   ① 内联多行 python 必须整体缩进，我那次把它们顶到第 0 列 ⇒ PyYAML 报
+          #      `while scanning a simple key … could not find expected ':'`
+          #      （lint-workflow.mjs 现在有规则专门抓这个）；
+          #   ② 更重要：**我们的 plist 是 NeXTSTEP 旧 ASCII 格式，plistlib 不认**
+          #      （`InvalidFileException: Invalid file`），必须三级降级才判得出来。
+          #      详见 ios/auto/tools/check-plist.sh 的文件头。
+          if sh tools/check-plist.sh "$plist"; then
+            echo "  ok  过滤器里同时有 com.leiting.wf 与 worldflipper"
+          else
+            bad "过滤器 plist 检查失败（见上面 check-plist.sh 的输出）"
+          fi
           echo "=== 断言结束 rc=$rc"
           exit $rc
           } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
@@ -494,18 +562,23 @@ jobs:
           #     ① `tr -d '\000-\010\013\014\016-\037\134'`：NUL、其它控制字符
           #        与反斜杠（`\134`）。（**换行必须留着**，下面按行处理；行内本来
           #        也不会有换行。）
-          #     ② `tr -cd '\040-\176'`：只留可打印 ASCII（UTF-8 中文会被去掉，
+          #     ② `LC_ALL=C cut -c1-400`：截断。★ **`LC_ALL=C` 是必需的**：
+          #        第 16 次 CI 就是它报 `cut: stdin: Illegal byte sequence` 把腿弄红的
+          #        —— 在 UTF-8 locale 下 `cut -c` 走的是按字符计数的路径，遇到非法
+          #        字节序列直接报错退出（GNU coreutils；macOS 的 BSD cut 同理）。
+          #        第 ① 步已经去掉了控制字符，但 0x80-0xFF 这些高位字节还在。
+          #     ③ `tr -cd '\040-\176'`：只留可打印 ASCII（UTF-8 中文会被去掉，
           #        这是可接受的 —— 日志的英文部分才是要看的）
-          #     ③ `tr '$`[]*?' '??????'`：shell 元字符全部换成 `?`。少了 `[`
+          #     ④ `tr '$`[]*?' '??????'`：shell 元字符全部换成 `?`。少了 `[`
           #        这一项时，`bplist00…Bundles[Executables…` 会让 bash 报
           #        `unexpected EOF while looking for matching ]`；少了 `$` 就是
           #        第 15 次 CI 的 `Binary: unbound variable`。
-          #     ★ 第 ③ 步**不要写反斜杠**：`tr '$`[]*?\' '…'` 末尾是裸反斜杠，
+          #     ★ 第 ④ 步**不要写反斜杠**：`tr '$`[]*?\' '…'` 末尾是裸反斜杠，
           #       GNU tr 会警告 `an unescaped backslash at end of string is not
           #       portable`，BSD tr（macOS）的解释未定义。反斜杠在上面第 ① 步
           #       用 `\134` 删掉了，所以这里根本不需要它。
           sanitize() {
-            LC_ALL=C tr -d '\000-\010\013\014\016-\037\134' | cut -c1-400 \
+            LC_ALL=C tr -d '\000-\010\013\014\016-\037\134' | LC_ALL=C cut -c1-400 \
               | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr '$`[]*?' '??????'
           }
           while [ "$start" -le "$emit_to" ]; do

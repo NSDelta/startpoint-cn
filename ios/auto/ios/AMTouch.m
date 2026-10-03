@@ -107,11 +107,21 @@ static AMSetInt_t                  pSetInt;
 
 #pragma mark - 私有可写状态
 
-// 公开头文件里 lastHitViewClass 是 readonly 的；这里补一个 readwrite 的同名属性，
-// 编译器就会为它合成 _lastHitViewClass 这个 ivar。少了这一段，下面
-// `_lastHitViewClass = ...` 会因为 ivar 不存在而编译失败。
+/* 公开头文件里 lastHitViewClass 是 readonly 的。这里**不**再声明一个 readwrite 的
+ * 同名属性，理由：class extension 里「升级」属性时**修饰符必须与头里逐字一致**
+ * （头里是 `readonly, nullable`，没有 copy），多写一个 copy 就会被 clang 拒绝。
+ *
+ * `_lastHitViewClass` 这个 ivar 就**在这里自己声明**（下面那个 `{}` 块），配合实现里的
+ * 自定义 getter/setter 使用。为什么不用 `@synthesize`：显式合成会再造一个 ivar，
+ * 与自己声明的同名冲突；而且一旦访问器没引用它就会踩中
+ *     error: ivar '_...' which backs the property is not referenced in this property's
+ *            accessor [-Werror,-Wunused-property-ivar]
+ * —— AMCapture 的 backend 就是这么被咬的（见那边的注释）。**ivar + 两个访问器**
+ * 是唯一自洽、且不依赖「自动合成何时发生」的写法。 */
 @interface AMTouch ()
-@property (nonatomic, readwrite, copy, nullable) NSString *lastHitViewClass;
+{
+    NSString *_lastHitViewClass;
+}
 @end
 
 #pragma mark - 状态
@@ -143,25 +153,32 @@ static void AMTouchLoadIOKit(void)
 static UIWindow *AMTouchKeyWindow(void)
 {
     UIApplication *app = [UIApplication sharedApplication];
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in app.connectedScenes) {
-            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            if (s.activationState != UISceneActivationStateForegroundActive) continue;
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) return w;
-            }
-        }
-        /* 前台 active 的场景里没有 key window：退一步，任意窗口里找 key。 */
-        for (UIScene *s in app.connectedScenes) {
-            if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) return w;
-            }
+
+    /* ★ **不要**回退到 `app.windows`。它在 iOS 15.0 起被标记为 deprecated
+       （`UIApplication.h:109  API_DEPRECATED("Use UIWindowScene.windows ...", ios(2.0, 15.0))`），
+       而 Theos 在 Debug 构建下带 -Werror ⇒ 直接构建失败：
+           error: 'windows' is deprecated: first deprecated in iOS 15.0
+                  [-Werror,-Wdeprecated-declarations]
+       这里原本正是这么写的（"退一步找任意窗口的 key window"）。目标最低版本是 iOS 15，
+       而且 UIApplication 在 iOS 14 之后就一定有 connectedScenes，所以走场景遍历足够；
+       连一个 scene 都没有时返回 nil，调用方（-beginTapAtPoint:）本来就会把这次点击
+       计入 refused/failed 并给出原因 —— 比读一个已废弃属性更可查。 */
+    for (UIScene *s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow) return w;
         }
     }
-    NSArray<UIWindow *> *ws = app.windows;
-    for (UIWindow *w in ws) { if (w.isKeyWindow) return w; }
-    return ws.firstObject;
+    /* 前台 active 的场景里没有 key window：退一步，任意场景里找 key。 */
+    for (UIScene *s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            if (w.isKeyWindow) return w;
+        }
+    }
+    return nil;
 }
 
 /// 做一次 hitTest 并把整条命中链拼成人能读的字符串 —— §5-Q3 的现场验证第 1 步。
@@ -295,6 +312,11 @@ static BOOL AMTouchSendHID(NSArray<UITouch *> *allTouches)
 #pragma mark - AMTouch
 
 @implementation AMTouch
+
+/* ★ 这里**不要**写 `@synthesize lastHitViewClass = _lastHitViewClass;`：
+   ivar 已经在 class extension 里自己声明了，再合成一次会重名；而且访问器一旦没引用
+   合成的那个 ivar 就会踩 -Werror 下的 -Wunused-property-ivar（AMCapture 的 backend
+   正是这么被咬的）。属性接口来自头文件声明，实现来自这里的 getter/setter。 */
 
 + (instancetype)shared
 {
@@ -454,6 +476,15 @@ static BOOL AMTouchSendHID(NSArray<UITouch *> *allTouches)
     return _lastHitViewClass;
 }
 
+/* 私有 setter。头里只有 readonly 的 getter，所以这个 setter 对外不可见 —— 但同一个
+ * @implementation 里 `self.lastHitViewClass = ...` 能看见它（编译器对「本类里已实现的
+ * setter」不做可见性检查）。写成方法而不是直接 `_lastHitViewClass = ...`，是为了让
+ * copy 语义有个落点（ivar 是 raw 指针，直接赋值不会拷贝）。 */
+- (void)setLastHitViewClass:(NSString *)name
+{
+    _lastHitViewClass = [name copy];
+}
+
 #pragma mark - 发送
 
 - (BOOL)sendTouches:(NSArray<UITouch *> *)touches
@@ -502,7 +533,7 @@ static BOOL AMTouchSendHID(NSArray<UITouch *> *allTouches)
     gActiveTouch = touch;
     gActivePoint = pointInWindow;
     gActiveTs = touch.timestamp;
-    _lastHitViewClass = touch.view ? NSStringFromClass([touch.view class]) : nil;
+    self.lastHitViewClass = touch.view ? NSStringFromClass([touch.view class]) : nil;
     return [self sendTouches:@[ touch ]];
 }
 

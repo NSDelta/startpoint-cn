@@ -37,8 +37,11 @@ typedef NS_ENUM(NSInteger, AMCaptureBackend) {
 typedef struct {
     unsigned long long frames;       ///< 成功交付的帧数
     unsigned long long dropped;      ///< 因为「上一帧还没被取走」而丢掉的帧数
-    double lastReadMs;               ///< 上一次 glReadPixels + 降采样的耗时（毫秒）
+    unsigned long long readSkips;    ///< 被时间节流跳过的读取次数（见 -minReadIntervalMs）
+    double lastReadMs;               ///< 上一次「读取 + 降采样」的总耗时（毫秒）
     double maxReadMs;                ///< 历史最大（判断会不会拖慢渲染线程）
+    double lastGLReadMs;             ///< 其中 glReadPixels 那一段（同步阻塞渲染线程的只有它）
+    double lastDownsampleMs;         ///< 其中灰度降采样那一段
     int width, height;               ///< 最近一帧的尺寸（像素）
 } AMCaptureStats;
 
@@ -76,6 +79,17 @@ typedef struct {
 
 /// 统计快照。
 - (AMCaptureStats)stats;
+
+/// 两次真正读取之间的最小间隔（毫秒），默认 30.0。
+///
+/// 游戏可能以 60/120 Hz 调 presentRenderbuffer:，而引擎一轮只推进 loop_interval
+/// （样例脚本是 30 ms）那么久。glReadPixels 是 GL 管线同步点 —— 它要等 GPU 把已经
+/// 排队的工作做完，是这里唯一真正花钱的操作；而「引擎还没走到下一步」的那些帧读出来
+/// 也没人会看。所以两次读取之间不足这个间隔就直接跳过，保留上一帧
+/// （引擎照旧每步看到一帧，行为不变；跳过的次数记在 stats.readSkips）。
+///
+/// 设 0 = 不节流（诊断用：想看游戏真实的渲染帧率就设 0，看 stats.frames 的增长速度）。
+@property (nonatomic) double minReadIntervalMs;
 
 /// 被 hook 的 presentRenderbuffer 调用计数。单调递增；用它判断「游戏还在渲染吗」。
 @property (nonatomic, readonly) unsigned long long presentCalls;

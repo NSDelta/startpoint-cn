@@ -26,6 +26,23 @@
 
 #import "AMCapture.h"
 
+/* 本文件是整个平台层里**唯一**直接使用 OpenGL ES 的地方（游戏是 AIR + Stage3D，
+   上屏路径就是 EAGL），而 OpenGL ES 从 iOS 12 起被整体标记为 deprecated。
+   Theos 在 Debug 构建下带 -Werror，于是每一条 GL 调用都会把构建打红：
+       error: 'glBindRenderbuffer' is deprecated: first deprecated in iOS 12.0 -
+              OpenGLES API deprecated. [-Werror,-Wdeprecated-declarations]
+   这里按文件关掉这一类警告 —— 只在**本文件**范围内生效（push/pop 覆盖到文件末尾，
+   因为下面所有 @implementation 都在 push 之后），比在 Makefile 里全局
+   -DGLES_SILENCE_DEPRECATION 更精确：别的文件将来用到废弃 API 仍然会被拦下。 */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+/* UIKit 要在 OpenGLES 之前 —— 否则依赖 GL 头里的类型也没问题，但保持与
+   AMCapture.h 的 @class UIImage 前向声明相对：**那个前向声明盖不过类方法调用**
+   （[UIImage imageWithCGImage:] 在 -previewImage 里），必须真的 import
+   UIKit。这一条也是第一次真实 iOS 编译才暴露的。 */
+#import <UIKit/UIKit.h>
+
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <OpenGLES/ES2/gl.h>
@@ -36,6 +53,7 @@
 #import <os/lock.h>
 #import <os/atomic.h>
 #import <mach/mach_time.h>
+
 
 #pragma mark - EAGLContext 私有能力
 
@@ -127,6 +145,10 @@ static unsigned long long gPresentCalls;
 static unsigned long long gFrames;
 static unsigned long long gDropped;
 static double             gLastReadMs, gMaxReadMs;
+static double             gLastGLReadMs, gLastDownsampleMs;
+static unsigned long long gReadSkips;
+static double             gMinReadIntervalMs = 30.0;   // 见 AMCaptureReadFromGL 里的说明
+static double             gLastReadAt;                  // 上次真正读取的时刻（单调毫秒）
 
 static double AMNowMs(void)
 {
@@ -173,11 +195,41 @@ static void AMDownsampleRGBAtoGray(const unsigned char *src, int srcW, int srcH,
 
 static void AMCaptureStoreGray(const unsigned char *gray, int w, int h);
 
+/* presentRenderbuffer 的调用计数。在这里（文件的中前部）定义，而不是像原来那样放在
+   文件末尾 —— 末尾定义会在调用点之前形成隐式声明，C99 起不再允许：
+       error: call to undeclared function 'AMCaptureNotePresent'
+       error: conflicting types for 'AMCaptureNotePresent'   （定义处）
+   放在调用点之前就一次都不用写原型（写了反而可能与定义重复）。
+   加 static：它只被本文件的 hook 用，头文件里也不导出，没有理由给外部链接名。 */
+static void AMCaptureNotePresent(void)
+{
+    __atomic_fetch_add(&gPresentCalls, 1ull, __ATOMIC_RELAXED);
+}
+
 /// 从当前绑定的 GL 状态读一帧。**必须在渲染线程调用**（或至少是持有当前 EAGLContext 的线程）。
 static void AMCaptureReadFromGL(void)
 {
     GLint vx = 0, vy = 0, vw = 0, vh = 0;
     if (!AMGLViewport(&vx, &vy, &vw, &vh)) return;
+
+    //
+    // 时间节流：游戏可能以 60/120 Hz 调 presentRenderbuffer:，而引擎一轮只推进
+    // loop_interval（样例脚本是 30 ms）那么久。**glReadPixels 是管线同步点**
+    // —— 它会把 GPU 已经排队的工作等干净，是这里唯一真正花钱的操作，而
+    // 「引擎还没走到下一步」的那些帧读出来也没人会看。
+    // 所以：距上次成功读取不足 gMinReadIntervalMs 就什么都不做，保留上一帧
+    // （gFrameFresh 不置位、gDropped 不自增）—— 引擎照旧每步看到一帧，行为不变。
+    //
+    // 0 表示不节流（诊断用：想看真实渲染帧率就设 0）。
+    //
+    if (gMinReadIntervalMs > 0.0) {
+        const double now = AMNowMs();
+        if (gLastReadAt != 0.0 && (now - gLastReadAt) < gMinReadIntervalMs) {
+            gReadSkips++;
+            return;
+        }
+        gLastReadAt = now;
+    }
 
     const size_t need = (size_t)vw * (size_t)vh * 4u;
     if (gReadCap < need) {
@@ -193,6 +245,7 @@ static void AMCaptureReadFromGL(void)
     // 显式设一遍，免得别的代码把它改成 1 或 8。
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(vx, vy, vw, vh, GL_RGBA, GL_UNSIGNED_BYTE, gReadBuf);
+    const double t1 = AMNowMs();       // glReadPixels 是管线同步点，这一段会阻塞渲染线程
 
     // 灰度降采样。目标尺寸 = 视口尺寸（1:1）。引擎会再做一次到脚本分辨率的缩放，
     // 但这一层保持原生像素，因为匹配的搜索矩形是按原生像素算的。
@@ -210,12 +263,16 @@ static void AMCaptureReadFromGL(void)
     gFrameH = vh;
     if (gFrameFresh) gDropped++;
     gFrameFresh = YES;
-    os_unfair_lock_unlock(&gLock);
-
-    const double dt = AMNowMs() - t0;
+    // 计时也写在锁里：-stats 是在别的线程上读这些 double 的，
+    // 64 位写入在 arm64 上虽然不会撕裂，但没有理由留一个数据竞争。
+    const double t2 = AMNowMs();
+    const double dt = t2 - t0;
     gLastReadMs = dt;
+    gLastGLReadMs = t1 - t0;
+    gLastDownsampleMs = t2 - t1;
     if (dt > gMaxReadMs) gMaxReadMs = dt;
     gFrames++;
+    os_unfair_lock_unlock(&gLock);
     gBackend = AMCaptureBackendGL;
 }
 
@@ -251,6 +308,11 @@ static void AMCaptureReadFromGL(void)
 #pragma mark - AMCapture
 
 @interface AMCapture ()
+/* hasFrame / backend 在公开头里是 readonly，这里升级成 readwrite（**修饰符必须与头里
+ * 逐字一致**，多写一个 copy 之类会被 clang 拒绝）。
+ * ★ 它们的存储**不是 ivar**：hasFrame 的 getter 读文件级 gFrame，backend 的
+ *   getter/setter 读写 gBackend ⇒ 既不要写 @synthesize，也不要给它们声明 ivar。
+ *   踩过的坑见下面 @implementation 顶上的注释。 */
 @property (nonatomic, readwrite) BOOL hasFrame;
 @property (nonatomic, readwrite) AMCaptureBackend backend;
 // presentCalls 是只读的派生量（背后是文件级 static gPresentCalls），
@@ -259,6 +321,15 @@ static void AMCaptureReadFromGL(void)
 @end
 
 @implementation AMCapture
+
+/* ★ 这里**不要**写 `@synthesize hasFrame = _hasFrame;` / `@synthesize backend = _backend;`。
+   第一次真实 iOS 编译的教训（第一次尝试加了这两行，换来一条新错误）：
+       error: ivar '_backend' which backs the property is not referenced in this
+              property's accessor [-Werror,-Wunused-property-ivar]
+   原因是这两个属性的存储根本**不是 ivar**：hasFrame 的 getter 读文件级的 gFrame、
+   backend 的 getter/setter 读写 gBackend。显式 @synthesize 会强行造出一个没人引用的
+   ivar，正好踩中 -Wunused-property-ivar（而且 Theos 带 -Werror ⇒ 直接失败）。
+   什么都不写最正确：属性由 @interface 里的声明提供接口，实现由下面那对访问器提供。 */
 
 + (instancetype)shared
 {
@@ -433,8 +504,11 @@ static void AMCaptureReadFromGL(void)
     os_unfair_lock_lock(&gLock);
     s.frames = gFrames;
     s.dropped = gDropped;
+    s.readSkips = gReadSkips;
     s.lastReadMs = gLastReadMs;
     s.maxReadMs = gMaxReadMs;
+    s.lastGLReadMs = gLastGLReadMs;
+    s.lastDownsampleMs = gLastDownsampleMs;
     s.width = gFrameW;
     s.height = gFrameH;
     os_unfair_lock_unlock(&gLock);
@@ -444,6 +518,18 @@ static void AMCaptureReadFromGL(void)
 - (unsigned long long)presentCalls
 {
     return gPresentCalls;
+}
+
+- (double)minReadIntervalMs
+{
+    return gMinReadIntervalMs;
+}
+
+- (void)setMinReadIntervalMs:(double)ms
+{
+    if (ms < 0.0) ms = 0.0;                 // 负数当 0（=不节流），别让它变成"永远不读"
+    if (ms > 1000.0) ms = 1000.0;           // 1 秒以上没有意义，只会让人以为坏了
+    gMinReadIntervalMs = ms;
 }
 
 - (void)acceptForeignFrame:(const unsigned char *)gray width:(int)w height:(int)h
@@ -478,9 +564,10 @@ static void AMCaptureStoreGray(const unsigned char *gray, int w, int h)
 
 #pragma mark - 被 hook 方法的计数
 
-// presentRenderbuffer 的调用计数：在交换后的实现里自增会递归，所以在 hook 里直接加。
-// 这里用一个 C 函数暴露给 hook 用（放在最后，避免上面的 @implementation 里出现未声明符号）。
-void AMCaptureNotePresent(void)
-{
-    __atomic_fetch_add(&gPresentCalls, 1ull, __ATOMIC_RELAXED);
-}
+/* AMCaptureNotePresent() 的定义在文件前部的「hook 实现」一节里（必须在调用点之前，
+   否则 C99 下是隐式声明）。原来放在这里，是第一次真实 iOS 编译报出来的两个错误之一。 */
+
+/* 关掉本文件的 -Wdeprecated-declarations（见文件顶部 push 处的说明）。文件末尾 pop 一次，
+   保证诊断状态不会泄漏给同一 TU 里可能追加的任何内容。 */
+#pragma clang diagnostic pop
+
