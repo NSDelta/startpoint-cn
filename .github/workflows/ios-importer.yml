@@ -250,6 +250,58 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      # 兜底通道（不依赖 release 权限）：把产物提交到一次性分支，raw 直链即可匿名取回。
+      - name: 推送产物到分支（raw 直链，无需 release 权限）
+        if: always()
+        run: |
+          set +e
+          set -uo pipefail
+          DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "没有产物（编译未通过），跳过分支推送"
+            exit 0
+          fi
+          branch="cdn-artifacts/${{ github.run_id }}"
+          repo_dir="$RUNNER_TEMP/artifacts-repo"
+          rm -rf "$repo_dir"
+          mkdir -p "$repo_dir"
+          cp "$DYLIB" "$repo_dir/CdnImporter.dylib"
+          if [ -f "$RUNNER_TEMP/clang.log" ]; then cp "$RUNNER_TEMP/clang.log" "$repo_dir/clang.log"; fi
+          if [ -f "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" ]; then
+            cp "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" "$repo_dir/inject-report.json"
+          fi
+          SHA="$(shasum -a 256 "$DYLIB" | awk '{print $1}')"
+          {
+            echo "run=${{ github.run_id }}"
+            echo "sha=$GITHUB_SHA"
+            echo "patch_base=$PATCH_BASE"
+            echo "dylib_bytes=$(stat -f "%z" "$DYLIB")"
+            echo "dylib_sha256=$SHA"
+          } > "$repo_dir/meta.txt"
+          remote="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          push_ok=0
+          (
+            cd "$repo_dir" || exit 1
+            git init -q -b "$branch" || exit 1
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A || exit 1
+            git commit -q -m "cdn-importer artifacts: run ${{ github.run_id }}" || exit 1
+            git push --force "$remote" "HEAD:refs/heads/$branch"
+          ) && push_ok=1
+          if [ "$push_ok" = "1" ]; then
+            echo "::notice title=artifact-branch::https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$branch/CdnImporter.dylib （sha256 $SHA）"
+          else
+            echo "::warning title=artifact-branch-failed::分支推送失败（见上方 git 输出）"
+          fi
+          # 自清理：只保留本次的产物分支（当前链接失效前请先下载）
+          git ls-remote --heads "$remote" 'refs/heads/cdn-artifacts/*' | awk '{print $2}' | sed 's#refs/heads/##' \
+            | while IFS= read -r old; do
+                if [ -z "$old" ] || [ "$old" = "$branch" ]; then continue; fi
+                git push "$remote" --delete "$old" && echo "已删除旧产物分支：$old"
+              done
+          exit 0
+
       # artifact 下载必须带 token；release 资产对公开仓库是匿名可取的 ⇒ 同一次构建同时发一份到 release。
       - name: 发布到 release（滚动标签，公开可匿名下载）
         if: always()
@@ -322,8 +374,8 @@ jobs:
           fi
 
           # gh 失败（token 权限/gh 行为差异等）⇒ 退回 REST API，用一次性标签（不需要覆盖逻辑）
-          echo "::notice title=release-rest-fallback::改走 REST 回退，标签 $FALLBACK_TAG"
           FALLBACK_TAG="cdn-importer-run-${{ github.run_id }}"
+          echo "::notice title=release-rest-fallback::改走 REST 回退，标签 $FALLBACK_TAG"
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           curl -sS -X POST \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
