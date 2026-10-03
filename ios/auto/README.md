@@ -31,6 +31,7 @@ core/                 引擎（纯 C99，无平台依赖）
   am_json.[ch]        两趟扫描、零中间 malloc 的 JSON 解析器
   am_container.[ch]   ZIP（stored + deflate）读取 + PNG 解码（只接受 8 位真彩）
   am_fft.[ch]         混合基 / radix-2 FFT（互相关用）
+  am_fft_accel.c      FFT 的 Accelerate/vDSP 后端（iOS 性能路径；非 Apple 平台退化成空实现）
   auto_match.[ch]     NCC 模板匹配（FFT 实现），逐位对齐 OpenCV 的 TM_CCOEFF_NORMED
   auto_script.[ch]    .auto 模型层：模板组 / 变量 / 场景 / 条件 / 动作 + 变体选择 + 坐标适配
   auto_engine.[ch]    执行引擎：条件折叠 / 场景派发 / 超时 / 动作执行 / 点击取点
@@ -50,7 +51,7 @@ dylib/                交付物②：非越狱注入单个 App 的 dylib（Theos
   tools/make-fake-dylib.mjs  造无代码 Mach-O，验证注入器的头部算术
 
 tests/                七套测试（MSVC，见 §3）；build/ 与 decomp/ 都不入库
-  test_fft.c          119 例：与直接 DFT 逐元素对拍 + 卷积定理 + next_fast_size
+  test_fft.c          125 例（含 [6] 加速后端一致性 6 例）：与直接 DFT 逐元素对拍 + 卷积定理 + next_fast_size
   test_json.c          84 例：JSON 解析（含畸形输入与错误偏移）
   test_matcher.c       13 例：9 个正样本
   test_matcher_neg.c   18 例：错配峰值上界 0.422071（sim 0.80，余量 0.378）
@@ -97,7 +98,7 @@ cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher_neg.exe /Fo
 运行（**参数是夹具目录，不是可选的 —— 少传会静默少跑用例**）：
 
 ```powershell
-tests\build\test_fft.exe          # 119 passed, 0 failed
+tests\build\test_fft.exe          # 125 passed, 0 failed
 tests\build\test_json.exe         matcher_golden_pkg       #  84 passed, 0 failed
 tests\build\test_matcher.exe      matcher_golden           #  13 passed, 0 failed
 tests\build\test_matcher_neg.exe  matcher_golden_neg       #  18 passed, 0 failed
@@ -106,7 +107,15 @@ tests\build\test_package.exe      matcher_golden_pkg       # 21 passed, 0 failed
 tests\build\test_engine.exe       matcher_golden_pkg\pkg   # 60 passed, 0 failed（★ 少传 \pkg => 36 passed, 1 failed）
 ```
 
-**合计 371 例，全部 0 failed、零 warning。**
+**合计 377 例，全部 0 failed、零 warning。**
+
+> **`test_fft` 从 119 涨到 125 的原因**：新增 `[6] 加速后端一致性` 段（6 例）。
+> 它用**与实现无关的不变量**（零频率分量 == 逐元素和、单位冲激 ⇒ 全 1、
+> Parseval、逆→正往返）校验 DFT，所以既能在 Windows 上量标量路径，也能在
+> macOS/CI 上量 vDSP 路径 —— 不能拿标量版当参考实现，因为 CI 上标量版
+> 根本不会被调用。段尾还有一条断言专门查「Accelerate 可用时是否真走了 vDSP」，
+> 忘了加 `-DAM_FFT_ACCELERATE=1` 会让那一整段变成「自己跟自己对」，
+> 那条断言会把它抓成 CI 变红。
 
 > **四个坑**：
 > ① `golden_cases.h` / `golden_neg_cases.h` / `golden_pkg_cases.h` **不在 `tests\` 里**，
@@ -120,7 +129,7 @@ tests\build\test_engine.exe       matcher_golden_pkg\pkg   # 60 passed, 0 failed
 > ④ 编译过一次之后别忘了 `tests\build\` 是 gitignore 的：换个 shell 可能跑到**旧二进制**。
 > 拿不准就先 `Remove-Item -Recurse tests\build`。
 
-工作流里的这些 `"119 passed"` 之类模式可用 `node tools/check-test-patterns.mjs .` 核对
+工作流里的这些 `"125 passed"` 之类模式可用 `node tools/check-test-patterns.mjs .` 核对
 （模式写错会让 CI 的某一格永远通过或永远失败，而在日志里只是一行字）。
 
 ### 3.1 iOS 侧（CI）
@@ -132,6 +141,8 @@ node tools\lint-workflow.mjs ..\..\.github\workflows\ios-autoclick.yml  # 工作
 node tools\selftest-check-objc.mjs .   # ★ 先证明检查器自己有效
 node tools\check-objc.mjs .            # 再拿它查真代码
 ```
+（第三道 `sh tools/tsan-sanitize.sh` 只在 macOS / Git-bash 下能跑，它验证**注解通道的
+净化器**是否还有效 —— 见 §6 里「注解文本会被回灌成 shell」那条。）
 
 `check-objc.mjs` **不是编译器**（不做类型检查），只做三件能在本机抓住的事：
 ① 结构配平（`@interface`/`@implementation`/`@protocol` 与 `@end`、括号、CRLF）；
@@ -145,7 +156,7 @@ node tools\check-objc.mjs .            # 再拿它查真代码
 > ⇒ 替换没生效 ⇒ 报 "MISS"。**探针本身也要有判据。**
 
 推送到 `ios/auto/**` 或手动触发 `.github/workflows/ios-autoclick.yml`：2×2 矩阵
-（`tweak|dylib` × `rootless|rootful`），除编译外还跑上面 371 例并**逐个校验 `"N passed"` 数值**
+（`tweak|dylib` × `rootless|rootful`），除编译外还跑上面 377 例并**逐个校验 `"N passed"` 数值**
 （只看退出码会漏掉"少跑了一半用例"），再对产物做结构断言 ——
 `lipo -info` 必须 arm64、tweak 必须 `nm -u` 到 `_MSHookMessageEx`（证明 logos 展开了）、
 dylib **绝不能**出现 `MSHook*` 符号（非越狱 App 里会 dyld 报错）、
@@ -239,6 +250,51 @@ python coord_model.py                         # 复算点击点模型（cv2 参�
   **运行行为只能在真机上验**。不要把"CI 绿了"当成"能跑"。
   没有调试器时的越界定位手段是 `tests/pg_guard.[ch]`（页守护分配器）；
   验证它自己是否可信，要先同时对**一个合法用例**和**一个非法用例**跑一遍。
+  `tools/check-objc.mjs` / `selftest-check-objc.mjs` 只是结构体检，**对真实编译错误
+  一个都报不出来**（要复现需要「A.h 被 B.m 第 N 行 include」这种 TU 上下文）——
+  它们的价值是抓住手误，不是替代编译器。
+- **vDSP 必须用 Double 那一套**：`DSPDoubleSplitComplex` + `vDSP_ctozD` / `vDSP_ztocD` /
+  `vDSP_fft_zipD` + `vDSP_create_fftsetupD`。数据是 `double`，用单精度的
+  `DSPSplitComplex` 只会得到 `-Wincompatible-pointer-types` 三条**警告**（不是错误！），
+  而它的 `realp/imagp` 是 `float *` ⇒ 步长按 4 字节算 ⇒ **vDSP 读到的是垃圾**。
+  Apple 侧的警告不是噪音，见 `core/am_fft_accel.c` 顶部注释。
+- **`clang: error: no such file or directory: 'core/xxx.c'` = 新文件没进推送**。
+  `ci-push.mjs` 用 `git stash create` 取快照，而它**只收已跟踪文件的改动** ——
+  新写的、还没 `git add` 的源文件根本不在里面。现在有两道防线：
+  推送前自动把 `--others` 的新文件收进树，推送后做**双向**回读校验
+  （既查"远端那份对不对"，也查"本地源文件一个不缺"）。
+- **判据要抄就抄零份**：`tools/check-test-patterns.mjs` 原来另抄了一张用例数表，
+  于是它自己成了第三个要同步的地方（`test_fft` 119→125 时它反而报错）。
+  现在它**从工作流现读** `run <exe> "<dir>" "<N passed>"`。
+  同理：**用例数变少先怀疑夹具路径**（`test_engine` 少传 `\pkg` 会静默跳过 24 例、
+  变成 36 passed），**文件数变少则先怀疑新文件没进快照**。
+- **诊断/取证步骤绝不允许把 job 判红**。GitHub Actions 的默认 shell 是 `bash -e`，
+  形如 `[ 条件 ] && 动作` 的「守卫 && 动作」在守卫为假时整行返回 1 ⇒ **该 step failure**。
+  这个坑在本工作流里踩过三次（`emit()` 的 `&& break`、`通过性摘要` 的
+  `[ -n "$dylib" ] && echo`、`错误注解` 的 `[ A ] || echo` —— 最后一次让四条腿在
+  「编译/打包/断言全部 success」的情况下集体变红）。修法：写成 `if … then … fi`，
+  可能非 0 的命令自带 `|| true`，末尾无条件 `exit 0`。
+- **注解文本会被 GitHub 回灌成下游的 shell 脚本**。`::notice::` / `::error::` 后面的内容
+  不只是"显示"：GitHub 把它原样写进**下一步的临时脚本文件**
+  （`/Users/runner/work/_temp/<uuid>.sh`），于是它**就是 shell 源码**。第 15 次 CI 的
+  `15.错误注解 = failure` 就是这么来的 —— deb 断言步骤 `cat` 过一个 binary plist 进
+  `build.log`，注解通道把含 `$Binary` 的那一行原样发了出去 ⇒ `Binary: unbound variable`
+  ⇒ 脚本带 1 退出，**而真正的构建其实是全绿的**（编译、打包、两条断言全部 success）。
+  **两道防线都要有**：① 源头 —— 凡是会进 `build.log` 的二进制都换成文本
+  （`python3 -c 'import plistlib…'`，失败退回 `strings | head`）；② 出口 —— 注解前逐行
+  `sanitize()`（去 NUL/控制字符/反斜杠 → 只留可打印 ASCII → 把 `$ \` [ ] * ?` 换成 `?`）。
+  `tools/tsan-sanitize.sh` 是这条净化链的自检：要求「原样文本**确实**报
+  `unexpected EOF`」（阳性对照）**并且**「净化后不但不报错、注入的命令也确实没被执行」
+  （用 `id` 的输出当哨兵，再配一个「把 `id` 放行首必须真的执行」的阳性对照）。
+  ⚠️ `sanitize()` 里**不要写反斜杠**：`tr '$`[]*?\' '…'` 末尾的裸反斜杠会让 GNU tr 警告
+  `an unescaped backslash at end of string is not portable`，而 BSD tr（macOS）的解释
+  未定义 —— 反斜杠改用八进制 `\134` 在**删除**那一步处理掉。
+- **GitHub 的 job 级日志 API 是能用的**（之前记的"匿名 403"只针对 `runs` 端点）：
+  `GET /repos/<owner>/<repo>/actions/runs/<run_id>/jobs` 拿 `steps[].conclusion` 与 `job.id`，
+  再 `GET /repos/<owner>/<repo>/actions/jobs/<job_id>/logs` 取完整控制台日志（带 BOM，
+  行首有时间戳）。**定位失败步骤优先走这两条**，不必每次都 fetch `ci-diag` 分支。
+  PowerShell 5.1 读 UTF-8 的 YAML 要用 `[System.IO.File]::ReadAllLines()` ——
+  `Get-Content` 会按 GBK 解码，中文行匹配必然失配。
 
 ---
 

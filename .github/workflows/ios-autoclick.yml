@@ -2,7 +2,7 @@
 #
 # 为什么必须在这里编译：开发机是 Windows，没有 clang/Xcode/Theos，也没有 WSL。
 # 本工作流同时承担**iOS 平台层唯一的编译验证**（ios/auto/ios/*.m 在本机从未编过）
-# 与 **core 的交叉编译器验证**（同一份 C99 在 clang 下再跑一遍 371 个用例）。
+# 与 **core 的交叉编译器验证**（同一份 C99 在 clang 下再跑一遍 377 个用例）。
 #
 # ── 三条诊断通道（都不需要仓库凭据即可读回）──────────────────────────────
 #   ① refs/heads/ci-diag/<run_id>/<leg>   完整构建日志 + meta.txt
@@ -53,12 +53,18 @@ jobs:
           uname -m
           clang --version
 
-      - name: 安装 ldid / xz
+      - name: 安装 ldid / xz / dpkg
         run: |
-          set -euo pipefail
-          brew install ldid xz || true
+          set -uo pipefail
+          # 这一步不进 build.log 的话，远端看不到 brew 到底装成了什么。
+          {
+          brew install ldid xz dpkg || true
           which ldid || brew link --overwrite ldid || true
           ldid -h >/dev/null || true
+          # 报出来（进 build.log 才算数）
+          echo "dpkg-deb  -> $(command -v dpkg-deb || echo '缺失')"
+          echo "dpkg      -> $(command -v dpkg || echo '缺失')"
+          } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       - name: 克隆 Theos
         run: |
@@ -88,12 +94,16 @@ jobs:
           # 一个"什么都报不出来"的检查器与"代码很干净"在输出上无法区分。
           node tools/selftest-check-objc.mjs .
           node tools/check-objc.mjs .
+          # 同上：注解通道的净化器（step「错误注解」里的 sanitize）也要自证有效。
+          # 它坏掉的后果是**整条腿变红而构建其实是全绿的** —— 第 15 次 CI 就是
+          # `Binary: unbound variable`。这个探针同时验证「原样文本确实会炸」。
+          sh tools/tsan-sanitize.sh
 
       # ── core 的编译 + 回归（跨编译器验证）────────────────────────────────
-      # 这 371 个用例平时在 Windows/MSVC 上跑。clang 下再跑一遍能同时抓到两类问题：
+      # 这 377 个用例平时在 Windows/MSVC 上跑。clang 下再跑一遍能同时抓到两类问题：
       #   · core 里 MSVC 容忍而 clang 不容忍的写法（隐式声明、窄化、变长数组…）
       #   · golden 夹具在两套浮点/整型规则下是否给出同样的峰值
-      # 期望值来自本机 MSVC 实测：119/84/56/13/18/21/60。计数对不上就失败 ——
+      # 期望值来自本机 MSVC 实测：125/84/56/13/18/21/60。计数对不上就失败 ——
       # 用例数变少同样意味着有东西没编进去。
       - name: core 编译（clang，-Wall -Wextra）
         run: |
@@ -101,40 +111,65 @@ jobs:
           cd ios/auto
           mkdir -p tests/build
           INC="-Icore -Itests -Imatcher_golden -Imatcher_golden_neg -Imatcher_golden_pkg"
-          CORE="core/auto_script.c core/am_json.c core/am_container.c core/auto_match.c core/am_fft.c"
+          CORE="core/auto_script.c core/am_json.c core/am_container.c core/auto_match.c core/am_fft.c core/am_fft_accel.c"
           CF="-std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -D_CRT_SECURE_NO_WARNINGS"
+          # ★ macOS 上**必须**打开 AM_FFT_ACCELERATE 并链 Accelerate：
+          #   core/am_fft_accel.c 的 vDSP 分支只在 iOS/macOS 上编得出来，而它是
+          #   真机性能的关键路径（标量 C 实测比 30 ms 预算慢 4.26 倍）。
+          #   不打开的话 test_fft 的 [6] 段会退化成「自己跟自己对」——
+          #   那一段里有一条断言专门查这件事，所以忘掉的后果是**当轮 CI 变红**，
+          #   而不是悄悄少测一截。
+          CF="$CF -DAM_FFT_ACCELERATE=1"
+          LD="-framework Accelerate"
           : > "$RUNNER_TEMP/build.log"
           for t in test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine; do
             extra=""
             [ "$t" = "test_engine" ] && extra="core/auto_engine.c"
             echo "=== clang $t" | tee -a "$RUNNER_TEMP/build.log"
             # shellcheck disable=SC2086
-            clang $CF $INC -o "tests/build/$t" "tests/$t.c" $CORE $extra 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+            clang $CF $INC $LD -o "tests/build/$t" "tests/$t.c" $CORE $extra 2>&1 | tee -a "$RUNNER_TEMP/build.log"
           done
 
-      - name: core 回归（371 例，计数硬校验）
+      - name: core 回归（377 例，计数硬校验）
         run: |
-          set -euo pipefail
+          # ★ 整段包进花括号 + tee（第 13 次 CI 的教训）：本步骤的 stdout **不在**
+          #   ci-diag/*/build.log 里，而 job 日志 API 需要更高权限 —— 于是远端只能
+          #   看到「这一步 failure」，连哪个用例、哪个期望值都对不上都不知道。
+          #   「把 info 打出来」和「把 info 打进唯一可读的那条通道」是两件事。
+          #   注意这里**不用 set -e**：run() 自己判返回码，用 -e 的话第一条失败就
+          #   整段退出，后面六套的输出全丢。rc 由 bad() 累计、最后显式 exit $rc。
+          set -uo pipefail
           cd ios/auto
+          {
+          rc=0
+          bad() { echo "::error::$1"; rc=1; }
           # 用例名 : 夹具目录参数 : 期望的 "N passed" 行
           run() {  # $1=exe $2=dir $3=期望
-            local exe="$1" dir="$2" want="$3" out rc
-            out=$(./tests/build/"$exe" $dir 2>&1); rc=$?
-            echo "$out" | tail -3
+            local exe="$1" dir="$2" want="$3" out got
+            out=$(./tests/build/"$exe" $dir 2>&1); local r=$?
+            got=$(printf '%s\n' "$out" | grep -oE '[0-9]+ passed' | tail -1)
+            echo "--- $exe (dir='$dir') rc=$r got='${got:-无}' want='$want'"
             if [ "$want" != "-" ]; then
-              echo "$out" | grep -q "$want" || { echo "::error::$exe 期望 '$want' 但没出现（rc=$rc）"; return 1; }
+              # 只在没命中时才把尾巴打出来 —— 命中时日志短，出问题时日志全。
+              printf '%s\n' "$out" | grep -q "$want" || {
+                echo "$out" | tail -12
+                bad "$exe 期望 '$want' 但没出现（rc=$r，实际 '$got'）"; return 1; }
             fi
-            [ "$rc" -eq 0 ] || { echo "::error::$exe 退出码 $rc"; return 1; }
+            [ "$r" -eq 0 ] || { echo "$out" | tail -12; bad "$exe 退出码 $r"; return 1; }
             return 0
           }
-          run test_fft          ""                    "119 passed"
-          run test_json         "matcher_golden_pkg"  "84 passed"
-          run test_script       "matcher_golden_pkg/pkg" "56 passed"
-          run test_matcher      "matcher_golden"      "13 passed"
-          run test_matcher_neg  "matcher_golden_neg"  "18 passed"
-          run test_package      "matcher_golden_pkg"  "21 passed"
-          run test_engine       "matcher_golden_pkg/pkg" "60 passed"
-          echo "core 回归全部通过（371 例）"
+          # ★ 这里的数值是承重的：test_engine 少传 \pkg 会因为「夹具目录里没东西」
+          #   静默跳过 24 个用例（36 passed），只看退出码是看不出来的。
+          run test_fft          ""                    "125 passed" || true
+          run test_json         "matcher_golden_pkg"  "84 passed"  || true
+          run test_script       "matcher_golden_pkg/pkg" "56 passed" || true
+          run test_matcher      "matcher_golden"      "13 passed" || true
+          run test_matcher_neg  "matcher_golden_neg"  "18 passed" || true
+          run test_package      "matcher_golden_pkg"  "21 passed" || true
+          run test_engine       "matcher_golden_pkg/pkg" "60 passed" || true
+          if [ "$rc" -eq 0 ]; then echo "core 回归全部通过（377 例）"; fi
+          exit $rc
+          } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       # ── 交付物 ①/②：Theos 编译 ──────────────────────────────────────────
       - name: 构建 ${{ matrix.pkg }}
@@ -163,63 +198,170 @@ jobs:
       - name: 产物结构断言
         working-directory: ios/auto/${{ matrix.pkg }}
         run: |
-          set -euo pipefail
-          echo "=== .theos/obj 树"
-          find .theos/obj -name '*.dylib' | sort
-          dylib=$(find .theos/obj -name '*.dylib' | head -1)
-          [ -n "$dylib" ] || { echo "::error::没有产出任何 .dylib"; exit 1; }
+          #
+          # 为什么把整段包进 `{ … } | tee -a "$RUNNER_TEMP/build.log"`：
+          # 断言步骤的 stdout **不在** ci-diag 分支的 build.log 里 —— build.log 只收
+          # 被 `tee` 过的那几步（core 编译 / core 回归 / 构建 / 打包）。而 job 日志
+          # API 要更高权限（匿名 403），check-run 注解对本机的 PAT 也取回来是空的。
+          # 于是"断言失败了"这一条到了我这边就只剩「这一步 failure」，
+          # 具体是哪一条断言、真实输出长什么样，全都看不到 —— 只能靠猜。
+          # 包一层 tee 之后，取证信息就落进唯一可读的那条通道了。
+          #
+          # 顺带：**不要 `set -e`**。断言失败时我们要先把取证信息全打出来再退出；
+          # `set -e` 会让 bash 在第一条失败的 grep 上立刻退出，上面的目的就落空了。
+          # 判据仍然严格：rc 从 0 起，任何一条不满足就置 1，最后显式 exit。
+          # （`set -o pipefail` 保证 `{ … } | tee` 这条管道的退出码来自 `{ … }`。）
+          #
+          set -uo pipefail
+          {
+          rc=0
+          bad() { echo "::error::$1"; rc=1; }
+          echo "=== uname / xcode"
+          uname -a
+          echo "=== pwd 与顶层目录（确认工作目录就是工程目录）"
+          pwd
+          ls -la
+          echo "=== 工具在不在"
+          for t in lipo otool nm file dpkg-deb find sort head; do
+            command -v "$t" >/dev/null 2>&1 && echo "  ok  $t -> $(command -v "$t")" || echo "  ✗ 缺 $t"
+          done
+          xcodebuild -version 2>/dev/null | head -2 || true
+          echo "=== .theos 树（前 60 行）"
+          find .theos 2>/dev/null | sort | head -60 || echo "（没有 .theos 目录）"
+          echo "=== 所有 Mach-O 候选（*.dylib / 无扩展名的可执行）"
+          find .theos \( -name '*.dylib' -o -name '*.a' -o -name '*.o' \) 2>/dev/null | sort | head -40 || true
+          dylib=$(find .theos -name '*.dylib' | head -1)
+          if [ -z "$dylib" ]; then
+            bad "没有产出任何 .dylib"
+            echo "=== 断言到此结束 rc=1"
+            exit 1
+          fi
+          echo "=== 产物：$dylib"
           ls -l "$dylib"
           file "$dylib"
           echo "=== 架构必须是 arm64"
-          lipo -info "$dylib" | grep -q arm64 || { echo "::error::不是 arm64：$(lipo -info "$dylib")"; exit 1; }
+          lipo -info "$dylib"
+          lipo -info "$dylib" | grep -q arm64 || bad "不是 arm64：$(lipo -info "$dylib")"
           echo "=== otool -L（确认链了什么）"
           otool -L "$dylib"
+          echo "=== 未定义符号（前 60 条）"
+          nm -u "$dylib" | head -60 || true
           if [ "$PKG" = "tweak" ]; then
             # 越狱版：必须有 substrate 依赖，且**不能**链 substrate 本身
             # （它是 Tweak.x 的 %hook 展开依赖，由宿主进程提供）。
             echo "=== tweak：确认 Tweak.x 的 logos 展开真的进来了"
-            nm -u "$dylib" | grep -q '_MSHookMessageEx' \
-              || { echo "::error::tweak 里没有 _MSHookMessageEx —— %hook 没被展开，Tweak.x 可能没编进去"; exit 1; }
+            if nm -u "$dylib" | grep -q '_MSHookMessageEx'; then
+              echo "ok: 找到 _MSHookMessageEx"
+            else
+              bad "tweak 里没有 _MSHookMessageEx —— %hook 没被展开，Tweak.x 可能没编进去"
+            fi
           else
             # 非越狱版：**绝不能**引用 substrate（App 进程里没有 libsubstrate/ellekit）。
-            if nm -u "$dylib" | grep -qE 'MSHookMessageEx|MSHookFunction|_MSGetImageByName'; then
-              echo "::error::dylib 引用了 substrate 符号 —— 在非越狱 App 里会 dyld 报错"
-              nm -u "$dylib" | grep -E 'MSHook|_MSGet' || true
-              exit 1
+            echo "=== dylib：确认没有 substrate 符号"
+            hits=$(nm -u "$dylib" | grep -E 'MSHookMessageEx|MSHookFunction|_MSGetImageByName' || true)
+            if [ -n "$hits" ]; then
+              echo "$hits"
+              bad "dylib 引用了 substrate 符号 —— 在非越狱 App 里会 dyld 报错"
+            else
+              echo "ok: 没有 substrate 符号"
             fi
             echo "=== dylib：确认没有 %hook 展开（应为空）"
-            if grep -qE '%hook|%orig|MSHook' dylib.x; then
-              echo "::error::dylib.x 里出现 logos 宏 —— 非越狱侧不能用"
-              exit 1
+            # 不能直接 grep 源码 —— dylib.x 的注释里就写着「%hook / %orig 不能用」，
+            # 第 9 次 CI 正是被这句注释误判成红（真正的 logos 宏在明文注释里找不到，
+            # 去掉注释再查才是真的在查宏）。这里用 clang 自己预处理一份再查。
+            # 用 printf 造一份「注释已剥离」的副本，再用 clang -E 预处理，最后查真宏。
+            # 不直接 grep 源码的理由：dylib.x 的注释里就写着「%hook / %orig 不能用」，
+            # 第 9 次 CI 正是被这句注释误判成红。多行命令统一用 printf 拼，
+            # 避免行尾续行符（本工作流的缩进体检会把它当成缩进异常）。
+            printf '%s\n' "sed -E 's://.*\$::' dylib.x > \"\$RUNNER_TEMP/dylib.nowx\"" "clang -E -P -x objective-c -I\"\$GITHUB_WORKSPACE/ios/auto/core\" -I\"\$GITHUB_WORKSPACE/ios/auto/ios\" \"\$RUNNER_TEMP/dylib.nowx\" > \"\$RUNNER_TEMP/dylib.pre\" 2>/dev/null" > "$RUNNER_TEMP/nologos.sh"
+            if bash "$RUNNER_TEMP/nologos.sh" && [ -s "$RUNNER_TEMP/dylib.pre" ]; then
+              if grep -nE 'MSHook|_logos_|%hook|%orig' "$RUNNER_TEMP/dylib.pre"; then
+                bad "dylib.x 预处理后仍出现 logos 宏 —— 非越狱侧不能用"
+              else
+                echo "ok: dylib.x 预处理干净（注释已剥离，查的是真宏）"
+              fi
+            else
+              echo "clang -E 预处理失败，退回按行查（跳过注释行）"
+              if grep -nE '%hook|%orig|MSHook' dylib.x | grep -vE '^[0-9]+: *(//|\*|/\*)'; then
+                bad "dylib.x 里出现 logos 宏 —— 非越狱侧不能用"
+              else
+                echo "ok: dylib.x 干净（无注释行命中）"
+              fi
             fi
           fi
+          echo "=== 断言结束 rc=$rc"
+          exit $rc
+          } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       - name: deb 结构断言（仅 tweak）
         if: matrix.pkg == 'tweak'
         working-directory: ios/auto/tweak
         run: |
-          set -euo pipefail
-          deb=$(ls packages/*.deb | head -1)
-          [ -n "$deb" ] || { echo "::error::没有产出 .deb"; exit 1; }
+          # 同「产物结构断言」：整段包进 tee 才会落进 ci-diag 的 build.log，
+          # 并且不用 `set -e`（先取证再退出）。理由见上面那一步的长注释。
+          set -uo pipefail
+          {
+          rc=0
+          bad() { echo "::error::$1"; rc=1; }
+          echo "=== 工具在不在（dpkg-deb 缺失会让下面的 lst 变成空串，必须在这里看出来）"
+          for t in dpkg-deb dpkg ar tar; do
+            command -v "$t" >/dev/null 2>&1 && echo "  ok  $t -> $(command -v "$t")" || bad "缺 $t"
+          done
+          echo "=== packages/ 里的东西"
+          ls -l packages/ 2>/dev/null || echo "（没有 packages/ 目录）"
+          echo "=== 整个工程目录里所有 .deb"
+          find . -name '*.deb' 2>/dev/null | sort
+          deb=$(find . -name '*.deb' | head -1)
+          if [ -z "$deb" ]; then
+            bad "没有产出 .deb"
+            exit 1
+          fi
           echo "=== $deb"
+          ls -l "$deb"
+          echo "=== dpkg-deb -I"
           dpkg-deb -I "$deb"
           echo "=== 内容清单"
           dpkg-deb -c "$deb"
-          # 过滤器 plist 必须和 dylib 同目录 —— 少了它 substrate 不知道往哪个进程注入。
           lst=$(dpkg-deb -c "$deb")
-          echo "$lst" | grep -q 'AMAutoClick\.dylib' || { echo "::error::deb 里没有 AMAutoClick.dylib"; exit 1; }
-          echo "$lst" | grep -q 'AMAutoClick\.plist' || { echo "::error::deb 里没有过滤器 plist"; exit 1; }
+          # 过滤器 plist 必须和 dylib 同目录 —— 少了它 substrate 不知道往哪个进程注入。
+          # 这一条是**真找到过 bug 的**：第 11 次 CI 之前 tweak/Makefile 用的是 library.mk，
+          # 而只有 instance/tweak.mk 有拷贝过滤器 plist 的规则 ⇒ 构建成功、deb 也出得来、
+          # 里面却只有 dylib。真机表现是「装上了什么都不发生」，无任何报错。
+          echo "$lst" | grep -q 'AMAutoClick\.dylib' || bad "deb 里没有 AMAutoClick.dylib"
+          echo "$lst" | grep -q 'AMAutoClick\.plist' || bad "deb 里没有过滤器 plist（tweak/Makefile 得用 tweak.mk）"
+          # ★ 路径前后缀：实测（第 12 次 CI 的 hint 里那条 `::error` 是误报）——
+          # dpkg-deb -c 把 `./` **吃掉了**，输出形如
+          #     drwxr-xr-x root/wheel 0 … var/jb/Library/MobileSubstrate/…
+          # 既不是 `/var/jb/`（第一版，锚在开头 ⇒ 永远不匹配）也不是 `./var/jb/`
+          # （第二版，同样不匹配）。可靠的口径是「前面是行首或空白」：
           if [ -n "$SCHEME" ]; then
-            echo "$lst" | grep -q '/var/jb/' \
-              || { echo "::error::rootless 构建的 deb 里没有 /var/jb/ 前缀"; exit 1; }
-            echo "rootless：安装路径已落在 /var/jb/"
+            echo "$lst" | grep -qE '(^|[[:space:]])var/jb/' || bad "rootless 构建的 deb 里没有 /var/jb/ 前缀"
+            # 反向也判一次：rootless 的 deb 里不该出现「裸的」Library/MobileSubstrate
+            # （那说明 Theos 的 scheme 没生效，装到越狱设备上会落到根文件系统）。
+            # ★ 这条必须锚在「行首或空白」，否则会命中 var/jb/Library/MobileSubstrate。
+            if echo "$lst" | grep -qE '(^|[[:space:]])Library/MobileSubstrate/'; then
+              bad "rootless 构建里出现了不带 /var/jb 前缀的 /Library/MobileSubstrate"
+            fi
+            echo "  ok  rootless 的安装路径都带 var/jb 前缀"
           fi
           # 过滤器内容必须是目标 bundle id（写错就是"装上了但什么都不发生"）。
           tmp=$(mktemp -d); dpkg-deb -x "$deb" "$tmp"
+          echo "=== 解包后的文件树"
+          find "$tmp" -type f | sort
           plist=$(find "$tmp" -name 'AMAutoClick.plist' | head -1)
-          echo "=== $plist"
-          cat "$plist"
-          grep -q 'com.leiting.wf' "$plist" || { echo "::error::过滤器里没有目标 bundle id"; exit 1; }
+          echo "=== $plist（下面用 python 打成文本；**不要 cat**，它是 bplist00 二进制）"
+          # ★ 为什么要绕这一下（第 15 次 CI 的真实教训）：这一段的 stdout 经 tee 进
+          #   build.log，而 step「错误注解」会把 build.log 的每行原样发成 `::notice`。
+          #   GitHub 再把注解文本回灌进下一步的临时脚本 —— 于是 binary plist 里的
+          #   `$Binary` 变成了 shell 的未定义变量，`set -u` 下整条腿判红
+          #   （`line 43: Binary: unbound variable`），而真正的构建其实是全绿的。
+          #   **凡是会进 build.log 的二进制，都要在源头换成文本。**
+          python3 -c 'import plistlib,sys;print(plistlib.load(open(sys.argv[1],"rb")))' "$plist" 2>/dev/null \
+            || { echo "（python 解析失败，退回 strings 视图）"; strings "$plist" | head -20; }
+          grep -q 'com.leiting.wf' "$plist" 2>/dev/null || bad "过滤器里没有目标 bundle id"
+          echo "=== 断言结束 rc=$rc"
+          exit $rc
+          } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       # ── 诊断通道 ①：完整日志 ─────────────────────────────────────────────
       - name: 诊断日志（失败时也可无凭据取回）
@@ -314,6 +456,18 @@ jobs:
       - name: 错误注解
         if: always()
         run: |
+          # ⚠️ 这一整段是诊断，**绝不允许它把 job 判红**。
+          #
+          # 第 14 次 CI 的真实现象：编译、打包、两条结构断言全部 success，
+          # 四条腿却都挂在「15.错误注解」上，而 build.log 到「=== 断言结束 rc=0」
+          # 就结束了 —— 说明脚本在这段里带着非 0 退出码死了。
+          # 根因是下面第 456 行那种「守卫 && 动作」：`[ A ] || echo …` 在 A 成立时
+          # 整个列表返回 1，而 GitHub Actions 的默认 shell 是 `bash -e`，
+          # **最后一条命令的退出码就是这一步的退出码** ⇒ step failure。
+          # （同一个坑在本工作流的「通过性摘要」和 display 函数里各踩过一次。）
+          #
+          # 现在的原则：**这里每一条可能返回非 0 的命令都自带 `|| true`，
+          # 且末尾无条件 `exit 0`。**取证少了可以再补，把绿的 job 弄红是纯损失。
           set -uo pipefail
           if [ ! -s "$RUNNER_TEMP/build.log" ]; then
             echo "::notice title=autoclick(${LEG})::该腿未产生构建输出（编译步骤可能未开始）"
@@ -322,15 +476,46 @@ jobs:
           echo "::notice title=build.log(${LEG})::共 $(wc -l < "$RUNNER_TEMP/build.log") 行 / $(wc -c < "$RUNNER_TEMP/build.log") 字节"
           total_lines=$(wc -l < "$RUNNER_TEMP/build.log")
           max_lines=750
-          [ "$total_lines" -le "$max_lines" ] || echo "::warning title=build.log(${LEG})::日志共 ${total_lines} 行，只发前 ${max_lines} 行（其余靠 ci-diag 分支）"
+          if [ "$total_lines" -gt "$max_lines" ]; then
+            echo "::warning title=build.log(${LEG})::日志共 ${total_lines} 行，只发前 ${max_lines} 行（其余靠 ci-diag 分支）"
+          fi
           if [ "$total_lines" -le "$max_lines" ]; then emit_to=$total_lines; else emit_to=$max_lines; fi
           start=1; chunk=0
+          # ★ 净化：注解文本会被 GitHub **原样回灌进下一步的临时脚本文件**，
+          #   所以 `::notice::` 后面的字节就是下一段 shell 的源码。build.log 里
+          #   有二进制（deb 断言那段 cat 过 binary plist，含 NUL 与控制字节），
+          #   第 15 次 CI 因此死在
+          #     /Users/runner/work/_temp/<uuid>.sh: line 43: Binary: unbound variable
+          #   —— 那行二进制里恰好有 `$Binary`，在 `set -u` 下成了未定义变量，
+          #   脚本带着 1 退出，而且发生在 `exit 0` 之前。教训：
+          #   **注解通道 = 把日志当脚本喂给下游，必须先去控制字符与元字符。**
+          #
+          #   过滤分三层，每一层都由 ios/auto/tools/tsan-sanitize.sh 实测过：
+          #     ① `tr -d '\000-\010\013\014\016-\037\134'`：NUL、其它控制字符
+          #        与反斜杠（`\134`）。（**换行必须留着**，下面按行处理；行内本来
+          #        也不会有换行。）
+          #     ② `tr -cd '\040-\176'`：只留可打印 ASCII（UTF-8 中文会被去掉，
+          #        这是可接受的 —— 日志的英文部分才是要看的）
+          #     ③ `tr '$`[]*?' '??????'`：shell 元字符全部换成 `?`。少了 `[`
+          #        这一项时，`bplist00…Bundles[Executables…` 会让 bash 报
+          #        `unexpected EOF while looking for matching ]`；少了 `$` 就是
+          #        第 15 次 CI 的 `Binary: unbound variable`。
+          #     ★ 第 ③ 步**不要写反斜杠**：`tr '$`[]*?\' '…'` 末尾是裸反斜杠，
+          #       GNU tr 会警告 `an unescaped backslash at end of string is not
+          #       portable`，BSD tr（macOS）的解释未定义。反斜杠在上面第 ① 步
+          #       用 `\134` 删掉了，所以这里根本不需要它。
+          sanitize() {
+            LC_ALL=C tr -d '\000-\010\013\014\016-\037\134' | cut -c1-400 \
+              | LC_ALL=C tr -cd '\040-\176' | LC_ALL=C tr '$`[]*?' '??????'
+          }
           while [ "$start" -le "$emit_to" ]; do
-            end=$((start + 29)); [ "$end" -gt "$emit_to" ] && end=$emit_to
+            end=$((start + 29)); if [ "$end" -gt "$emit_to" ]; then end=$emit_to; fi
             chunk=$((chunk + 1))
             while IFS= read -r line; do
               [ -n "$line" ] || continue
-              printf '::notice title=build-log(%s)-%02d::%s\n' "${LEG}" "$chunk" "${line:0:400}"
+              line=$(printf '%s' "$line" | sanitize)
+              [ -n "$line" ] || continue
+              printf '::notice title=build-log(%s)-%02d::%s\n' "${LEG}" "$chunk" "$line"
             done < <(sed -n "${start},${end}p" "$RUNNER_TEMP/build.log")
             start=$((end + 1))
           done
@@ -345,8 +530,10 @@ jobs:
               from=$(( ln > ctx ? ln - ctx : 1 )); to=$(( ln + ctx ))
               while IFS= read -r line; do
                 [ -n "$line" ] || continue
+                line=$(printf '%s' "$line" | sanitize)
+                [ -n "$line" ] || continue
                 n=$((n + 1))
-                printf '::error title=%s-%02d(%s)::%s\n' "$1" "$n" "${LEG}" "${line:0:400}"
+                printf '::error title=%s-%02d(%s)::%s\n' "$1" "$n" "${LEG}" "$line"
                 [ "$n" -ge 8 ] && break
               done < <(sed -n "${from},${to}p" "$RUNNER_TEMP/build.log")
             done
@@ -354,21 +541,35 @@ jobs:
             # 会把 emit 的返回码带成 1（实测过一次，注解反而变少）。
             return 0
           }
-          emit clang-error 'error:|fatal error|no member named|no visible @interface|expected ' 6
-          [ "$n" -ge 8 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8
-          [ "$n" -ge 8 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4
+          emit clang-error 'error:|fatal error|no member named|no visible @interface|expected ' 6 || true
+          [ "$n" -ge 8 ] || emit link-error 'Undefined symbols|undefined reference|ld: |linker command failed|_OBJC_CLASS_\$_' 8 || true
+          [ "$n" -ge 8 ] || emit theos-error 'No such file or directory|missing a filter property list|is not a valid|does not exist' 4 || true
           echo "::notice title=autoclick(${LEG})::分类注解 ${n} 条"
-          exit 0
+          # 无条件 0：这一段是取证，不是门禁。`|| true` 是双保险（万一上面
+          # 又漏了一条守卫式写法）。
+          exit 0 || true
 
       - name: 通过性摘要（notice）
         if: success()
         working-directory: ios/auto/${{ matrix.pkg }}
         run: |
+          # ★ 这一整步**必须**显式 exit 0。
+          # 第 11 次 CI 的 dylib 两条腿就栽在这里：本步是 `[ -n "$dylib" ] && echo …`
+          # 这种「守卫 && 动作」的写法，守卫为假时整行返回 1，而 `set -e`（GitHub 的
+          # 默认 shell 就是 bash -e）会把这一步判成失败 —— 于是构建成功、断言 rc=0，
+          # 报出来的却是「16.通过性摘要 = failure」。教训：末尾是守卫的复合命令，
+          # 要么写成 if，要么显式 exit 0。
           set -uo pipefail
-          dylib=$(find .theos/obj -name '*.dylib' 2>/dev/null | head -1)
-          deb=$(ls packages/*.deb 2>/dev/null | head -1)
+          dylib=$(find .theos/obj -name '*.dylib' 2>/dev/null | head -1 || true)
+          deb=$(ls packages/*.deb 2>/dev/null | head -1 || true)
           echo "::notice title=autoclick(${LEG})::pkg=${PKG} scheme=${SCHEME:-rootful} dylib=${dylib:-<none>} deb=${deb:-<none>}"
-          [ -n "$dylib" ] && echo "::notice title=autoclick(${LEG})::dylib 大小 $(wc -c < "$dylib") 字节"
+          if [ -n "$dylib" ]; then
+            echo "::notice title=autoclick(${LEG})::dylib 大小 $(wc -c < "$dylib") 字节"
+          fi
+          if [ -n "$deb" ]; then
+            echo "::notice title=autoclick(${LEG})::deb 大小 $(wc -c < "$deb") 字节"
+          fi
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
