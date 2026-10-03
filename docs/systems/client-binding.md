@@ -131,8 +131,8 @@ pending ──(绑定平台成功)──▶ active
   **不经过 `src/runtime/config.ts`**（`src/lib/signup-code.ts:36-38`，契约 C9 / CC-4）。
 
 消费一个码是**单事务**的：校验 + 建绑定 + 置码为已用一起提交
-（`src/data/domains/account-binding.ts:459-466`）。失败码是给 `POST /api/bot/bind` 冻结的那一套
-（`src/data/domains/account-binding.ts:439-445`）：
+（`src/data/domains/account-binding.ts:786`，事务从 `:794` 开始）。失败码是给 `POST /api/bot/bind` 冻结的那一套
+（`src/data/domains/account-binding.ts:759-765`）：
 
 ```
 CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISABLED
@@ -143,7 +143,7 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 注册处：`src/cn-server.ts:42` 引入、`src/cn-server.ts:170`
 `fastify.register(spAuthPlugin, { prefix: "/sp-auth" })`。
 
-六条路由全部 `POST` + `application/json`（`src/routes/sp-auth/index.ts:68,73,78,83,88,93`）：
+八条路由全部 `POST` + `application/json`（`src/routes/sp-auth/index.ts:69,74,79,84,89,94,101,107`）：
 
 | 路径 | 用途 | 成功 `data` |
 | --- | --- | --- |
@@ -153,8 +153,46 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 | `POST /sp-auth/resend` | 重新发码 | `{code, code_expires_at}` |
 | `POST /sp-auth/profile` | 「我是谁」+ 绑定态 | `{viewer_id, username, bound, bind_state, platform, …}` |
 | `POST /sp-auth/logout` | 注销设备授权 | `{}` |
+| `POST /sp-auth/reset-request` | 忘记密码①：换一枚 15 分钟重置码 | `{code, expiresInSec, account}` |
+| `POST /sp-auth/reset-confirm` | 忘记密码③：改密并踢掉旧设备 | `{account}` |
 
-字段与 `data` 形状的权威定义在 `src/lib/sp-auth/contract.ts:85-135`。
+字段与 `data` 形状的权威定义在 `src/lib/sp-auth/contract.ts:94-176`。
+
+### 忘记密码：`reset-request` → `/api/bot/reset` → `reset-confirm`
+
+三步走，任何一步单独拿到都改不了密码（实现 `src/lib/sp-auth/reset.ts`）：
+
+1. `POST /sp-auth/reset-request {account}`：`account` 支持**账号名或已绑定的 QQ 号**
+   （与 `login` 同一套解析，`src/lib/sp-auth/reset.ts` 里直接调
+   `resolveAccountByLoginNameSync`）。查不到账号 ⇒ `ACCOUNT_NOT_FOUND`；
+   `bind_state !== "active"` 或没有 qq 绑定行 ⇒ `RESET_NO_QQ`；
+   同一账号 60 秒内第二次 ⇒ `RATE_LIMITED`（与 `resend` 同窗口），
+   同一 IP 60 秒内超过 10 次同样 `RATE_LIMITED`。码沿用
+   `SIGNUP_CODE_ALPHABET`（6 位、去易混淆字符），**TTL 15 分钟**
+   （`SP_AUTH_RESET_DEFAULT_CODE_TTL_MINUTES`，可用 `RESET_CODE_TTL_MINUTES` 覆盖），
+   同一账号只保留一枚有效码：新请求把旧码置 `revoked`。
+2. 群里 `POST /api/bot/reset {qq, code}`（同一 `X-Bot-Token` 鉴权）：码状态决定
+   `CODE_NOT_FOUND`（不存在/已用/已作废）、`CODE_EXPIRED`；该账号当前绑定的 QQ
+   （主绑定优先，否则最早的 qq 行）与发命令的 `qq` 不一致 ⇒ `QQ_MISMATCH`，
+   没有 qq 绑定 ⇒ `BIND_REQUIRED`。通过则把码标成 `confirmed` 并记
+   `confirmed_at` / `confirmed_qq`；重复发同一枚已确认的码是幂等的。
+3. `POST /sp-auth/reset-confirm {account, code, password}`：先按 `isStrongPassword`
+   判 `PASSWORD_WEAK`（**弱密码不消耗码、不计尝试**），再判码归属
+   （不是这个账号的 / 不存在 / 已用过 ⇒ `RESET_CODE_INVALID`）、过期
+   （⇒ `CODE_EXPIRED`）、是否已被 QQ 确认（⇒ `RESET_NOT_CONFIRMED`，并按次数
+   累加 `attempts`，连错 5 次锁成 `RATE_LIMITED`）。全部通过后
+   `hashPassword` 改 `accounts.password_hash`、码置 `used`、
+   `clearDeviceGrantsForAccountSync` 撤销该账号**全部**设备授权、删除
+   `sessions` 里那条 VIEWER 行 ⇒ 旧设备必须重新登录（存档按 `account_id`
+   关联，不会因此丢失）。
+
+落库表 `password_reset_codes(code UNIQUE, account_id, status ∈
+pending/confirmed/used/revoked, attempts, expires_at, confirmed_at, confirmed_qq,
+used_at, created_at, updated_at, revision)`，随
+`initializeAccountBindingSchemaSync` 的 `CREATE TABLE IF NOT EXISTS` 建表
+（`src/data/schema/account-binding.ts:96-113`，老库不需要升 `user_version`，
+`CURRENT_DATA_SCHEMA` 仍是 28）。重置码与密码都不进日志；审计动作用
+`reset_request` / `reset_confirm` / `reset_password` 写进 `bind_audit`。
 
 ### 响应约定（整个命名空间一致）
 
@@ -166,12 +204,14 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 - 失败（带附加数据，如 `DEVICE_TAKEN` 携带占用者）：`{ok:false, code, message, data}`
   （`src/routes/sp-auth/index.ts:40`）
 - `message` 是 C7 中文兜底话术，由 `messageFor(code)` 生成
-  （`src/routes/sp-auth/index.ts:36`；字典 `src/lib/sp-auth/contract.ts:39-54`）
+  （`src/routes/sp-auth/index.ts:36`；字典 `src/lib/sp-auth/contract.ts:47-68`）
 - **未捕获异常也不破坏 200**：`guard()` 把抛出转成 `SERVICE_UNAVAILABLE`，
   且只把错误消息写服务端日志、绝不回传请求体或堆栈
   （`src/routes/sp-auth/index.ts:48-60`）
 
-错误码全集 14 个见 `src/lib/sp-auth/contract.ts:15-30`。
+错误码全集 20 个见 `src/lib/sp-auth/contract.ts:15-38`（忘记密码新增
+`ACCOUNT_NOT_FOUND` / `RESET_NO_QQ` / `RESET_CODE_INVALID` /
+`RESET_NOT_CONFIRMED` / `CODE_NOT_FOUND` / `QQ_MISMATCH`，既有 14 个一字未改）。
 
 ### 字段规则
 
@@ -223,8 +263,8 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 
 注册处：`src/routes/web_api/index.ts:53`
 `fastify.register(botApiPlugin, { prefix: "/bot", env: options.botApiEnv })`
-⇒ 对外完整前缀 `/api/bot`。四条路由**全部是 POST**
-（`src/routes/web_api/bot.ts:299,348,372,438`）。
+⇒ 对外完整前缀 `/api/bot`。五条路由**全部是 POST**
+（`src/routes/web_api/bot.ts:325,374,398,464,516`）。
 
 | 方法 + 路径 | 用途 |
 | --- | --- |
@@ -232,6 +272,7 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 | `POST /api/bot/status` | 查某个平台身份已绑定的账号 |
 | `POST /api/bot/unbind` | 自助解绑（只能解非主绑定） |
 | `POST /api/bot/skip_chapter` | 把该身份绑定的存档推到第 N 章开头（`/skip chapter N`） |
+| `POST /api/bot/reset` | 忘记密码②：账号已绑定的 QQ 确认重置码 |
 
 ### `skip_chapter`：进度捷径
 
@@ -262,15 +303,22 @@ current_quest, finished_quests, recorded_chapters}}`。
 need_stage_node 指向上一章**最后**一个节点（第 3 章首节点依赖 `2009001..2009007`，
 即第 2 章最后一个节点）。因此「上一章全部主线已通关」是充分条件。
 
+### `reset`：忘记密码的群内确认
+
+`/sp-auth/reset-request`（用户名或已绑定的 QQ 换一枚 15 分钟重置码）之后，玩家在群里发
+`/reset <码>`：只有**已绑定该账号的那个 QQ** 能确认，因此码泄漏本身不足以接管账号。
+确认成功后 `/sp-auth/reset-confirm` 才允许改密码。13 个文件、接口与失败码见
+`src/lib/sp-auth/reset.ts` 与 `src/routes/sp-auth/index.ts`。
+
 ### 鉴权：fail-closed
 
 - 令牌来自服务端环境变量 `BOT_API_TOKEN`
-  （`src/routes/web_api/bot.ts:48-56`，缺失或全空白 ⇒ `null`）
+  （`src/routes/web_api/bot.ts:63` 的 `resolveBotApiToken`，缺失或全空白 ⇒ `null`）
 - 比较是**常数时间**的：两侧先 `sha256` 再 `crypto.timingSafeEqual`，
-  这样长度不可观测（`src/routes/web_api/bot.ts:63-68`）
+  这样长度不可观测（`src/routes/web_api/bot.ts:77-79`）
 - **env 缺失时整组 403**：`onRequest` 钩子里令牌为 `null` 直接
   `reply.status(403).send({ok:false, code:"FORBIDDEN"})`，且不区分「没带」和「带错」
-  （`src/routes/web_api/bot.ts:234,236`；响应体常量 `:36`）
+  （`src/routes/web_api/bot.ts:319,321`；响应体常量 `FORBIDDEN_BODY` 在 `:48`）
 - 这是一处刻意的 fail-closed：**没配令牌 = 整个 bot 面不可用**，而不是「无令牌放行」。
   因此 `.env.example` 里 `BOT_API_TOKEN` 默认为空串，等于默认关闭该面。
 
@@ -278,20 +326,22 @@ need_stage_node 指向上一章**最后**一个节点（第 3 章首节点依赖
 
 | 场景 | HTTP | body | 代码 |
 | --- | --- | --- | --- |
-| 令牌缺失 / 不匹配 | 403 | `{ok:false,code:"FORBIDDEN"}` | `src/routes/web_api/bot.ts:234,236` |
-| `unbind` 缺 `code` | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:319` |
-| 入参缺字段（如 platform） | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:222` |
-| `bind` 缺 code / 码格式非法 | 400 | `{ok:false,code:"CODE_INVALID"}` | `:248` |
-| `status` 无绑定 | **200** | `{ok:true,data:{bindings:[]}}` | `:306` |
-| 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:253`、`:324` |
-| 业务失败（码过期/已用/锁定/已绑定） | 200 | `{ok:false,code:<C4 码>}` | `:271`、`:328` |
-| 解绑目标不存在 / 是主绑定 | 200 | `{ok:false,code:"BINDING_NOT_FOUND"｜"PRIMARY_BINDING"}` | `:336`、`:337` |
-| `skip_chapter` 的 chapter > 12 | 400 | `{ok:false,code:"INVALID_CHAPTER"}` | `src/routes/web_api/bot.ts:450` |
-| `skip_chapter` 无绑定 / 绑定歧义 / 无存档 | 200 | `{ok:false,code:"NO_BINDING"｜"NO_PLAYER"}` | `:457`、`:459` |
+| 令牌缺失 / 不匹配 | 403 | `{ok:false,code:"FORBIDDEN"}` | `src/routes/web_api/bot.ts:319,321` |
+| `unbind` 缺 `code` | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:299`（`sendBotError` 的 `BotRequestError` 分支） |
+| 入参缺字段（如 platform） | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:299` |
+| `bind` 缺 code / 码格式非法 | 400 | `{ok:false,code:"CODE_INVALID"}` | `:333` |
+| `status` 无绑定 | **200** | `{ok:true,data:{bindings:[]}}` | `:392` |
+| 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:337`（bind）、`:409`（unbind）、`:478`（skip_chapter） |
+| 业务失败（码过期/已用/锁定/已绑定） | 200 | `{ok:false,code:<C4 码>}` | `:357`、`:414` |
+| 解绑目标不存在 / 是主绑定 | 200 | `{ok:false,code:"BINDING_NOT_FOUND"｜"PRIMARY_BINDING"}` | `:422`、`:423` |
+| `skip_chapter` 的 chapter > 12 | 400 | `{ok:false,code:"INVALID_CHAPTER"}` | `src/routes/web_api/bot.ts:476` |
+| `skip_chapter` 无绑定 / 绑定歧义 / 无存档 | 200 | `{ok:false,code:"NO_BINDING"｜"NO_PLAYER"}` | `:483`、`:485` |
+| `reset` 缺 `qq`/`code` | 400 | `{ok:false,code:"CODE_NOT_FOUND",message}` | `:524` |
+| `reset` 码不存在/过期/QQ 不符/账号没绑 QQ | 200 | `{ok:false,code:<C7 码>,message}` | `:536`、`:539`、`:542`、`:543`、`:547` |
 
 要点：**鉴权失败和参数缺失用 HTTP 状态码；业务判定失败用 200 + `code`**。
-`CODE_INVALID` 一个码同时出现在 400（格式非法）和 200（查无此码，`:197`、`:203`、
-`:208` 经 `:271` 返回）两条路径上——调用方必须同时看 HTTP 状态和 body 的 `code`。
+`CODE_INVALID` 一个码同时出现在 400（格式非法）和 200（查无此码/已撤销/平台不符，`:274`、
+`:280`、`:285` 经 `:357` 返回）两条路径上——调用方必须同时看 HTTP 状态和 body 的 `code`。
 
 `unbind` 的权限边界写在注释里：bot 自助**只能解非主绑定**，主绑定解绑需要管理员
 （`src/data/domains/account-binding.ts:695`；后台侧对应 `src/routes/web_api/binding.ts:485-486`）。

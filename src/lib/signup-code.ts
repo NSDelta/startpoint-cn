@@ -12,10 +12,11 @@
  */
 
 import {
+    createPasswordResetCodeSync,
     createSignupCodeSync,
     getActiveSignupCodeSync,
 } from "../data/domains/account-binding"
-import type { SignupCode } from "../data/types"
+import type { PasswordResetCode, SignupCode } from "../data/types"
 import { getRealNowMs } from "../runtime/time/game-time"
 import { SP_AUTH_ERROR_CODES } from "./sp-auth/contract"
 import type { SpAuthCodeView } from "./sp-auth/contract"
@@ -31,6 +32,13 @@ export const SP_AUTH_CODE_ISSUE_WINDOW_MS = 60_000
 
 /** Actor recorded in `bind_audit` for everything this API does. */
 export const SP_AUTH_AUDIT_ACTOR = "sp-auth"
+
+/**
+ * Password reset codes ("忘记密码") live 15 minutes: the player asked for one
+ * because they are sitting in the group chat right now, so the window only has
+ * to survive "open the page, send `/reset`, type a new password".
+ */
+export const SP_AUTH_RESET_DEFAULT_CODE_TTL_MINUTES = 15
 
 /**
  * Reads `SIGNUP_CODE_TTL_MINUTES` with the injectable-env pattern from
@@ -102,4 +110,32 @@ export function rateLimitRetryAfterMs(
 ): number {
     if (!lastIssuedAt) return 0
     return Math.max(0, SP_AUTH_CODE_ISSUE_WINDOW_MS - (nowMs - lastIssuedAt.getTime()))
+}
+
+/**
+ * Reads `RESET_CODE_TTL_MINUTES` (same injectable-env pattern as
+ * {@link resolveSignupCodeTtlMinutes}); falls back to
+ * {@link SP_AUTH_RESET_DEFAULT_CODE_TTL_MINUTES}.
+ */
+export function resolvePasswordResetCodeTtlMinutes(env: NodeJS.ProcessEnv = process.env): number {
+    const raw = (env.RESET_CODE_TTL_MINUTES ?? "").trim()
+    if (raw.length === 0) return SP_AUTH_RESET_DEFAULT_CODE_TTL_MINUTES
+    const parsed = Number(raw)
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) return SP_AUTH_RESET_DEFAULT_CODE_TTL_MINUTES
+    return Math.min(parsed, SP_AUTH_MAX_CODE_TTL_MINUTES)
+}
+
+/**
+ * Issues a reset code for an account: revokes the previous live one and resets
+ * the TTL (the data layer writes the `reset_request` audit row).
+ */
+export function issuePasswordResetCode(
+    accountId: number,
+    env: NodeJS.ProcessEnv = process.env,
+): PasswordResetCode {
+    return createPasswordResetCodeSync({
+        accountId,
+        ttlMinutes: resolvePasswordResetCodeTtlMinutes(env),
+        actor: SP_AUTH_AUDIT_ACTOR,
+    })
 }

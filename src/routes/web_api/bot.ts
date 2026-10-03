@@ -6,15 +6,20 @@ import { resolvePlayerIdSync } from "../../data/activeAccount"
 import { getAccountSync } from "../../data/domains/account"
 import {
     SIGNUP_CODE_MAX_ATTEMPTS,
+    confirmPasswordResetCodeSync,
     consumeSignupCodeSync,
     getAccountBindStateSync,
     getBindingByPlatformUidSync,
+    getBoundPlatformBindingSync,
+    getPasswordResetCodeSync,
     getSignupCodeSync,
     listBindingsSync,
     revokeSignupCodeSync,
     unbindPlatformAccountSync,
 } from "../../data/domains/account-binding"
 import { getViewerIdSync } from "../../data/domains/session"
+import type { SpAuthErrorCode } from "../../lib/sp-auth/contract"
+import { messageFor } from "../../lib/sp-auth/result"
 import { getRealNow } from "../../runtime/time/game-time"
 import {
     ChapterSkipError,
@@ -198,6 +203,19 @@ function resolveBoundAccountId(platform: BindingPlatform, uid: string): number |
     return bindings.find(binding => binding.isPrimary)?.accountId ?? null
 }
 
+interface BotResetRequest {
+    /** The QQ that typed `/reset` in the group. */
+    readonly qq: string
+    readonly code: string
+}
+
+function readResetRequest(body: unknown): BotResetRequest {
+    const raw = requireBody(body)
+    // The qq field of `/api/bot/reset` is the sender identity, so it is read
+    // with the same rules as a platform uid.
+    return { qq: requireUid(raw.qq), code: requireCode(raw.code) }
+}
+
 function readUsername(accountId: number): string | null {
     return getAccountSync(accountId)?.username ?? null
 }
@@ -282,6 +300,14 @@ function sendBotError(request: FastifyRequest, reply: FastifyReply, error: unkno
     }
     request.log.error({ err: error }, "bot api route failed")
     return reply.status(500).send({ ok: false, code: "INTERNAL_ERROR" })
+}
+
+/**
+ * Failure body of `/api/bot/reset`: the frozen `code` plus the C7 Chinese copy
+ * as a pure extension, so the bot can paste it straight into the group chat.
+ */
+function sendResetFailure(reply: FastifyReply, code: SpAuthErrorCode): FastifyReply {
+    return reply.status(200).send({ ok: false, code, message: messageFor(code) })
 }
 
 const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {}) => {
@@ -479,6 +505,54 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
             if (error instanceof ChapterSkipError) {
                 return reply.status(400).send({ ok: false, code: "INVALID_CHAPTER" })
             }
+            return sendBotError(request, reply, error)
+        }
+    })
+
+    // 忘记密码 ②: the QQ bound to the account confirms the reset code that the
+    // player requested on the web page. Only "the group identity that already
+    // owns the account" may confirm, which is what keeps a leaked code from
+    // being enough to take the account over.
+    fastify.post("/reset", async (request, reply) => {
+        if (!isDatabaseReady()) return reply.status(503).send({ ok: false, code: "SERVICE_UNAVAILABLE" })
+        let body: BotResetRequest
+        try {
+            body = readResetRequest(request.body)
+        } catch (error) {
+            if (error instanceof BotRequestError) {
+                // Same shape as `/bind`: a malformed command reads as a bad code.
+                return reply.status(400).send({
+                    ok: false,
+                    code: "CODE_NOT_FOUND",
+                    message: messageFor("CODE_NOT_FOUND"),
+                })
+            }
+            throw error
+        }
+        if (!limiter.check(`reset:${body.qq}`)) return sendResetFailure(reply, "RATE_LIMITED")
+        try {
+            const code = getPasswordResetCodeSync(body.code)
+            if (code === null || code.status === "used" || code.status === "revoked") {
+                return sendResetFailure(reply, "CODE_NOT_FOUND")
+            }
+            if (code.expiresAt.getTime() <= getRealNow().getTime()) {
+                return sendResetFailure(reply, "CODE_EXPIRED")
+            }
+            const bound = getBoundPlatformBindingSync(code.accountId, "qq")
+            if (bound === null) return sendResetFailure(reply, "BIND_REQUIRED")
+            if (bound.platformUid !== body.qq) return sendResetFailure(reply, "QQ_MISMATCH")
+            if (code.status !== "confirmed") {
+                const confirmed = confirmPasswordResetCodeSync({ id: code.id, qq: body.qq, actor: "bot" })
+                // Lost the row between read and write (concurrent confirm / use).
+                if (confirmed === null) return sendResetFailure(reply, "CODE_NOT_FOUND")
+            }
+            // Re-sending `/reset` for a code this QQ already confirmed is not an
+            // error: the group member just wants the same answer again.
+            return reply.status(200).send({
+                ok: true,
+                data: { account: readUsername(code.accountId), state: "confirmed" },
+            })
+        } catch (error) {
             return sendBotError(request, reply, error)
         }
     })

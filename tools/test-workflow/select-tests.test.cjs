@@ -2063,6 +2063,7 @@ test("splits isolated integration tests into focused domains", () => {
         "tools/follow_domain.test.cjs",
         "tools/account_binding.test.cjs",
         "tools/sp_auth.test.cjs",
+        "tools/sp_auth_reset.test.cjs",
         "tools/bind_gate.test.cjs",
         "tools/signup_code_revoke_on_bind.test.cjs",
         "tools/ios_notice_code.test.cjs",

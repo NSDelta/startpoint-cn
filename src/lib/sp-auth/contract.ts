@@ -26,6 +26,14 @@ export const SP_AUTH_ERROR_CODES = [
     "CODE_EXPIRED",
     "CODE_USED",
     "CODE_LOCKED",
+    // Added by the self-service password reset ("忘记密码") cards. Existing
+    // values above are frozen and must not be renamed or reordered.
+    "ACCOUNT_NOT_FOUND",
+    "RESET_NO_QQ",
+    "RESET_CODE_INVALID",
+    "RESET_NOT_CONFIRMED",
+    "CODE_NOT_FOUND",
+    "QQ_MISMATCH",
     "SERVICE_UNAVAILABLE",
 ] as const
 
@@ -50,6 +58,12 @@ export const SP_AUTH_ERROR_MESSAGES: Record<SpAuthErrorCode, string> = {
     CODE_EXPIRED: "验证码已过期，请在游戏里重新获取。",
     CODE_USED: "验证码已被使用。",
     CODE_LOCKED: "验证码尝试次数过多，已锁定，请重新获取。",
+    ACCOUNT_NOT_FOUND: "没有找到这个账号，请检查登录名或 QQ 号是否填对。",
+    RESET_NO_QQ: "该账号还没有绑定 QQ，无法自助重置密码，请联系管理员。",
+    RESET_CODE_INVALID: "重置码不正确，请照抄群里的那串字母数字。",
+    RESET_NOT_CONFIRMED: "还没有在群里发送 /reset 确认，请先发一次再提交新密码。",
+    CODE_NOT_FOUND: "重置码不存在或已被使用，请在网页上重新获取。",
+    QQ_MISMATCH: "发命令的 QQ 与该账号绑定的 QQ 不一致。",
     SERVICE_UNAVAILABLE: "服务暂时不可用，请稍后再试。",
 }
 
@@ -109,6 +123,25 @@ export interface SpAuthBindStatusData {
 export type SpAuthResendData = SpAuthCodeView
 
 /**
+ * `POST /sp-auth/reset-request` → data (self-service "忘记密码").
+ *
+ * `account` is the normalized username the code belongs to, so the page can
+ * show "验证码已发给 <account>" even when the player typed their QQ number.
+ * `expiresInSec` is the remaining lifetime of the freshly issued code (900 for
+ * the 15 minute default) — the page renders a countdown from it.
+ */
+export interface SpAuthResetRequestData {
+    code: string
+    expiresInSec: number
+    account: string
+}
+
+/** `POST /sp-auth/reset-confirm` → data: just the account that was reset. */
+export interface SpAuthResetConfirmData {
+    account: string
+}
+
+/**
  * `POST /sp-auth/profile` → data.
  *
  * Not in the §3.2 table (added by card A4); the shape mirrors the existing
@@ -159,6 +192,18 @@ export interface SpAuthLoginBody {
 
 export interface SpAuthTokenBody {
     token?: unknown
+}
+
+/** `POST /sp-auth/reset-request`: username or bound QQ number. */
+export interface SpAuthResetRequestBody {
+    account?: unknown
+}
+
+/** `POST /sp-auth/reset-confirm`: same account field + the code + new password. */
+export interface SpAuthResetConfirmBody {
+    account?: unknown
+    code?: unknown
+    password?: unknown
 }
 
 // ---------------------------------------------------------------------------

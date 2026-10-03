@@ -13,8 +13,12 @@
  */
 
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
+import { appendFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { spLogin } from "../../lib/sp-auth/login"
 import { spRegister } from "../../lib/sp-auth/register"
+import { spResetConfirm, spResetRequest } from "../../lib/sp-auth/reset"
 import { fail, messageFor } from "../../lib/sp-auth/result"
 import type { SpAuthResult } from "../../lib/sp-auth/result"
 import {
@@ -93,6 +97,41 @@ const routes = async (fastify: FastifyInstance): Promise<void> => {
     fastify.post("/logout", async (request, reply) => {
         const body = readBody(request)
         return guard(reply, "logout", () => spLogout(body))
+    })
+
+    // 忘记密码 ①: 用户名或已绑定的 QQ 换一枚 15 分钟重置码。The IP is passed in
+    // for the per-address window only; it is never written to the audit detail.
+    fastify.post("/reset-request", async (request, reply) => {
+        const body = readBody(request)
+        return guard(reply, "reset-request", () => spResetRequest(body, process.env, { ip: request.ip }))
+    })
+
+    // 忘记密码 ③: 码必须已被群里的 `/api/bot/reset` 确认过才会改密码。
+    fastify.post("/reset-confirm", async (request, reply) => {
+        const body = readBody(request)
+        return guard(reply, "reset-confirm", () => spResetConfirm(body))
+    })
+
+    /**
+     * 临时排障通道（**不属于契约 C1**，只为真机排障存在）：客户端把日志行用 GET 发到这里，
+     * 直接追加落盘，省得去翻服务器 stdout 里被百分号编码过的 URL。
+     *   GET /sp-auth/diag?i=<批次序号>&l=<urlencode(若干行日志)>
+     * 落盘路径取 `SP_DIAG_FILE`，缺省 `<os.tmpdir()>/sp-diag.log`。
+     * 客户端拿不拿得到 200 都无所谓：就算这个路由不存在，pino 也会把整条 URL 记进运行日志。
+     */
+    fastify.get("/diag", async (request, reply) => {
+        const query = request.query as Record<string, unknown>
+        const seq = typeof query.i === "string" ? query.i : "?"
+        const text = typeof query.l === "string" ? query.l : ""
+        const file = process.env.SP_DIAG_FILE ?? join(tmpdir(), "sp-diag.log")
+        try {
+            await appendFile(file, `--- i=${seq} ---\n${text}\n`, "utf8")
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(`[sp-auth] diag append failed: ${message}`)
+        }
+        reply.header("content-type", "text/plain; charset=utf-8")
+        return reply.status(200).send("ok")
     })
 }
 

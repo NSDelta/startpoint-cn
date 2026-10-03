@@ -87,6 +87,31 @@ export function initializeAccountBindingSchemaSync(database: Database): void {
         CREATE INDEX IF NOT EXISTS idx_bind_audit_account
         ON bind_audit (account_id, created_at DESC, id DESC)
     `)
+
+    // Self-service password reset ("忘记密码"). Kept next to `signup_codes`
+    // because it is the same shape of secret: a short-lived, single-use code the
+    // player reads out of the group chat. `confirmed_qq` records which QQ proved
+    // ownership with `/reset`; nothing here is ever logged in clear text.
+    database.exec(`
+        CREATE TABLE IF NOT EXISTS password_reset_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'used', 'revoked')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT NOT NULL,
+            confirmed_at TEXT,
+            confirmed_qq TEXT,
+            used_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0)
+        )
+    `)
+    database.exec(`
+        CREATE INDEX IF NOT EXISTS idx_password_reset_codes_account_status
+        ON password_reset_codes (account_id, status, expires_at)
+    `)
 }
 
 /**

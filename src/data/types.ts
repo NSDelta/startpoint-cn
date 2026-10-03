@@ -951,6 +951,11 @@ export type BindAuditAction =
     | "login"
     | "register"
     | "gate_reject"
+    // Self-service password reset ("忘记密码"): request a reset code, confirm it
+    // from the group with `/reset`, then actually change the password.
+    | "reset_request"
+    | "reset_confirm"
+    | "reset_password"
 
 export interface RawSignupCode {
     id: number
@@ -975,6 +980,44 @@ export interface SignupCode {
     platformUid: string | null
     attempts: number
     expiresAt: Date
+    createdAt: Date
+    updatedAt: Date
+    revision: number
+}
+
+/**
+ * Lifecycle of a self-service password reset code ("忘记密码"). A code is
+ * `pending` while it waits for the QQ confirmation in the group, `confirmed`
+ * once `/reset` matched the bound QQ, `used` after the password was changed and
+ * `revoked` when a newer code replaced it.
+ */
+export type PasswordResetCodeStatus = "pending" | "confirmed" | "used" | "revoked"
+
+export interface RawPasswordResetCode {
+    id: number
+    code: string
+    account_id: number
+    status: string
+    attempts: number
+    expires_at: string
+    confirmed_at: string | null
+    confirmed_qq: string | null
+    used_at: string | null
+    created_at: string
+    updated_at: string
+    revision: number
+}
+
+export interface PasswordResetCode {
+    id: number
+    code: string
+    accountId: number
+    status: PasswordResetCodeStatus
+    attempts: number
+    expiresAt: Date
+    confirmedAt: Date | null
+    confirmedQq: string | null
+    usedAt: Date | null
     createdAt: Date
     updatedAt: Date
     revision: number

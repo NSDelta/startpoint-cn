@@ -9,9 +9,12 @@ import {
     BindingCreatedBy,
     BindingPlatform,
     DeviceGrant,
+    PasswordResetCode,
+    PasswordResetCodeStatus,
     RawAccountBinding,
     RawBindAudit,
     RawDeviceGrant,
+    RawPasswordResetCode,
     RawSignupCode,
     SignupCode,
     SignupCodeStatus,
@@ -441,6 +444,316 @@ export function revokeSignupCodeSync(input: RevokeSignupCodeInput): boolean {
         }
         return changes > 0
     })()
+}
+
+// ---------------------------------------------------------------------------
+// password reset codes ("忘记密码", self-service reset)
+// ---------------------------------------------------------------------------
+
+/** Reset codes are valid for 15 minutes: the player is in the group right now. */
+export const PASSWORD_RESET_CODE_TTL_MINUTES = 15
+
+/** A reset code is locked after this many failed `/sp-auth/reset-confirm` tries. */
+export const PASSWORD_RESET_CODE_MAX_ATTEMPTS = 5
+
+const passwordResetCodeColumns = `
+    id, code, account_id, status, attempts, expires_at,
+    confirmed_at, confirmed_qq, used_at, created_at, updated_at, revision
+`
+
+function buildPasswordResetCode(raw: RawPasswordResetCode): PasswordResetCode {
+    return {
+        id: raw.id,
+        code: raw.code,
+        accountId: raw.account_id,
+        status: raw.status as PasswordResetCodeStatus,
+        attempts: raw.attempts,
+        expiresAt: new Date(raw.expires_at),
+        confirmedAt: raw.confirmed_at === null ? null : new Date(raw.confirmed_at),
+        confirmedQq: raw.confirmed_qq,
+        usedAt: raw.used_at === null ? null : new Date(raw.used_at),
+        createdAt: new Date(raw.created_at),
+        updatedAt: new Date(raw.updated_at),
+        revision: raw.revision,
+    }
+}
+
+export interface CreatePasswordResetCodeInput {
+    accountId: number
+    /** Test and admin override; defaults to {@link PASSWORD_RESET_CODE_TTL_MINUTES}. */
+    ttlMinutes?: number
+    actor?: string | null
+}
+
+/**
+ * Issues a reset code for an account and revokes the previous live code of the
+ * same account (one live code per account, same rule as signup codes).
+ */
+export function createPasswordResetCodeSync(input: CreatePasswordResetCodeInput): PasswordResetCode {
+    const db = getDb()
+    const accountId = requireSafeId(input.accountId, "account id")
+    const ttlMinutes = input.ttlMinutes ?? PASSWORD_RESET_CODE_TTL_MINUTES
+    if (!Number.isSafeInteger(ttlMinutes)) {
+        throw new Error("Password reset code TTL must be an integer number of minutes")
+    }
+    const actor = input.actor ?? "system"
+
+    return db.transaction((): PasswordResetCode => {
+        const accountExists = db.prepare("SELECT 1 FROM accounts WHERE id = ?").get(accountId)
+        if (accountExists === undefined) throw new Error("Password reset account does not exist")
+
+        const now = getRealNow()
+        const nowIso = now.toISOString()
+        const expiresAt = new Date(now.getTime() + ttlMinutes * 60_000).toISOString()
+
+        revokePasswordResetCodesForAccountSync(accountId, actor)
+
+        let code: string | null = null
+        for (let attempt = 0; attempt < 64; attempt += 1) {
+            const candidate = generateSignupCodeValue()
+            const existing = db.prepare("SELECT 1 FROM password_reset_codes WHERE code = ?").get(candidate)
+            if (existing === undefined) {
+                code = candidate
+                break
+            }
+        }
+        if (code === null) throw new Error("Could not allocate a unique password reset code")
+
+        const inserted = db.prepare(`
+            INSERT INTO password_reset_codes (
+                code, account_id, status, attempts, expires_at,
+                confirmed_at, confirmed_qq, used_at, created_at, updated_at, revision
+            ) VALUES (?, ?, 'pending', 0, ?, NULL, NULL, NULL, ?, ?, 1)
+        `).run(code, accountId, expiresAt, nowIso, nowIso)
+        const id = Number(inserted.lastInsertRowid)
+
+        appendBindAuditSync({
+            action: "reset_request",
+            accountId,
+            detail: { codeId: id },
+            actor,
+            createdAt: nowIso,
+        })
+
+        return buildPasswordResetCode(readPasswordResetCodeRowById(id))
+    })()
+}
+
+function readPasswordResetCodeRowById(id: number): RawPasswordResetCode {
+    const raw = getDb().prepare(`
+        SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE id = ?
+    `).get(id) as RawPasswordResetCode | undefined
+    if (raw === undefined) throw new Error("Password reset code disappeared")
+    return raw
+}
+
+/** Codes are case insensitive for the player, exactly like signup codes. */
+export function getPasswordResetCodeSync(code: string): PasswordResetCode | null {
+    const normalized = normalizeSignupCode(code)
+    if (normalized === "") return null
+    const raw = getDb().prepare(`
+        SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE code = ?
+    `).get(normalized) as RawPasswordResetCode | undefined
+    return raw === undefined ? null : buildPasswordResetCode(raw)
+}
+
+/** Live (pending, not yet expired) code of an account, if any. */
+export function getActivePasswordResetCodeSync(accountId: number): PasswordResetCode | null {
+    const raw = getDb().prepare(`
+        SELECT ${passwordResetCodeColumns}
+        FROM password_reset_codes
+        WHERE account_id = ? AND status = 'pending' AND expires_at > ?
+        ORDER BY id DESC
+        LIMIT 1
+    `).get(
+        requireSafeId(accountId, "account id"),
+        getRealNow().toISOString(),
+    ) as RawPasswordResetCode | undefined
+    return raw === undefined ? null : buildPasswordResetCode(raw)
+}
+
+export interface ListPasswordResetCodesFilter {
+    accountId?: number
+    status?: PasswordResetCodeStatus
+    limit?: number
+}
+
+export function listPasswordResetCodesSync(
+    filter: ListPasswordResetCodesFilter = {},
+): PasswordResetCode[] {
+    const db = getDb()
+    const conditions: string[] = []
+    const parameters: unknown[] = []
+    if (filter.accountId !== undefined) {
+        conditions.push("account_id = ?")
+        parameters.push(requireSafeId(filter.accountId, "account id"))
+    }
+    if (filter.status !== undefined) {
+        conditions.push("status = ?")
+        parameters.push(filter.status)
+    }
+    const where = conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`
+    const rows = db.prepare(`
+        SELECT ${passwordResetCodeColumns}
+        FROM password_reset_codes
+        ${where}
+        ORDER BY id DESC
+        LIMIT ?
+    `).all(...parameters, normalizeListLimit(filter.limit)) as RawPasswordResetCode[]
+    return rows.map(buildPasswordResetCode)
+}
+
+/**
+ * Revokes every live (pending/confirmed) code of an account. Idempotent: a
+ * second call returns 0.
+ */
+export function revokePasswordResetCodesForAccountSync(
+    accountId: number,
+    actor: string | null = "system",
+): number {
+    const db = getDb()
+    const id = requireSafeId(accountId, "account id")
+    return db.transaction((): number => {
+        const nowIso = getRealNow().toISOString()
+        const result = db.prepare(`
+            UPDATE password_reset_codes
+            SET status = 'revoked', updated_at = ?, revision = revision + 1
+            WHERE account_id = ? AND status IN ('pending', 'confirmed')
+        `).run(nowIso, id)
+        const changes = Number(result.changes)
+        if (changes > 0) {
+            appendBindAuditSync({
+                action: "revoke_code",
+                accountId: id,
+                detail: { kind: "password_reset", revoked: changes },
+                actor,
+                createdAt: nowIso,
+            })
+        }
+        return changes
+    })()
+}
+
+export interface ConfirmPasswordResetCodeInput {
+    id?: number
+    code?: string
+    /** QQ that sent `/reset` in the group; recorded for the audit trail. */
+    qq: string
+    actor?: string | null
+}
+
+/**
+ * Marks a pending reset code as confirmed by the QQ that sent `/reset`.
+ * Returns `null` when there is no matching pending row (the caller already
+ * checked the code, so that means it moved on underneath us).
+ */
+export function confirmPasswordResetCodeSync(
+    input: ConfirmPasswordResetCodeInput,
+): PasswordResetCode | null {
+    const db = getDb()
+    if (input.id === undefined && input.code === undefined) {
+        throw new Error("Confirming a password reset code needs an id or a code")
+    }
+    const qq = requireNonEmpty(input.qq, "qq")
+    const normalized = input.code === undefined ? null : normalizeSignupCode(input.code)
+
+    return db.transaction((): PasswordResetCode | null => {
+        const nowIso = getRealNow().toISOString()
+        const result = normalized === null
+            ? db.prepare(`
+                UPDATE password_reset_codes
+                SET status = 'confirmed', confirmed_at = ?, confirmed_qq = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE id = ? AND status = 'pending'
+            `).run(nowIso, qq, nowIso, requireSafeId(input.id!, "password reset code id"))
+            : db.prepare(`
+                UPDATE password_reset_codes
+                SET status = 'confirmed', confirmed_at = ?, confirmed_qq = ?,
+                    updated_at = ?, revision = revision + 1
+                WHERE code = ? AND status = 'pending'
+            `).run(nowIso, qq, nowIso, normalized)
+        if (Number(result.changes) === 0) return null
+
+        const raw = normalized === null
+            ? db.prepare(`
+                SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE id = ?
+            `).get(requireSafeId(input.id!, "password reset code id")) as RawPasswordResetCode | undefined
+            : db.prepare(`
+                SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE code = ?
+            `).get(normalized) as RawPasswordResetCode | undefined
+        if (raw === undefined) return null
+
+        appendBindAuditSync({
+            action: "reset_confirm",
+            accountId: raw.account_id,
+            platform: "qq",
+            platformUid: qq,
+            detail: { codeId: raw.id },
+            actor: input.actor ?? "bot",
+            createdAt: nowIso,
+        })
+        return buildPasswordResetCode(raw)
+    })()
+}
+
+export interface ConsumePasswordResetCodeInput {
+    id?: number
+    code?: string
+    accountId: number
+    actor?: string | null
+}
+
+/**
+ * Marks a confirmed code as used: a reset code is single use and dies with the
+ * password change that consumed it.
+ */
+export function consumePasswordResetCodeSync(
+    input: ConsumePasswordResetCodeInput,
+): PasswordResetCode | null {
+    const db = getDb()
+    if (input.id === undefined && input.code === undefined) {
+        throw new Error("Consuming a password reset code needs an id or a code")
+    }
+    const accountId = requireSafeId(input.accountId, "account id")
+    const normalized = input.code === undefined ? null : normalizeSignupCode(input.code)
+
+    return db.transaction((): PasswordResetCode | null => {
+        const nowIso = getRealNow().toISOString()
+        const result = normalized === null
+            ? db.prepare(`
+                UPDATE password_reset_codes
+                SET status = 'used', used_at = ?, updated_at = ?, revision = revision + 1
+                WHERE id = ? AND account_id = ? AND status IN ('pending', 'confirmed')
+            `).run(nowIso, nowIso, requireSafeId(input.id!, "password reset code id"), accountId)
+            : db.prepare(`
+                UPDATE password_reset_codes
+                SET status = 'used', used_at = ?, updated_at = ?, revision = revision + 1
+                WHERE code = ? AND account_id = ? AND status IN ('pending', 'confirmed')
+            `).run(nowIso, nowIso, normalized, accountId)
+        if (Number(result.changes) === 0) return null
+        const raw = normalized === null
+            ? db.prepare(`
+                SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE id = ?
+            `).get(requireSafeId(input.id!, "password reset code id")) as RawPasswordResetCode | undefined
+            : db.prepare(`
+                SELECT ${passwordResetCodeColumns} FROM password_reset_codes WHERE code = ?
+            `).get(normalized) as RawPasswordResetCode | undefined
+        return raw === undefined ? null : buildPasswordResetCode(raw)
+    })()
+}
+
+/** Counts one failed `/sp-auth/reset-confirm` attempt. */
+export function incrementPasswordResetCodeAttemptsSync(id: number): PasswordResetCode | null {
+    const db = getDb()
+    const codeId = requireSafeId(id, "password reset code id")
+    const nowIso = getRealNow().toISOString()
+    const result = db.prepare(`
+        UPDATE password_reset_codes
+        SET attempts = attempts + 1, updated_at = ?, revision = revision + 1
+        WHERE id = ?
+    `).run(nowIso, codeId)
+    if (Number(result.changes) === 0) return null
+    return buildPasswordResetCode(readPasswordResetCodeRowById(codeId))
 }
 
 export type SignupCodeFailureCode =
@@ -906,6 +1219,29 @@ export function getPrimaryBindingSync(
             ORDER BY id ASC
             LIMIT 1
         `).get(id, assertBindingPlatform(platform)) as RawAccountBinding | undefined
+    return raw === undefined ? null : buildAccountBinding(raw)
+}
+
+/**
+ * The binding that represents an account on a platform: the primary one when
+ * set, otherwise the earliest. Mirror image of
+ * {@link getBindingByPlatformUidSync}, which resolves the same pair from the
+ * platform identity side.
+ */
+export function getBoundPlatformBindingSync(
+    accountId: number,
+    platform: BindingPlatform,
+): AccountBinding | null {
+    const raw = getDb().prepare(`
+        SELECT ${accountBindingColumns}
+        FROM account_bindings
+        WHERE account_id = ? AND platform = ?
+        ORDER BY is_primary DESC, id ASC
+        LIMIT 1
+    `).get(
+        requireSafeId(accountId, "account id"),
+        assertBindingPlatform(platform),
+    ) as RawAccountBinding | undefined
     return raw === undefined ? null : buildAccountBinding(raw)
 }
 
