@@ -1,0 +1,538 @@
+# iOS 自动点击插件 —— 设计方案（冻结版）
+
+> 交付目标（用户 m00002）：iOS 可用的自动屏幕点击插件两件套
+> ① 越狱可用的 **deb**
+> ② 非越狱注入**单个应用**的 **dylib**
+> 两者都必须**兼容 .auto 脚本格式**（自动化编辑器 v4.3.8 导出）
+>
+> 本文所有结论均标注证据等级：`[实证]` 本机实测/反编译确认 · `[源码]` 官方源码 · `[推断]` · `[未证实]`
+
+---
+
+## 0. 一句话结论
+
+`.auto` 的执行语义已在 Windows 上**完整复刻并通过全部黄金测试**（匹配内核与 Android/OpenCV 判定等价），
+iOS 端只需补上「取帧」与「注入触摸」两个薄适配层即可。目标游戏是 **Adobe AIR + OpenGL ES 2**，
+且是**竖屏应用** —— 这两点让两个交付物都比预想简单：
+
+- **取帧**：AIR 用 Stage3D 渲染到 `EAGLView` 的默认 framebuffer ⇒ hook `-[EAGLContext presentRenderbuffer:]` + `glReadPixels` 拿真帧，不需要 `drawHierarchy`（对 GL 内容是黑帧），也不需要越狱。
+- **注入**：游戏是竖屏、坐标系与 `.auto` 录制空间一致 ⇒ 无需任何坐标变换，且可以在**同进程内**合成事件。
+
+---
+
+## 1. .auto 格式（已完整逆向）`[实证]`
+
+`.auto` = ZIP(deflate)。条目：
+
+| 条目 | 说明 |
+|---|---|
+| `version` | 内容 `4308` = App 版本 4.3.8 |
+| `script_version` | `7` |
+| `script.json` | 脚本主体（UTF-8） |
+| `image/<ts>.png` | 模板裁剪图（24 张） |
+| `ori/<ts>.png` | 全屏原始截图（30 张） |
+
+文件名是毫秒时间戳。
+
+### 1.1 script.json 顶层
+
+样本 `幻想连战.auto` 实测 31 个键。运行期真正参与执行的：
+
+```
+init, id, name, loop_mode(1), version(7), lowest_app_version("4.3"),
+concurrency(true), expand_size(0), capture_direction(-1*), task_mode(0),
+input_type(1), adapter(1), loop_interval(30),
+image_list, var_list, scene_list, default_scene,
+common_event, common_event_low, gesture_group_list, ...
+```
+
+`*` `capture_direction` **只被序列化/反序列化，运行期引擎从不读取**（`grep` 全仓无消费者）`[实证]`。
+
+### 1.2 image_list[]（模板组）
+
+```jsonc
+{ "name":"招募", "id":"BqhUaUbSkADiXx5r", "sim":"0.8", "adapter_type":1 /*可缺省*/,
+  "images":[ { "file":"image/1789816658174.png", "ori":"ori/1789816658174.png",
+               "rect":"444,1221,186,46", "type":1, "threshold":0,
+               "filter_color":0, "filter_sim":0,
+               "screen_info":{"width":1080,"height":1920,"density":280,"pixelStride":?, "rowPadding":?} } ] }
+```
+
+- `sim` 在**组级**（阈值，默认 0.8）。
+- `images[]` 是**多分辨率变体**（样本 23 个变体，覆盖 1080x1920@280 / 1200x2000@280 / 1440x3200@560）。
+- `rect` = 模板在 `ori` 截图中的**绝对左上角 + 宽高**。`[实证]` 23/23 逐像素相等。
+
+### 1.3 var_list[]（变量 → **点击矩形**）
+
+```jsonc
+{ "type":2, "id":"…", "name":"", "value":"…",
+  "crops":[ { "ori":"ori/…png", "rect":"262,989,577,504",
+              "orientation":2, "screen_info":{…} } ] }
+```
+
+**`crops[].rect` 就是点击矩形的来源。** 条件/动作通过 `search_id` → 变量 id 引用它。
+
+### 1.4 default_scene[]（执行入口）
+
+```jsonc
+{ "name":"招募", "id":"…",
+  "item_group":{ "type":5, "relation":1, "item_list":[ {…条件项…} ] },
+  "action_list":[ {…动作…} ] }
+```
+
+- 条件项：`{type:1, id, relation:1, state:1, image_id, search_id, timeout:0, reset_timeout:false}`
+- 动作：`{type:2, id, postpone:1, image_id, search_id, button:1, press_time:0, click_times:1, interval:0}`
+- 样本 = **10 个场景，每场景恰 1 条件 + 1 动作**，全部 `type=2`；两个场景 `disabled:true`；均无 `scene_event` 门。
+
+**`search_id` 的角色（关键）**：它是「在**哪个矩形内**找模板」+「在**哪个矩形内**点」。
+
+---
+
+## 2. 执行语义（反编译 Android 参考实现 `cn.autoeditor` v4.3.8 得出）`[实证]`
+
+### 2.1 点击点算法 ★
+
+```
+在 search_id 所指变量的 crop 矩形内做模板匹配
+  → 若命中(峰值 ≥ sim)：在【命中矩形】内均匀随机取一点点击
+  → 若给定了 deviation(偏移变量)：在【偏移矩形】内随机取点
+```
+
+逐层证据：
+
+| 层 | 位置 | 关键代码 |
+|---|---|---|
+| 匹配 | `cn/autoeditor/framework/base/c.java:299-365` | `Imgproc.d(d8, this.f1050e, mat2)` → `Core.minMaxLoc` → `p1Var.f1446e = max(maxVal,0)`；`f1442a = (int)mm.maxLoc.x + rect.x`（**全帧像素坐标**）；`f1444c/f1445d = 模板宽高` |
+| 判定 | `cn/autoeditor/framework/i/c.java` | `return p1Var.f1446e >= f7959i.f1049d ? 1 : 2;`（位1=找到，位2=未找到） |
+| 取点 | `cn/autoeditor/framework/base/h.java:60-72` + `framework/k5.java:36-38` | `k5.c(Rect)` = `new Point(nextInt(rect.width)+rect.x, nextInt(rect.height)+rect.y)` —— **矩形内随机** |
+| 动作 | `h/f.java:58-120` | `i8/i9 = rect.width/height`；`i10 = rect.x - point.x`；最终 `nextInt(i8)+f7960j.x+i10` |
+| 派发 | `cn/autoeditor/framework/e.java:686-705` | `GestureDescription.Builder().addStroke(StrokeDescription(path,0,dur))` → `AccessibilityService.dispatchGesture` |
+
+**`sim` 的语义 = 归一化互相关的峰值，直接比大小。** 匹配方式 `[实证]`：
+
+`cv2.matchTemplate(ori, tpl, TM_CCOEFF_NORMED)` 的全局最大点 = 模板 `rect` 左上角，23/23 `delta=0, score=1.0000`。
+
+### 2.2 场景推进（`cn/autoeditor/framework/b.java:34-137`）
+
+- 运行期场景列表 = `scene_list` 全部 + **`default_scene` 追加在最后**。
+- `common_event` / `common_event_low` 的事件列表被 `addAll(0, …)` **插到每个场景前面**（仅当该场景有 `scene_event` 门）。
+- 每轮：先评估**场景门**（有 `scene_event` 才有）；门通过后，**只对索引 `i > f999a` 的事件**逐条评估条件组；
+  命中则 `f999a = i` 并执行其动作；命中 break 类动作就跳出；走到末尾后 `f999a = -1` 回绕。
+- 场景门 false→true 时执行门自己的动作（`onSceneIn`）；true→false 时重置该场景所有事件条件。
+- `loop_mode == 2` 时每轮把 `f999a` 重置为 -1。
+
+### 2.3 条件组（`i/m.java:39-64`）
+
+```java
+z8 = (c8 == 1 || c8 != 2) ? (z8 & d8) : (z8 | d8);   // relation==2 → OR，其余 → AND
+```
+
+- 嵌套组展平（`i.m.a()`）；JSON 嵌套形态 `{type:5, item_state:-1, group:[…]}`。
+- **timeout**：`>0` 时条件变成「必须**连续满足** timeout 秒」；`==0` 时就是「本帧是否满足」。
+  预检查 `b()` 只在**门**那一轮调用 ⇒ 事件级条件即使写了 timeout 也退化为瞬时判定。**Android 行为如此，照抄。**
+
+### 2.4 搜索矩形的构造
+
+```
+无 search_id：搜索区 = 模板自身 rect 外扩 expand_size 像素
+有 search_id：搜索区 = 该变量 crop 矩形（可含多个，逐个试）
+模板比搜索区大 → 放弃该搜索区（返回未命中）
+命中即停（取最优）
+```
+
+### 2.5 分配置适配
+
+两个独立算法，都已在 C 侧复刻：
+
+- **模板变体选择**（`EditorImage.getAdapterInfo`）：先找 `screen_info` **精确相等**的变体；找不到时 `adapter==2` 按**长宽比最接近**，否则按 **`|Δdensity|` 最小**。
+- **组级 `adapter_type`** 缺省 `-1` ⇒ 落到**脚本级 `adapter`**（样本 = 1）⇒ 长边等比缩放分支：`x` 乘 `max`、`y` 乘 `max2`、模板尺寸乘 `f8`。
+- **crop 矩形跨分辨率映射**（`EditorCrop.getAdapterValue`）：`d8 = 当前长边/录制长边`（作用于 x），`d9 = 当前短边/录制短边`（作用于 y）。
+
+### 2.6 ★ 坐标空间（重要，本轮新确认）`[实证]`
+
+- `ori_infos` 去重 4 类：`1080x1920@280`×9、`1200x2000@280`×11、`1440x3200@560`×3、`1920x1080@280`×7。
+- **但 `ori/*.png` 实际只有竖屏帧**：1080x1920×16、1200x2000×11、1440x3200×3 —— **没有任何 1920x1080 的帧**。
+- `var_list` 的 9 个 crop **全部 `orientation=2`**，`screen_info` 是 1080x1920 或 1200x2000。
+- 全部 23 个模板变体的 `rect` 在其 `ori` 截图内**逐像素成立**（23/23），且可视化后**红框严丝合缝套住**「招募」「挑战」等按钮、**界面文字正立可读**。
+  ⇒ **`世界弹射物语` iOS/Android 客户端是竖屏应用**（`Default-Portrait*` 启动图也印证）。
+- **结论：`.auto` 的坐标 = 竖屏归一化像素空间，与运行时帧空间一致，运行时不需要任何旋转变换。**
+- iOS 侧对应量：`am_screen` 的 `long_edge = max(buf_w, buf_h)`、`short_edge = min(...)`（复刻 Android `updateScreenInfo()` 的 `f866a/f867b`）。
+  1080x1920 的 iOS 帧命中 `screen_info` 精确匹配分支 ⇒ 连缩放都不需要。
+
+---
+
+## 3. 目标游戏客户端（iOS）`[实证]`
+
+`apkipa\苹果v15.2.ipa` (160905608 B) → `out\ipa-extract\Payload\worldflipper.app\`：
+
+| 文件 | 大小 | 含义 |
+|---|---|---|
+| `worldflipper` | 108757200 | 主二进制，**无 `Frameworks/` 目录** |
+| `worldflipper_ios_release.swf` | 11242032 | **Flash/AIR 应用包** |
+| `BackgroundWorker.swf` / `BackgroundWorker-app.xml` | | AIR worker |
+| `DeviceList.plist` / `leiting_Config.plist` | | AIR / 雷霆 SDK 配置 |
+| `Default-Portrait-*.png` | | **仅竖屏**启动图 |
+
+主二进制字符串证据：`AdobeAIR`×7、`air.`×40、`FlashRuntime`×4（`FlashRuntimeIsolate`）、`Stage3D`×15、`Context3D`×129、
+`platform.gpu.kind` = **`opengles2`**、`/System/Library/Frameworks/OpenGLES.framework/OpenGLES`、`kEAGLDrawable`×4、
+`_OBJC_CLASS_$_EAGLContext`、`presentRenderbuffer:` / `renderbufferStorage:fromDrawable:` / `setDrawableProperties:`。
+（`Metal` 的 8 次命中全是 `FunnelMetalKind` 之类业务类名，**非渲染路径**。）
+
+⇒ **Adobe AIR + OpenGL ES 2 + Stage3D，竖屏。**
+
+---
+
+## 4. 架构
+
+### 4.1 分层
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  core/            纯 C99，零平台依赖，Windows/macOS/iOS 同源 │
+│    am_container    ZIP(deflate) + PNG 解码（内置 inflate）   │
+│    auto_match      NCC 模板匹配（≡ OpenCV TM_CCOEFF_NORMED） │
+│    am_json         最小 JSON 解析器                          │
+│    auto_script     .auto 模型层（image_list/var_list/scene） │
+│    auto_engine     执行器：场景门/条件组/动作派发/缓存       │
+│    auto_screen     屏幕抽象（长边/短边、分辨率适配）         │
+│    auto_log                                                    │
+├─────────────────────────────────────────────────────────────┤
+│  ios/             平台适配（Objective-C / C）                │
+│    AMCapture      取帧：hook presentRenderbuffer + glReadPixels │
+│    AMTouch        注入：HID 事件链（主）/ 响应链（备）        │
+├─────────────────────────────────────────────────────────────┤
+│  tweak/           deb 交付物（Theos）                        │
+│    Tweak.xm       注入游戏进程：装配引擎 + 悬浮控制面板      │
+│    AMControlPanel 悬浮球 / 脚本选择 / 启停 / 日志            │
+│  dylib/           dylib 交付物（Theos，同一套源码）          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+两个交付物**共用同一套 core + ios 适配层**，差别只在装配方式与 UI 呈现：
+
+| | deb（越狱） | dylib（非越狱） |
+|---|---|---|
+| 注入目标 | App Store 版 `worldflipper`（**加密包，无需重打包**） | 已解密 IPA，经 `ios/importer/tools/inject-dylib.mjs` 注入后侧载 |
+| 安装路径 | `/var/jb/Library/MobileSubstrate/DynamicLibraries/` | `Payload/worldflipper.app/Frameworks/` |
+| install_name | — | `@executable_path/Frameworks/AMAutoClick.dylib` |
+| 取帧 | 同 dylib（**同进程 framebuffer**） | hook `presentRenderbuffer:` + `glReadPixels` |
+| 注入 | 同 dylib + 可升级为全局 HID | 同进程 HID 事件链 |
+| 额外能力 | 可注入 SpringBoard 做**全局**取帧/注入（系统弹窗也能点）→ **v2** | 仅宿主 App 自己的窗口 |
+
+> **为什么 v1 不做 SpringBoard 侧？**
+> `[实证]` 项目里已解包的 IPA 是 `cryptid=0` 的 dump；App Store 正版是加密的，非越狱侧载**无法**注入它。
+> 反过来，越狱设备上 deb 用与 dylib 相同的同进程方案就已经能完整工作，且 game 是竖屏、坐标系天然对齐。
+> 全局取帧（`IOSurface` + `CARenderServerRenderDisplay`）留作 v2 增强，接口已预留。
+
+### 4.2 引擎数据流
+
+```
+每秒 ~N 轮（loop_interval 毫秒）：
+  AMCapture 取帧 → BGRA/RGBA 缓冲
+      ↓ am_gray_from_rgb
+  灰度帧 + 帧号(frame_no)++
+      ↓ per 场景
+  场景门？→ 条件组求值
+      ↓
+  事件循环（单调索引，i > last_index）
+      条件：在 search 矩形内 am_match_template → 峰值 ≥ sim ?
+      动作：am_match_template → k5 式矩形内随机点 → AMTouch tap
+      ↓
+  记录统计 / 面板刷新
+```
+
+**结果缓存**：复刻 Android —— 按「搜索矩形」缓存 `(peak, x, y, w, h)`，**帧号变化即全部失效**。
+
+### 4.2.1 性能实测与预算（★ 本节的数字决定 iOS 侧必须做什么）
+
+引擎已实现并全部通过测试（`ios/auto/core/`）。在**本机 Windows、标量 C、`/O2`** 上实测：
+
+| 项目 | 实测 |
+|---|---|
+| 单个 crop 搜索区（`幻想` 167x49 in 476x505，稳态） | **73.9 ms** |
+| 最差单个 crop 搜索（`挑战` 214x48 in 703x497） | **127.8 ms** |
+| 9 个 crop 搜索合计 | **676 ms** |
+| 全帧单个搜索（1200x2000） | 316 ms |
+| `loop_interval` 预算 | **30 ms** |
+
+⇒ **最差单个搜索超预算 4.26 倍。** 这是纯 FFT 卷积的代价，不是可以靠调参绕过的。
+
+**已经吃掉的优化（1512 ms → 676 ms，2.2 倍）**：pad 尺寸一律取 **2 的幂**。踩过的坑值得记：一开始按「最小的 5-smooth 数」选 pad（648x512 而不是 1024x1024），**结果更慢**——因为混合基路径每元素比 radix-2 慢约 11 倍。实测对比（`tests/bench_fft.c`）：
+
+```
+  576x648  (373k 点, mixed)  58.0 ms      1080x1920 (2074k 点, mixed) 332 ms
+ 1024x512  (524k 点, pow2)   17.3 ms      2048x2048 (4194k 点, pow2)  134 ms
+ 1024x1024(1049k 点, pow2)   33.7 ms
+```
+
+**结论：核函数与业务必须解耦，性能靠换核解决。** 具体：
+1. iOS 侧 `am_fft` 整体替换为 **Accelerate/vDSP**（`vDSP_fft_zrip` 实数 FFT + `vDSP_fft_zop`），预期比标量 C 快 5~20 倍 ⇒ 最差搜索降到 10 ms 量级，可进预算。core 的接口（`am_fft_plan_create` / `am_fft_execute`）已为此隔离，替换不触碰 `auto_match.c`。
+2. **不要每帧匹配所有模板**。复刻 Android 的单调索引（§2.2）：每帧只评估可达的节点，正常稳态是 1~3 次匹配/帧。
+3. FFT 与模板尺寸无关 ⇒ **模板频域结果跨帧复用**（已实现），搜索区频域在 `expand_size`/crop 固定时也可复用。
+
+> 混合基（5-smooth）路径保留且有测试覆盖（`am_fft_plan_create` 接受 5-smooth 长度），在小尺寸 1D 上有用；**大尺寸 N 维变换不要用它**。理由与数据已写进 `core/am_fft.h` 的注释，防止后人"优化"回 5-smooth。
+
+### 4.3 必须与 Android 逐位一致的三处
+
+1. **匹配打分**：NCC（`TM_CCOEFF_NORMED`），负相关/NaN 钳 0，常数模板按 OpenCV 分母 0 行为处理。已复刻并验证。
+2. **灰度公式**：`(R*77 + G*150 + B*29) >> 8`（OpenCV 定点、不舍入）。已复刻并验证。
+3. **取点**：命中矩形内**均匀随机**（不是中心），`press_time` 缺省 `nextInt(30)+20` ms。照抄。
+
+### 4.4 一处必须记住的实现陷阱：匹配缓存的键
+
+`core/auto_match.c` 的 `am_match_template()` 是**文件级单例**（`static am_match_ctx g_ctx`）+ 频域缓存：
+模板频谱、pad 尺寸、积分图都只在尺寸变化时重建。
+
+**初版判据是「`(pw,ph,rw,rh,tw,th)` 全等就复用」，这是错的。** `.auto` 脚本里每个按钮裁切
+都是不同图像，但**尺寸常常相同**（样本 11 个模板组里有 4 组是 8 的倍数级同尺寸）。于是
+模板 A 先被匹配过之后，模板 B 会直接复用 **A 的频谱**，算出一个"看起来很合理"的错分数。
+
+症状极具误导性：**同一个 8x8 的精确匹配 ROI+模板给出 `peak=0.632184`，而孤立探针给 `1.000000`**；
+而且 `0.6322` 这种"不大不小的分数"恰好也是「常量模板」分支（`var_t <= AM_EPS` ⇒ `peak=0.0`）
+的邻居，很容易被误读成模板方差为 0。
+
+**修法**：`am_match_ctx` 里保存模板与 ROI 的像素副本（`tpl_copy` / `roi_copy`），
+`ctx_prepare` 的复用判据追加 `tpl_same()` / `roi_same()`（`memcmp` 整块）。
+**教训：任何跨模板复用的缓存都必须把【内容】纳入键，不能只放尺寸。**
+
+---
+
+## 5. 取帧方案（iOS）
+
+| 方案 | 可行性 | 帧率 | 说明 |
+|---|---|---|---|
+| **hook `-[EAGLContext presentRenderbuffer:]` + `glReadPixels(默认 FBO)`** | ✅ 首选 | 快 | AIR/Stage3D 渲染到默认 framebuffer，读默认 FBO = 真帧（含 3D 内容）。`glReadPixels` 从 back buffer 读，需处理上下翻转（OpenGL 原点在左下） |
+| `drawViewHierarchyInRect:afterScreenUpdates:NO` | ⚠️ 兜底 | 慢 | `[社区]` Sentry 2025 在 iPhone 8/iOS 15.7 实测 25.4 ms/帧（占主线程）；**对 GL 内容可能黑帧** |
+| `layer.renderInContext:` | ⚠️ 兜底 | 中 | 20.7 ms；渲染不完整（漏 tab bar 图标之类） |
+| `IOSurface` + `CARenderServerRenderDisplay` | ❌ 非越狱不可用 | — | `[社区]` 自 iOS 9 起被 Apple 阻断；越狱侧需在 SpringBoard/backboardd 内（tweak 继承宿主 entitlement） |
+
+**采集节流**：只有「上一帧匹配已完成」时才发起下一次采集，避免主线程堆积；面板可调间隔（默认 100 ms，`.auto` 请求 30 ms）。
+
+---
+
+## 6. 触摸注入方案（iOS）
+
+> 专项调研：`.research/ios-touch-synthesis.md`（1096 行，全部结论带 `[源码]/[文档]/[社区]/[自写]/[未找到]` 标签）。
+> **该调研推翻了两条我先前的假设**，结论也据此改了 —— 见下方「裁决变更」。
+
+### 6.1 裁决（已按证据修正）
+
+| 目标 | 路径 | 理由 |
+|---|---|---|
+| **非越狱 sideload（主交付物）** | **`UITouch` + `-[UIApplication _touchesEvent]` + `-[UIApplication sendEvent:]`** | HID 路在普通 App 进程内**不可用**（见下）。此路是 PTFakeTouch(698★) 的血统，明确是 "User mode"、不需越狱 |
+| **越狱 deb** | 先跑 `IOSTouchHIDProbe`，成功则用 HID；**失败自动回退 `sendEvent:`** | 越狱侧 HID 有正面证据（ignuslabs 注入 dylib，iOS 15/16 rootless），但证据链薄 |
+
+**★ 关键判断：HID 路的可用性是「进程身份 / 沙箱 / entitlement」问题，不是 iOS 版本问题。**
+
+### 6.2 推翻的两条假设（记下来以免重犯）
+
+1. `lyft/Hammer` **没有任何 Objective-C 源码，全是 Swift**；`Hammer/EventGenerator*.m`、`HMTouch*.m`、`IOHIDEvent+KIF.{h,m}` 都不存在（后者在 KIF 里）。
+2. KIF **从不调用 `_enqueueHIDEvent:`**，它走公开的 `-[UIApplication sendEvent:]`。KIF 里也**没有** `KIF_findViewAtPoint:withEvent:`。
+
+### 6.3 为什么不以 HID 为主
+
+| 证据 | 内容 |
+|---|---|
+| `KQAR/Reticle#281`（iOS 26 真机）`[社区]` | digitizer IOHID 事件在设备进程内「constructible, accepted and **routed nowhere**」——16 种 sink/senderID/displayIntegrated/坐标空间组合**全部无报错、全部无效**；改走 `UITouch`→`sendEvent:` 后「hit-testing, gesture recognizers, scroll views and momentum all behave as they do under one」 |
+| `google/EarlGrey#293`（维护者）`[社区]` | 「**doesn't work on devices due to entitlement issues**」 |
+| Apple WebKit `HIDEventGenerator.mm`（至今 main）`[源码]` | 只用 `BKSHIDEventSetDigitizerInfo` + `_enqueueHIDEvent:`，**零版本分支** ⇒ 只能证明「API 存在」，不能证明「在第三方进程内有效」 |
+| SimulateTouch(512★) / ZXTouch(1407★) `[源码]` | 两条经典 HID 注入实现**都跑在 SpringBoard 里**，不是 App 进程内 |
+| `IOHIDEventSystemClientDispatchEvent` | 非越狱 App 进程内不行；且 iOS 15+ 必须先 `IOHIDEventSystemClientScheduleWithRunLoop(client, CFRunLoopGetMain(), kCFRunLoopDefaultMode)` 否则静默不投递 |
+
+### 6.4 实现要点（`ios/AMTouch.m`）
+
+**`sendEvent:` 路（主）**
+- 事件对象：`-[UIApplication _touchesEvent]`；`UIEvent` 私有 `_clearTouches` / `_addTouch:forDelayedDelivery:` / `_setHIDEvent:` / `_setTimestamp:`。
+- `UITouch` 私有 selector：`setWindow:`（**必须第一个调** —— KIF 注释 "Wipes out some values. Needs to be first."）、`setView:`、`setTapCount:`、`setIsTap:`、`setTimestamp:`、`setPhase:`、`setGestureView:`、`_setLocationInWindow:resetPrevious:`、`_setIsFirstTouchForView:`、`_setIsTapToClick:`（iOS 14 分支：用 `_setIsTapToClick:NO`，否则 `_setIsFirstTouchForView:YES` + `setIsTap:NO`）、`_setHidEvent:`（**iOS 9 起必需**）。
+- 每个触摸仍用 IOKit 的 `IOHIDEventCreateDigitizerFingerEvent` 造 HID 事件喂给 `_setHidEvent:` —— 被丢掉的是「把 HID 事件当**输入**提交」，不是「构造 HID 事件」。
+- **抬起必须复用同一个 `UITouch` 对象**。
+- 坐标是 **window points**（WebKit 用 `roundf`）。
+
+**HID 路（越狱备选）**
+- 全用 `dlopen`+`dlsym`（`/System/Library/Frameworks/IOKit.framework/IOKit`、`BackBoardServices.framework`），不需要私有头文件。
+- `BKSHIDEventSetDigitizerInfo` 七参（WebKit/Hammer/ignuslabs 逐字一致）：
+  `(IOHIDEventRef ev, uint32_t contextID, uint8_t systemGestureIsPossible, uint8_t isSystemGestureStateChangeEvent, CFStringRef displayUUID, CFTimeInterval initialTouchTimestamp, float maxForce)`；
+  Hammer 传 `(event, window.contextId, false, false, nil, 0, 0)`。**`contextID` 来自 `-[UIWindow _contextId]`**（`GSGetMainDisplay` 在 WebKit/Hammer/KIF/SimulateTouch 里**全库零命中**）。
+- 必须设：hand 事件 `kIOHIDEventFieldDigitizerIsDisplayIntegrated = 1`；finger `MajorRadius = MinorRadius = 5.0`（`[社区]` 0.04 会被 OS 判成噪声）；`IOHIDEventSetSenderID` **非 0**（Hammer 注释 "Can be any value except 0"）。Hammer 用 `0x0000000123456789`，SimulateTouch digitizer 用 `0x000000010000027F`，键盘用 `0xDEFACEDBEEFFECE5`。
+- 时序照抄 WebKit：`fingerLiftDelay=0.05`、`multiTapInterval=0.15`、`fingerMoveInterval=0.016`、`longPressHoldDelay=2.0`、`fingerIdentifiers[]={2,3,4,5,1}`。
+- **按压时长由构造时的时间戳决定**（`mach_absolute_time()`），不是投递间隔 ⇒ 想要 30 ms 按压必须**真 sleep 30 ms** 再构造 up 事件。
+
+### 6.5 失败检测（唯一可靠手段）
+
+`swizzle -[UIApplication _handleHIDEvent:]`，发一个 **vendor-defined marker 事件**
+（usagePage = `kHIDPage_VendorDefinedStart + 100` = `0xFF64`，字段 `data` = `(1<<16)+4 = 0x10004`），等它回来：
+- 回来 ⇒ HID 真进管线，可用；
+- 不回来 ⇒ 被静默丢弃，**立刻切 `sendEvent:` 路**。
+
+已封装为 `IOSTouchHIDProbe(timeout)`。这是 WebKit / Hammer 同款机制 —— **它们都自己做了 marker/ack 栅栏，这本身就是「Apple 也不相信发了就算送达」的证据**。
+
+> 不要用 `respondsToSelector:` / `dlsym` 判断可用性：**全是 YES，事件仍可能被静默丢弃。**
+
+### 6.6 未证实项（别当可靠路径用）
+
+- **Adobe AIR 是否响应同进程合成触摸：正反证据都没有**（7 组搜索全空，唯一沾边是 `airsdk/Adobe-Runtime-Support#3375` 证明 AIR 把 UIKit 触摸映射成 `flash.events.TouchEvent`）。⇒ **上真机第一步就做三步验证法**（见 §12）。
+- 「忽略 `userInteractionEnabled`/`alpha`/`hidden` 的强制命中」是调研 agent **自写**的（KIF 没做这件事）。
+- 手动 `beginTrackingWithTouch:`+`endTrackingWithTouch:` 能否触发 `UIButton` action：**`[未找到]`**。只有 `sendActionsForControlEvents:UIControlEventTouchDown` + `...TouchUpInside` 有硬证据（公开 API；**不检查 isEnabled、不驱动高亮**）。
+
+### 6.7 硬性前置条件 `[社区]`
+
+`-[UIView hitTest:withEvent:]` 决定 `UITouch.view` ⇒ 目标视图必须
+`userInteractionEnabled == YES`、`hidden == NO`、`alpha > 0.01`。
+**游戏若把容器关掉，两条路会同时失效** —— 这是必须在真机上先验证的点。
+
+---
+
+## 7. UI / 交互
+
+一个悬浮控制面板（`UIWindow`，`windowLevel = UIWindowLevelAlert + 1`）：
+
+- **悬浮球**：点一下展开展板；可拖动，位置持久化。
+- **脚本管理**：从 `Documents/AMAutoClick/`（越狱另支持任意路径）列出 `.auto`，也支持「导入」（`UIDocumentPicker` / `iTunes 文件共享` / `Open In`）。
+- **控制**：开始 / 暂停 / 停止 / 单步执行一轮；显示当前场景名、帧率、命中数。
+- **参数**：轮询间隔、全局 sim 覆盖、点击后延迟、调试模式（叠加显示搜索区与命中框）。
+- **日志**：最近 N 行 + 导出。
+- 面板自身**不参与匹配**（截图前隐藏或直接从 framebuffer 排除）。
+
+---
+
+## 8. 目录结构（冻结）
+
+```
+ios/auto/
+├─ core/                     # 纯 C，已实现并测试
+│   ├─ auto_match.{h,c}      # NCC 匹配 ✅
+│   ├─ am_container.{h,c}    # ZIP + inflate + PNG ✅
+│   ├─ am_json.{h,c}         # JSON 解析器（待写）
+│   ├─ auto_script.{h,c}     # .auto 模型层（待写）
+│   ├─ auto_engine.{h,c}     # 执行器（待写）
+│   ├─ auto_screen.{h,c}     # 屏幕抽象 + 分辨率适配（待写）
+│   └─ auto_log.{h,c}        # 日志回调（待写）
+├─ ios/                      # 平台适配（待写）
+│   ├─ AMCapture.{h,m,mm}    # presentRenderbuffer hook + glReadPixels
+│   ├─ AMTouch.h/.m          # HID 注入 + 响应链兜底
+│   ├─ AMRuntime.{h,m}       # 装配引擎、取帧线程、面板桥接
+│   └─ AMControlPanel.{h,m}  # 悬浮面板
+├─ tweak/                    # Theos：deb（待写）
+│   ├─ Makefile  control  Tweak.xm  layout/DEBIAN/*
+├─ dylib/                    # Theos：dylib（待写）
+│   ├─ Makefile  control  AMAutoClick.plist
+├─ tests/                    # ✅ 三套已全绿
+│   ├─ test_matcher.c  test_matcher_neg.c  test_package.c
+├─ tools/                    # ✅ 夹具生成 + 构建脚本
+├─ matcher_golden/  matcher_golden_neg/  matcher_golden_pkg/
+└─ decomp/                   # jadx 反编译参考实现（勿提交）
+```
+
+---
+
+## 9. 构建与出包
+
+### 9.1 已具备（本机 Windows）`[实证]`
+
+```powershell
+# 七套测试（MSVC；/utf-8 必需，否则中文注释报 C4819/C1071）
+$vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+$cf     = "/nologo /W4 /O2 /std:c11 /utf-8 /D_CRT_SECURE_NO_WARNINGS"
+$inc    = "/I core /I tests /I matcher_golden /I matcher_golden_neg /I matcher_golden_pkg"
+$core   = "core\auto_script.c core\am_json.c core\am_container.c core\auto_match.c core\am_fft.c"
+
+# 容器+格式+匹配+FFT 全链路（21 例：ZIP/PNG 断言 + 17 个真实匹配用例）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_package.exe /Fo:tests\build\ $inc tests\test_package.c $core"
+# .auto 模型层（56 例：场景/条件/变体选择/坐标适配/点击矩形/ZIP 路径）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_script.exe /Fo:tests\build\ $inc tests\test_script.c $core"
+# 执行引擎（60 例：条件折叠/场景派发/点击矩形/缓存/超时/合成夹具自检）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_engine.exe /Fo:tests\build\ $inc tests\test_engine.c core\auto_engine.c $core"
+# FFT 自身（119 例：与直接 DFT 逐元素对比 + 卷积定理 + 尺寸查询）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_fft.exe /Fo:tests\build\ /I core tests\test_fft.c core\am_fft.c"
+# JSON 解析（84 例）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_json.exe /Fo:tests\build\ /I core tests\test_json.c core\am_json.c"
+# 正/负样本匹配（13 + 18 例）
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher.exe /Fo:tests\build\ $inc tests\test_matcher.c core\auto_match.c core\am_fft.c core\am_container.c"
+cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher_neg.exe /Fo:tests\build\ $inc tests\test_matcher_neg.c core\auto_match.c core\am_fft.c core\am_container.c"
+```
+
+> **两个坑**：① `golden_cases.h` / `golden_neg_cases.h` / `golden_pkg_cases.h` **不在 `tests\` 里**，
+> 而在各自夹具目录 —— 所以 `$inc` 里那三个 `/I` 是承重的，缺了会报 `fatal error C1083`，
+> 而**旧的可执行文件不加 `/I` 也能"通过"**（过期二进制）。② `D_CRT_SECURE_NO_WARNINGS` 必须
+> 走命令行，在源文件里 `#define` 无效（`<string.h>` 已被头文件先拉进来）。
+
+运行（参数是夹具目录；`test_script` 不传第二个参数时会自动在夹具目录的**同级**找
+`sample.auto`，即 `matcher_golden_pkg/pkg` → `matcher_golden_pkg/sample.auto`）：
+
+```powershell
+tests\build\test_package.exe   matcher_golden_pkg
+tests\build\test_script.exe    matcher_golden_pkg\pkg
+tests\build\test_engine.exe    matcher_golden_pkg\pkg
+tests\build\test_fft.exe ;  tests\build\test_json.exe
+tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.exe matcher_golden_neg
+```
+
+结果：`test_engine` **60 passed** / `test_script` **56 passed** / `test_package` **21 passed** /
+`test_fft` **119 passed** / `test_json` **84 passed** / `test_matcher` **13 passed** /
+`test_matcher_neg` **18 passed**，**合计 371 例，全部 0 failed、零 warning**。
+（`test_matcher_neg` 另报「错配峰值区间上界 = 0.422071，sim = 0.80，最小余量 = 0.378」。）
+
+> `test_engine` 的合成夹具（`tests\test_engine.c` 的 `write_gray_png`）是**手写 PNG**：
+> 真彩 type 2 + zlib 头 `78 01` + stored deflate 块 + Adler-32 + IHDR/IEND（CRC 写 0，`am_container` 不校验）。
+> 四个字段全部踩过坑：**颜色类型必须是 type 2/6**（`am_png_decode_gray` 对灰度 type 0 返回
+> `AM_ERR_UNSUPPORTED`）、**stored 块头是三比特一个字节，LEN 紧跟其后不再对齐**、
+> **缓冲要留满 `2 + 块头*5 + raw + 4`**、**Adler-32 必须计入 IDAT 长度**。
+> 这些只有用**独立实现交叉验证**（python `zlib.decompress`）才抓得住 —— C 侧不校验 Adler-32，
+> 出错时会静默解出错误像素。
+
+
+### 9.2 iOS/theos（CI 侧）`[源码]`
+
+- `TARGET = iphone:clang:16.5:15.0` —— **必须写死 SDK**；写 `latest` 会静默选中 iOS 26 SDK。
+- `brew install ldid-procursus xz`（**不是** `ldid`；`xz` 提供 `lzma`，否则 dm.pl 打包失败）。不需要 fakeroot/dpkg。
+- `Architecture: iphoneos-arm`（rootless 时 Theos 自动改写为 `iphoneos-arm64`）；`Depends: mobilesubstrate`（ElleKit 声明 `Provides: mobilesubstrate (= 99)`）。
+- 过滤器 plist：`Filter = { Bundles = ("com.leiting.wf"); }`（**不要写 `Mode` 键**，无任何证据）。
+- 引用私有框架符号用 `-undefined dynamic_lookup`（Theos 不会自动加）。
+- 双 deb：`make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_DIR="$PWD/dist/rootless"` 与不带 scheme 的 rootful 版。
+- 越狱设备：iPhone 7 Plus / iOS 15.8.3 / **A10 = arm64（非 arm64e）** ⇒ Dopamine 2.x 或 palera1n rootless + ElleKit。
+
+### 9.3 非越狱侧载
+
+`ios/importer/tools/inject-dylib.mjs` 已就绪（插 `LC_LOAD_DYLIB`、放进 `Frameworks/`、强断言 ncmds+1 且文件长度不变）。
+⚠️ 必须在 `client-patch/build/patch-ipa.mjs` **之后**运行；之后侧载重签。
+⚠️ dylib 内**不可**用 MSHookFunction/ellekit API，**不可** include `rootless.h`。
+
+---
+
+## 10. 风险与未证实项
+
+| # | 风险 | 影响 | 处置 |
+|---|---|---|---|
+| 1 | iOS 版游戏 UI 布局是否与 Android 模板一致 | **致命**（匹配全失败） | ⚠️ **必须在真机取一张 iOS 截图，用 `tools/make_matcher_golden.py` 跑一遍**。这是上真机前唯一无法在 Windows 上消除的未知 |
+| 2 | `_enqueueHIDEvent:` 在 iOS 15.8.3 是否可用 | 高（决定注入方案） | 主/备双路 + 失败自愈；见 `.research/ios-touch-synthesis.md` |
+| 3 | AIR 是否响应同进程合成触摸 | 高 | 同上；兜底走响应链 |
+| 4 | `glReadPixels` 读到的是当前帧还是上一帧 | 中 | 影响滞后一帧（30ms），可接受；真机实测确认 |
+| 5 | 非越狱侧载 7 天续签 | 中 | 用户体验问题，文档说明 |
+| 6 | ~~`am_inflate_zlib` 已改非 static 但头文件未声明~~ | — | ✅ 已补进 `core/am_container.h` |
+| 7 | 风控：固定轨迹点击可能被判定为脚本 | 低（私服） | 已复刻「矩形内随机取点」，天然带抖动 |
+| 8 | **标量 C 的 FFT 比预算慢 4.26 倍**（§4.2.1） | **高**（掉帧 → 反应迟钝） | iOS 侧换 Accelerate/vDSP；并复刻 Android 的单调索引，每帧只评估可达节点。**这是已知的最大性能缺口** |
+| 9 | FFT 内核已在 Windows 上被证正确（119 例 vs 直接 DFT），但 vDSP 版是**另一份实现** | 中 | 换核后必须重跑 `test_package` 的 17 个真实用例做等价性验证，不能只信"能跑" |
+| 10 | ~~`am_match_template` 的 ROI 缓存键只含尺寸不含内容~~ | — | ✅ 已修：`ctx_prepare` 现在也 `memcmp` 模板与 ROI 的像素副本（见 §4.4） |
+| 11 | iOS 版 `nativeScale` 需合成伪 densityDpi 供变体选择（§2.5） | 中 | iPhone 7 Plus `nativeScale=2.608` ⇒ density=416；变体选择只比 density，故该值必须与录制机的 density 同一量纲 |
+
+---
+
+## 11. 实施顺序
+
+1. ✅ `core/auto_match` + `core/am_container` + 三套黄金测试（**已完成，全绿**）
+2. ✅ `core/am_fft` —— 混合基/radix-2 FFT（**119 例全绿**；pad 取 2 的幂，见 §4.2.1）
+3. ✅ `core/am_json` —— 最小 JSON 解析器（**84 例全绿**，两趟扫描零中间 malloc）
+4. ✅ `core/auto_script` —— 模型层 + 变体选择 + 坐标适配（**56 例全绿**，见 §9.1）※§2.5 的三条语义
+   已按反编译产物逐条核对；`am_adapt_rect` 从 Android 的**非均匀**双系数改成了**单一均匀系数**（理由见 §2.5）
+5. ✅ `core/auto_engine` —— 场景/条件/动作执行器（复刻 §2.2–2.4；**60 例全绿**，含合成夹具自检）※
+   与 Android 的两处**刻意偏离**：① 无门场景直接判为 active（不复制 `framework/b.java` 的静态
+   `f998h` 握手 —— 对所有场景都无门的脚本，两者净效果相同）；② `cond_image` 的搜索区在
+   「模板 rect ∩ 搜索变量 crop」为空时回退到「模板 rect 外扩 `expand_size`」（Android 无条件求交，
+   异型分辨率下交集可能为空 ⇒ 场景静默永不触发）
+6. ⬜ **Windows 侧端到端验证**：用「幻想连战.auto」+ `matcher_golden_pkg` 的 ori 截图喂帧，
+   断言点击点落在 `crop` 矩形内（`test_engine` 的 `[A]` 段已用真实夹具做了单场景版本）
+7. ⬜ iOS 侧换 FFT 核（Accelerate/vDSP）+ 重跑等价性验证（风险 #9）
+8. ⬜ `ios/AMCapture` + `ios/AMTouch` + `ios/AMRuntime`
+9. ⬜ `tweak/`（deb）+ `dylib/` 两个 Theos 工程
+10. ⬜ CI（照 `ios-tweak.yml` 模式）+ 真机验收清单
+11. ⬜ 真机：先验风险 #1（iOS 截图跑匹配），再验 #2/#3（注入），最后跑完整脚本

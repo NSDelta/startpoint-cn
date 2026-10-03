@@ -1,0 +1,9 @@
+c00_cond_M1GhcK      幻想/幻想                  tpl=165x26  roi=476x505 peak=1.000000000 @(118,272) | meangray 0.999954283 @(118,272) | exact
+c01_cond_msiNQO      开始幻想/不可续战              tpl=135x34  roi=454x337 peak=0.999997675 @(156,158) | meangray 0.999805629 @(156,158) | exact
+c02_cond_JjOLX2      挑战/挑战                  tpl=214x48  roi=703x497 peak=0.999999523 @(271,206) | meangray 0.999963939 @(271,206) | exact
+c03_cond_2lMSzb      继续/继续                  tpl= 77x33  roi=671x435 peak=1.000000000 @(282,294) | meangray 0.999780655 @(282,294) | exact
+c04_cond_aX2Gto      继续挑战/继续挑战              tpl=172x47  roi=494x397 peak=0.999999881 @(150,255) | meangray 0.999956489 @(150,255) | exact
+c05_cond_pCJ6Rk      OK/OK                  tpl= 63x37  roi=501x378 peak=1.000000000 @(215,242) | meangray 0.999974132 @(215,242) | exact
+c06_cond_6IfiNO      没开招募/没开招募              tpl=143x30  roi=494x395 peak=1.000000000 @(176,139) | meangray 0.999453366 @(176,139) | exact
+c07_cond_BqhUaU      没开招募/招募                tpl=186x46  roi=577x504 peak=1.000000000 @(182,232) | meangray 0.999972105 @(182,232) | exact
+c08_cond_mH7FSK      开始招募/开始招募              tpl=165x44  roi=599x384 peak=0.999998093 @(221,176) | meangray 0.999964714 @(221,176) | exact
