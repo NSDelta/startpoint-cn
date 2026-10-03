@@ -44,6 +44,26 @@
 导入成功后会删除 4 个标记文件：`<dummy>/{partial_downloaded.json,partial_downloaded.platform,partial_downloaded_android_thread.json}`
 与 `<Local Store>/partial_downloaded.json`（客户端用它们判断「正在下载中」，留着会一票否决本地资源）。
 
+### 1.1 客户端怎么利用这套文件（决定导入器「做到哪一步就够」）
+
+客户端启动时走 `GlobalLoading.applyLoad(rightAfterSignUp, serverAssetVersion)`（`pinball/loading/global/GlobalLoading.as:392-432`），
+三个判定的结果决定它走 ZIP 下载流 / Recovery 流 / 直接进游戏：
+
+| 判定 | 依据 | 导入器要满足的条件 |
+| --- | --- | --- |
+| `isDownloaded()` | `partial_downloaded.json` 存在 ⇒ false；否则比 `info.json.version` 与服务器版本 | 删掉 4 个 partial + `version` 写成服务器当前版本（本项目 = `1.4.54`） |
+| `isAssetComplete()` | `info.json.assetRecoveryInfo == []` | 写空数组（字段缺失会被判为不完整） |
+| `needsDownloadAsset()` | iOS（`tutorialBundleKind.index == 1`）返回 `!isBeforeTutorialDownload()` | 与导入内容无关，教学进度正常推进即可 |
+
+- 客户端另有一次 **sufficiency check**：下载服务端 `files_list`（当前是零字节的 `recovery/empty.csv`）逐行
+  `fileExists(<dummy>/<path>)`，缺失项会写回 `assetRecoveryInfo` 并触发 Recovery 流（URL = `baseUrl + <hash>`）。
+  导入完整时该表为空 ⇒ 这里不会拦。
+- `totalSize` 只用于**空间检查**，`assetSizeKind` 决定下载模式（`fulfill`/`shortened`），`baseUrl`/`files_list`
+  只服务 Recovery；`latestModifiedTimeOfArchive` 客户端只写不判。
+- 因此导入器**只需**：按序铺好 `<dummy>/download/**` + 写 `info.json` + 删 4 个 partial。
+  代价是每次启动客户端仍会向服务器要 `/asset/get_path` 之类的接口来拿「服务器版本」——所以要么跑本仓库的
+  自建服务（`npm run dev` / `启动CN服-8001.bat`），要么用 `client-patch/build/patch-ipa.mjs` 把域名改到自建服务。
+
 ## 2. 构建（Windows 上编不了，必须 macOS）
 
 ### 2.1 走 CI（推荐）

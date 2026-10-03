@@ -205,8 +205,15 @@ jobs:
           if [ -f "$run_dir/CdnImporter.dylib" ]; then git add -f "$run_dir/CdnImporter.dylib"; fi
           if [ -f "$run_dir/mini-injected.ipa" ]; then git add -f "$run_dir/mini-injected.ipa"; fi
           git commit -m "ci-diag: run ${{ github.run_id }}" >/dev/null
-          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$run_dir"
+          remote="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force "$remote" "HEAD:refs/heads/$run_dir"
           echo "已推送诊断分支：$run_dir"
+          # 自清理：只保留最近一条诊断分支（旧的一次性分支直接删掉，避免仓库里堆垃圾）
+          git ls-remote --heads "$remote" 'refs/heads/ci-diag/*' | awk '{print $2}' | sed 's#refs/heads/##' \
+            | while IFS= read -r old; do
+                if [ -z "$old" ] || [ "$old" = "$run_dir" ]; then continue; fi
+                git push "$remote" --delete "$old" && echo "已删除旧诊断分支：$old"
+              done
 
       - name: 上传 dylib
         if: always()
