@@ -121,7 +121,7 @@ NSString *CdnMaterializePathForBasename(NSString *basename);
 
 - (nullable id<CdnArchiveSource>)acquireSourceWithError:(NSError **)error {
     if (_materialized != nil) return _materialized;
-    NSString *target = CdnMaterializePathForBasename(_basename);
+    NSString *target = CdnMaterializePathForBasename(self.basename);
     if (!CdnImporterEnsureDirectory(target.stringByDeletingLastPathComponent, error)) return nil;
     CdnImporterRemoveItem(target);
     uint64_t written = 0;
@@ -132,14 +132,14 @@ NSString *CdnMaterializePathForBasename(NSString *basename);
         return nil;
     }
     _materialized = source;
-    CdnImporterLog(@"[索引] 物化整包成员 %@（%llu 字节）", _basename, written);
+    CdnImporterLog(@"[索引] 物化整包成员 %@（%llu 字节）", self.basename, written);
     return source;
 }
 
 - (void)releaseSource {
     [_materialized close];
     _materialized = nil;
-    CdnImporterRemoveItem(CdnMaterializePathForBasename(_basename));
+    CdnImporterRemoveItem(CdnMaterializePathForBasename(self.basename));
 }
 
 @end

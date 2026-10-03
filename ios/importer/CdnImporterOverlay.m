@@ -11,15 +11,27 @@ static const CGFloat kCdnBallSize = 56.0;
 
 #pragma mark - 穿透宿主 VC
 
-/// 命中自身视图时返回 nil，让触摸继续传给下层（游戏）窗口；子视图（球 / 面板）正常命中。
+/// 命中自身时返回 nil，让触摸继续传给下层（游戏）窗口；子视图（球 / 面板）正常命中。
+@interface CdnImporterPassthroughView : UIView
+@end
+
+@implementation CdnImporterPassthroughView
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit == self ? nil : hit;
+}
+
+@end
+
 @interface CdnImporterPassthroughViewController : UIViewController
 @end
 
 @implementation CdnImporterPassthroughViewController
 
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return hit == self.view ? nil : hit;
+- (void)loadView {
+    self.view = [[CdnImporterPassthroughView alloc] initWithFrame:CGRectZero];
+    self.view.backgroundColor = [UIColor clearColor];
 }
 
 - (BOOL)prefersStatusBarHidden {
