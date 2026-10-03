@@ -387,7 +387,9 @@ z8 = (c8 == 1 || c8 != 2) ? (z8 & d8) : (z8 | d8);   // relation==2 → OR，其
 一个悬浮控制面板（`UIWindow`，`windowLevel = UIWindowLevelAlert + 1`）：
 
 - **悬浮球**：点一下展开展板；可拖动，位置持久化。
-- **脚本管理**：从 `Documents/AMAutoClick/`（越狱另支持任意路径）列出 `.auto`，也支持「导入」（`UIDocumentPicker` / `iTunes 文件共享` / `Open In`）。
+- **脚本管理**：从 `Documents/AutoClick/`（越狱另支持任意路径）列出 `.auto`，也支持「导入」（`UIDocumentPicker` / `iTunes 文件共享` / `Open In`）。
+  > **实现勘误**：本节初稿写的是 `Documents/AMAutoClick/`，而代码（`AMRuntime.m` 的 `-discoverScripts`）用的是 `Documents/AutoClick/`。
+  > **以代码为准**（`Documents/AutoClick/`）。三处搜索顺序：`Documents/AutoClick/*.auto` → `Library/Application Support/AutoClick/*.auto` → main bundle 根。
 - **控制**：开始 / 暂停 / 停止 / 单步执行一轮；显示当前场景名、帧率、命中数。
 - **参数**：轮询间隔、全局 sim 覆盖、点击后延迟、调试模式（叠加显示搜索区与命中框）。
 - **日志**：最近 N 行 + 导出。
@@ -395,33 +397,42 @@ z8 = (c8 == 1 || c8 != 2) ? (z8 & d8) : (z8 | d8);   // relation==2 → OR，其
 
 ---
 
-## 8. 目录结构（冻结）
+## 8. 目录结构（**实况**，与初稿的三处偏差已标注）
 
 ```
 ios/auto/
-├─ core/                     # 纯 C，已实现并测试
-│   ├─ auto_match.{h,c}      # NCC 匹配 ✅
+├─ core/                     # 纯 C99，零平台依赖 ✅ 全部已实现
+│   ├─ auto_match.{h,c}      # NCC 匹配（FFT TM_CCOEFF_NORMED）✅
+│   ├─ am_fft.{h,c}          # 混合基 Cooley-Tukey，被上者用 ✅
 │   ├─ am_container.{h,c}    # ZIP + inflate + PNG ✅
-│   ├─ am_json.{h,c}         # JSON 解析器（待写）
-│   ├─ auto_script.{h,c}     # .auto 模型层（待写）
-│   ├─ auto_engine.{h,c}     # 执行器（待写）
-│   ├─ auto_screen.{h,c}     # 屏幕抽象 + 分辨率适配（待写）
-│   └─ auto_log.{h,c}        # 日志回调（待写）
-├─ ios/                      # 平台适配（待写）
-│   ├─ AMCapture.{h,m,mm}    # presentRenderbuffer hook + glReadPixels
-│   ├─ AMTouch.h/.m          # HID 注入 + 响应链兜底
-│   ├─ AMRuntime.{h,m}       # 装配引擎、取帧线程、面板桥接
-│   └─ AMControlPanel.{h,m}  # 悬浮面板
-├─ tweak/                    # Theos：deb（待写）
-│   ├─ Makefile  control  Tweak.xm  layout/DEBIAN/*
-├─ dylib/                    # Theos：dylib（待写）
-│   ├─ Makefile  control  AMAutoClick.plist
-├─ tests/                    # ✅ 三套已全绿
-│   ├─ test_matcher.c  test_matcher_neg.c  test_package.c
-├─ tools/                    # ✅ 夹具生成 + 构建脚本
+│   ├─ am_json.{h,c}         # JSON 解析器（两遍零 malloc）✅
+│   ├─ auto_script.{h,c}     # .auto 模型层 + 变体选择 + 坐标适配 ✅
+│   └─ auto_engine.{h,c}     # 执行器（条件折叠 / 场景派发 / 动作）✅
+│   ✗ auto_screen.{h,c}      # **不存在**：屏幕抽象在 auto_script.{h,c} 里
+│   ✗ auto_log.{h,c}         # **不存在**：日志走 am_engine_host.trace 回调
+├─ ios/                      # 平台适配 ✅ 已实现（编译验证在 CI）
+│   ├─ AMCapture.{h,m}       # presentRenderbuffer hook + glReadPixels
+│   ├─ AMTouch.{h,m}         # 伪造 UITouch + _touchesEvent + sendEvent:（HID 仅越狱侧）
+│   ├─ AMRuntime.{h,m}       # am_engine_host 接线、脚本发现、引擎线程
+│   ├─ AMConfig.{h,m}        # 部署期配置 + 面板状态持久化（单独 plist）
+│   └─ AMControlPanel.{h,m}  # 悬浮球 + 控制板
+├─ tweak/                    # Theos：deb ✅
+│   ├─ Makefile  control  AMAutoClick.plist  Tweak.x
+│   ✗ layout/DEBIAN/*        # 初稿写的，实际不需要（无 postinst/prerm）
+├─ dylib/                    # Theos：dylib ✅
+│   ├─ Makefile  control  dylib.x  tools/inject-dylib.mjs
+│   └─ tools/make-fake-dylib.mjs   # 造无代码 Mach-O，验证注入器头部算术
+├─ tests/                    # ✅ 七套（371 例）
+│   ├─ test_fft test_json test_script test_matcher
+│   ├─ test_matcher_neg test_package test_engine
+│   └─ pg_guard.{c,h}  bench_*.c  bench_cases.h
+├─ tools/                    # ✅ 夹具生成 + 构建脚本 + lint-workflow.mjs
 ├─ matcher_golden/  matcher_golden_neg/  matcher_golden_pkg/
-└─ decomp/                   # jadx 反编译参考实现（勿提交）
+└─ decomp/                   # jadx 反编译参考实现（已 gitignore，勿提交）
 ```
+
+**目录位置的勘误**：平台层的初稿目录是顶层 `ios/autoclick/`，实际按本节冻结在 `ios/auto/ios/`（`ios/autoclick/` 已删）。
+`ios/tweak/`、`ios/deb/`、`ios/prototype/`、`ios/patched/` 都是 **SpLogin（P10-B）** 的，与本交付无关。
 
 ---
 
@@ -456,16 +467,24 @@ cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher_neg.exe /Fo
 > 而**旧的可执行文件不加 `/I` 也能"通过"**（过期二进制）。② `D_CRT_SECURE_NO_WARNINGS` 必须
 > 走命令行，在源文件里 `#define` 无效（`<string.h>` 已被头文件先拉进来）。
 
-运行（参数是夹具目录；`test_script` 不传第二个参数时会自动在夹具目录的**同级**找
-`sample.auto`，即 `matcher_golden_pkg/pkg` → `matcher_golden_pkg/sample.auto`）：
+运行（参数是夹具目录 —— **这几个参数都是承重的，实测过少传会失败**）：
 
 ```powershell
-tests\build\test_package.exe   matcher_golden_pkg
-tests\build\test_script.exe    matcher_golden_pkg\pkg
-tests\build\test_engine.exe    matcher_golden_pkg\pkg
-tests\build\test_fft.exe ;  tests\build\test_json.exe
+tests\build\test_package.exe   matcher_golden_pkg       # 不是 ...\pkg
+tests\build\test_script.exe    matcher_golden_pkg\pkg   # 不传也行，会自己找同级 sample.auto
+tests\build\test_engine.exe    matcher_golden_pkg\pkg   # ★ 少传 \pkg => 36 passed, 1 failed
+tests\build\test_fft.exe ;  tests\build\test_json.exe  matcher_golden_pkg
 tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.exe matcher_golden_neg
 ```
+
+> **两个实测出来的参数陷阱**（都是"看着像产品 bug，其实只是路径"）：
+> ① `test_package` 要的是**没有 `pkg` 的那一层** —— 它的 17 个匹配用例读 `<dir>/pkg/<file>`，
+> 而 `sample.auto` 在 `matcher_golden_pkg/` 里。现在两个路径都能开（逐个候选探测），
+> 但 CI 与文档统一按上表写。
+> ② `test_engine` **必须带 `\pkg`**：它把 `<arg>` 当作存放 `script.json` + 散图的那一层。
+> 少传的后果不是崩溃，而是 **`36 passed, 1 failed`** —— 有 24 个用例被"目录里没东西"静默跳过。
+> ⇒ 任何"用例数变少"的现象都**先怀疑夹具路径**，再怀疑代码；这也是 CI 里逐套校验
+> `"N passed"` 数值（而不只看退出码）的原因。
 
 结果：`test_engine` **60 passed** / `test_script` **56 passed** / `test_package` **21 passed** /
 `test_fft` **119 passed** / `test_json` **84 passed** / `test_matcher` **13 passed** /
@@ -493,9 +512,28 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 
 ### 9.3 非越狱侧载
 
-`ios/importer/tools/inject-dylib.mjs` 已就绪（插 `LC_LOAD_DYLIB`、放进 `Frameworks/`、强断言 ncmds+1 且文件长度不变）。
-⚠️ 必须在 `client-patch/build/patch-ipa.mjs` **之后**运行；之后侧载重签。
+真身是 **`ios/auto/dylib/tools/inject-dylib.mjs`**（本节初稿写的 `ios/importer/tools/inject-dylib.mjs`
+**不存在** —— `ios/importer/` 下只有 `tools/`，没有这个脚本；`ios/patched/` 里只有一个 `.gitignore`）。
+用法：`node inject-dylib.mjs --app=<.app 目录> [--dylib=<路径>] [--name=AMAutoClick] [--check] [--force]`。
+
+**⚠️ 本节初稿的一条前提是错的，已作废**：「必须在 `client-patch/build/patch-ipa.mjs` **之后**运行」。
+`patch-ipa.mjs` 里 grep 不到任何 `LC_LOAD_DYLIB` / `Frameworks/` / `@executable_path` 相关代码
+（`client-patch/build/lib/ios-macho.mjs` 也只有**只读**解析），两者互不依赖，**顺序随便**。
+
+**它在目标二进制上实测过的数字**（`worldflipper`，108757200 B）：
+- 头部空闲区：`ncmds=67` / `sizeofcmds=7584`（0x1DA0）⇒ 命令区末尾 `0x1dc0`，到首页边界 `0x4000`
+  之间有 **8768 字节且逐字节为 0**；一条 `LC_LOAD_DYLIB` 是 72 B。
+- 注入后逐字节比对整份文件（108 MB）：**只有 52 字节不同** —— `ncmds`(0x10) +1、
+  `sizeofcmds`(0x14) +72、命令本身（到 0x1e04）。**文件长度一个字节都没变。**
+- `ipsw macho info --loads` 复核：`067: LC_LOAD_DYLIB @executable_path/Frameworks/AMAutoClick.dylib (1)`，
+  排在 `066: LC_CODE_SIGNATURE` 之前。幂等：重跑报「已经注入过了，不改动」。
+- 为什么不惜代价不移位：**AIR 的 AOT 加载器按偏移读文件**，一旦越界就要挪整个文件、
+  改 `__TEXT` 之后所有 `fileoff` —— client-patch 那边的启动黑屏就是这么来的。**宁可直接失败。**
+
+⚠️ 未加密才能注入：`LC_ENCRYPTION_INFO_64 cryptid = 0`（本包来自 DumpDecrypter）。
+`cryptid != 0` 时脚本直接 fail，**不要**绕过 —— 改完头部的加密包在设备上会被解密器拒绝。
 ⚠️ dylib 内**不可**用 MSHookFunction/ellekit API，**不可** include `rootless.h`。
+⚠️ 注入之后必须**重新签名整个 `.app`**（改过头的主二进制的原签名已失效），再打包侧载。
 
 ---
 
@@ -503,17 +541,19 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 
 | # | 风险 | 影响 | 处置 |
 |---|---|---|---|
-| 1 | iOS 版游戏 UI 布局是否与 Android 模板一致 | **致命**（匹配全失败） | ⚠️ **必须在真机取一张 iOS 截图，用 `tools/make_matcher_golden.py` 跑一遍**。这是上真机前唯一无法在 Windows 上消除的未知 |
+| 1 | iOS 版游戏 UI 布局是否与 Android 模板一致 | **致命**（匹配全失败） | ⚠️ **必须在真机取一张 iOS 截图，用 `ios/auto/tools/make_matcher_golden.py` 跑一遍**（本节初稿写的 `tools/make_matcher_golden.py` 路径不存在）。这是上真机前唯一无法在 Windows 上消除的未知 |
 | 2 | `_enqueueHIDEvent:` 在 iOS 15.8.3 是否可用 | 高（决定注入方案） | 主/备双路 + 失败自愈；见 `.research/ios-touch-synthesis.md` |
-| 3 | AIR 是否响应同进程合成触摸 | 高 | 同上；兜底走响应链 |
-| 4 | `glReadPixels` 读到的是当前帧还是上一帧 | 中 | 影响滞后一帧（30ms），可接受；真机实测确认 |
+| 3 | AIR 是否响应同进程合成触摸 | 高 | ⚠️ **仍无任何直接证据**（7 次搜索全空，无正反例）。但已证伪的相邻命题：`KQAR/Reticle#281` 在 iOS 26 真机上试了 16 种组合全部**无错误且无效果**；`EarlGrey#293` 明说 device 上因 entitlement 不行。⇒ HID 路是**进程身份/沙箱/entitlement 问题，不是版本问题**，非越狱 App 进程内基本死路。**落地方案：非越狱走伪造 `UITouch` + `sendEvent:`；越狱侧才把 HID 当第二条腿，且必须先跑 §2.5 的 marker 探针确认**。真机三步验收见 `.research/ios-touch-synthesis.md` §5-Q3 |
+| 4 | `glReadPixels` 读到的是当前帧还是上一帧 | 中 | 落在 `presentRenderbuffer:` **之前**读（present 之后 back buffer 内容未定义）；最坏滞后一帧。`AMCapture` 在取帧失败时**沿用上一帧**并计入 `dropped`，`-stats` 里可见。真机实测确认 |
 | 5 | 非越狱侧载 7 天续签 | 中 | 用户体验问题，文档说明 |
 | 6 | ~~`am_inflate_zlib` 已改非 static 但头文件未声明~~ | — | ✅ 已补进 `core/am_container.h` |
 | 7 | 风控：固定轨迹点击可能被判定为脚本 | 低（私服） | 已复刻「矩形内随机取点」，天然带抖动 |
-| 8 | **标量 C 的 FFT 比预算慢 4.26 倍**（§4.2.1） | **高**（掉帧 → 反应迟钝） | iOS 侧换 Accelerate/vDSP；并复刻 Android 的单调索引，每帧只评估可达节点。**这是已知的最大性能缺口** |
-| 9 | FFT 内核已在 Windows 上被证正确（119 例 vs 直接 DFT），但 vDSP 版是**另一份实现** | 中 | 换核后必须重跑 `test_package` 的 17 个真实用例做等价性验证，不能只信"能跑" |
+| 8 | **标量 C 的 FFT 比预算慢 4.26 倍**（§4.2.1） | **高**（掉帧 → 反应迟钝） | iOS 侧换 Accelerate/vDSP；并复刻 Android 的单调索引，每帧只评估可达节点。**这是已知的最大性能缺口**。缓解：`am_engine_match` 已有帧号缓存（同一帧不重算），且场景门每轮只评估可达节点 |
+| 9 | FFT 内核已在 Windows 上被证正确（119 例 vs 直接 DFT），但 vDSP 版是**另一份实现** | 中 | 换核后必须重跑 `test_package` 的 21 个用例（其中 17 个是真实图像）做等价性验证，不能只信"能跑" |
 | 10 | ~~`am_match_template` 的 ROI 缓存键只含尺寸不含内容~~ | — | ✅ 已修：`ctx_prepare` 现在也 `memcmp` 模板与 ROI 的像素副本（见 §4.4） |
-| 11 | iOS 版 `nativeScale` 需合成伪 densityDpi 供变体选择（§2.5） | 中 | iPhone 7 Plus `nativeScale=2.608` ⇒ density=416；变体选择只比 density，故该值必须与录制机的 density 同一量纲 |
+| 11 | ~~iOS 版 `nativeScale` 需合成伪 densityDpi 供变体选择（§2.5）~~ | 中 | ✅ 口径已纠正：density **不是**由 `nativeScale` 算，而是 **`帧缓冲宽 / 窗口点宽 × 160`**（`AMTouch -pixelToPointScaleInWindow:` 现算，优先用 `[AMCapture shared].frameSize.width / window.bounds.size.width`）。iPhone 7 Plus 逻辑 1242×2208（scale 3.0）/ 物理 1080×1920（nativeScale 2.608），**GL 帧缓冲是 1242×2208** ⇒ 用 nativeScale 会让 density 偏小 13%、**触摸坐标整体偏 1.15 倍**（1200 宽画面上 180 像素）。变体选择只比 density，故该值必须与录制机同一量纲 |
+| 12 | 本机**没有任何 iOS 编译能力**（无 clang / 无 Xcode / 无 debugger） | 中 | 平台层代码的正确性只能靠 **CI 编译 + `nm -u` 符号断言**兜住；**运行时行为（hook 是否装上、触摸是否生效）必须在真机上验**。不要把"CI 绿了"当成"能跑" |
+| 13 | AIR/Stage3D 可能渲到一个**尺寸与窗口不同的离屏 renderbuffer**再缩放上屏 | **高**（坐标整体偏 ⇒ 全点不中） | 已处置：取帧时同时问 `GL_VIEWPORT` **和**当前绑定的 renderbuffer 尺寸（`AMGLRenderbufferSize`），不一致时以 renderbuffer 为准；触摸换算系数用「帧缓冲宽 / 窗口点宽」**现算**，与帧同源。真机验收第 7 步专门查这一项 |
 
 ---
 
@@ -529,10 +569,55 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
    `f998h` 握手 —— 对所有场景都无门的脚本，两者净效果相同）；② `cond_image` 的搜索区在
    「模板 rect ∩ 搜索变量 crop」为空时回退到「模板 rect 外扩 `expand_size`」（Android 无条件求交，
    异型分辨率下交集可能为空 ⇒ 场景静默永不触发）
-6. ⬜ **Windows 侧端到端验证**：用「幻想连战.auto」+ `matcher_golden_pkg` 的 ori 截图喂帧，
-   断言点击点落在 `crop` 矩形内（`test_engine` 的 `[A]` 段已用真实夹具做了单场景版本）
+6. ✅ **Windows 侧端到端验证**：`test_engine` 的 `[A]` 段用「幻想连战.auto」+ `matcher_golden_pkg`
+   的真实 ori 截图喂帧，断言点击点落在动作自己的 `crop` 矩形内；`[B]` 段用手写 PNG 合成的
+   两张互不相同的标记图，验证「条件折叠 → 场景派发 → 点击落点」整条链（**60 例全绿**）。
 7. ⬜ iOS 侧换 FFT 核（Accelerate/vDSP）+ 重跑等价性验证（风险 #9）
-8. ⬜ `ios/AMCapture` + `ios/AMTouch` + `ios/AMRuntime`
-9. ⬜ `tweak/`（deb）+ `dylib/` 两个 Theos 工程
-10. ⬜ CI（照 `ios-tweak.yml` 模式）+ 真机验收清单
+8. ✅ `ios/auto/ios/` 五个类（`AMCapture` / `AMTouch` / `AMRuntime` / `AMConfig` / `AMControlPanel`）
+   —— 源码已完成。**注意：本机无 clang，首次编译发生在 CI 上，运行行为必须真机验（风险 #12）**
+9. ✅ `tweak/`（deb）+ `dylib/` 两个 Theos 工程 + `dylib/tools/inject-dylib.mjs`（已在真实
+   `worldflipper` 上跑通，见 §9.3）
+10. ✅ CI（`.github/workflows/ios-autoclick.yml`，2×2 矩阵 + 371 例回归 + 产物结构断言）；
+    ⬜ **真机验收清单**（见 §12）
 11. ⬜ 真机：先验风险 #1（iOS 截图跑匹配），再验 #2/#3（注入），最后跑完整脚本
+
+---
+
+## 12. 真机验收清单（按顺序做，每一步失败都会让后面的话没意义）
+
+**第 0 步 —— 先确认 iOS 上的画面能不能匹配（风险 #1，最致命）**
+1. 越狱 iPhone 7 Plus 装上 deb，进游戏到主界面。
+2. 面板上按「导出当前帧」→ 得到一张 PNG（`AMCapture -previewImage` / 内部帧缓冲）。
+3. 把这张 PNG 拷回本机，用 `ios/auto/tools/make_matcher_golden.py` 对 `幻想连战.auto`
+   的 24 个模板各跑一遍，看**峰值**。判据：`>= sim (0.8)`。
+   - 若普遍低于 0.8 但形状对得上 ⇒ 大概率是**缩放**问题（§2.5 的适配口径），不是匹配坏了。
+   - 若峰值普遍 ≈ 0 ⇒ 画面完全不同（分辨率/UI 改版）⇒ **必须先重录模板**，别再往下走。
+
+**第 1 步 —— 取帧是否真的在跑**
+4. Console 里过滤 `[AMAutoClick]`；`AMCapture -stats` 的 `frames` 应随游戏画面持续增长。
+   `dropped` 若持续增长说明消费端跟不上（正常，见 §4.2.1），但 `frames` 必须涨。
+   - `frames == 0` ⇒ hook 没装上（`presentRenderbuffer:` 没被调用 / 不是 GL 主路）⇒ 查 `backendName`。
+
+**第 2 步 —— 触摸是否真的到达游戏（风险 #3，第二致命）**
+5. 先用 `AMTouch -describeHitAtPoint:` 在 Console 打印目标点的 `hitTest:` 链
+   （`.research/ios-touch-synthesis.md` §5-Q3 第 1 步）。**必须打印出 AIR 的 UIView 子类**，
+   不能是 nil、也不能只有 UIWindow。
+   - 若链里出现 `uie=0`（`userInteractionEnabled == NO`）或 `hidden=1` / `alpha≈0`
+     ⇒ 合成触摸一定会被丢弃，需要用 §4.1 的强制命中。
+6. 再 swizzle `-[UIApplication sendEvent:]` 只打日志，**用手指点一下**目标按钮，记录真实手指
+   到达的 `touch.view` 类名；与第 5 步合成时命中的类名对比。**不一致就还不能往下走。**
+7. 面板上按「测试点击」：在游戏画面上画一个准星，点一次，看准星位置。
+   - 点偏但方向对 ⇒ 坐标换算错（先怀疑 §10 风险 #11 的 density 口径）。
+   - 完全没反应但 Console 无报错 ⇒ 回到第 6 步。
+
+**第 3 步 —— 完整脚本**
+8. 把 `幻想连战.auto` 放进 `Documents/AutoClick/`（**不是 `Documents/AMAutoClick/`**，见 §7）。
+9. 面板上选脚本 → 启动；观察是否按预期的场景顺序推进。
+10. 打开面板的「日志」页，确认 `am_engine_last_error` 与 `taps` 计数；`taps` 为 0 而 `frames` 在涨
+    ⇒ 所有条件都不成立 ⇒ 回到第 0 步。
+
+**第 4 步 —— 非越狱侧**
+11. `node ios/auto/dylib/tools/inject-dylib.mjs --app=<解密的 worldflipper.app>`（先 `--check`）。
+12. 重新签名整个 `.app` → 打包 → 侧载 → 7 天内启动。
+13. 因为没有人能点面板，必须靠 `AMConfig` 的 `autoStart` + `preferredScriptName`（见 §7）。
+    Console 里 `[AMAutoClick] dylib 已就绪：…` 是唯一的存活证据。

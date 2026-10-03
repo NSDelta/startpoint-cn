@@ -35,6 +35,20 @@ core/                 引擎（纯 C99，无平台依赖）
   auto_script.[ch]    .auto 模型层：模板组 / 变量 / 场景 / 条件 / 动作 + 变体选择 + 坐标适配
   auto_engine.[ch]    执行引擎：条件折叠 / 场景派发 / 超时 / 动作执行 / 点击取点
 
+ios/                  平台层（Objective-C，只在 CI 上编译过 —— 本机没有 clang）
+  AMCapture.[hm]      hook -[EAGLContext presentRenderbuffer:] 后 glReadPixels 取帧
+  AMTouch.[hm]        伪造 UITouch + -[UIApplication _touchesEvent] + sendEvent:
+  AMRuntime.[hm]      把 am_engine_host 接到上面两个；脚本发现；引擎线程
+  AMConfig.[hm]       部署期配置 + 面板状态（单独 plist，不用 NSUserDefaults）
+  AMControlPanel.[hm] 悬浮球 + 控制板（导出当前帧 / 日志 / 启停）
+
+tweak/                交付物①：越狱 deb（Theos）
+  Makefile control AMAutoClick.plist Tweak.x
+dylib/                交付物②：非越狱注入单个 App 的 dylib（Theos）
+  Makefile control dylib.x
+  tools/inject-dylib.mjs     插 LC_LOAD_DYLIB + 拷 Frameworks/（不移位，硬断言）
+  tools/make-fake-dylib.mjs  造无代码 Mach-O，验证注入器的头部算术
+
 tests/                七套测试（MSVC，见 §3）；build/ 与 decomp/ 都不入库
   test_fft.c          119 例：与直接 DFT 逐元素对拍 + 卷积定理 + next_fast_size
   test_json.c          84 例：JSON 解析（含畸形输入与错误偏移）
@@ -52,6 +66,8 @@ matcher_golden_neg/   18 个负样本夹具（golden_neg_cases.h + raw/*.bin）
 matcher_golden_pkg/   sample.auto + pkg/（54 张平铺 PNG + script.json）+ 17 个真实匹配用例
 sample/               从「幻想连战.auto」解出的 script.json 与结构报告（人读用）
 tools/                生成夹具的 python 脚本（cv2 参考实现）
+  check-test-patterns.mjs  拿真实测试输出核对 CI 里的 grep 模式
+  lint-workflow.mjs        工作流 YAML 体检（TAB / 缩进 / 关键锚点）
 *.py                  格式逆向与坐标模型的验证脚本（coord_model / extract_auto / verify_format …）
 ```
 
@@ -78,26 +94,62 @@ cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher.exe /Fo:tes
 cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_matcher_neg.exe /Fo:tests\build\ $inc tests\test_matcher_neg.c core\auto_match.c core\am_fft.c core\am_container.c"
 ```
 
-运行：
+运行（**参数是夹具目录，不是可选的 —— 少传会静默少跑用例**）：
 
 ```powershell
 tests\build\test_fft.exe          # 119 passed, 0 failed
-tests\build\test_json.exe         #  84 passed, 0 failed
-tests\build\test_matcher.exe      matcher_golden        #  13 passed, 0 failed
-tests\build\test_matcher_neg.exe  matcher_golden_neg    #  18 passed, 0 failed
+tests\build\test_json.exe         matcher_golden_pkg       #  84 passed, 0 failed
+tests\build\test_matcher.exe      matcher_golden           #  13 passed, 0 failed
+tests\build\test_matcher_neg.exe  matcher_golden_neg       #  18 passed, 0 failed
 tests\build\test_script.exe       matcher_golden_pkg\pkg   # 56 passed, 0 failed
-tests\build\test_package.exe      matcher_golden_pkg       # 21 passed, 0 failed
-tests\build\test_engine.exe       matcher_golden_pkg\pkg   # 60 passed, 0 failed
+tests\build\test_package.exe      matcher_golden_pkg       # 21 passed, 0 failed（不是 ...\pkg）
+tests\build\test_engine.exe       matcher_golden_pkg\pkg   # 60 passed, 0 failed（★ 少传 \pkg => 36 passed, 1 failed）
 ```
 
 **合计 371 例，全部 0 failed、零 warning。**
 
-> **两个坑**：
+> **四个坑**：
 > ① `golden_cases.h` / `golden_neg_cases.h` / `golden_pkg_cases.h` **不在 `tests\` 里**，
 > 而在各自夹具目录 —— 上面 `$inc` 里的三个 `/I` 是承重的。缺了会报 `fatal error C1083`，
 > 而**旧的可执行文件不加 `/I` 也能"通过"**（过期二进制）。改完代码务必重新编译。
 > ② `D_CRT_SECURE_NO_WARNINGS` 必须走命令行，在源文件里 `#define` 无效
 > （`<string.h>` 已被头文件先拉进来）。
+> ③ **`test_engine` 必须带 `\pkg`**：它把参数当作存放 `script.json` + 散图的那一层。
+> 少传不会崩，而是 **`36 passed, 1 failed`** —— 24 个用例被"目录里没东西"静默跳过。
+> **任何"用例数变少"的现象都先怀疑夹具路径，再怀疑代码。**
+> ④ 编译过一次之后别忘了 `tests\build\` 是 gitignore 的：换个 shell 可能跑到**旧二进制**。
+> 拿不准就先 `Remove-Item -Recurse tests\build`。
+
+工作流里的这些 `"119 passed"` 之类模式可用 `node tools/check-test-patterns.mjs .` 核对
+（模式写错会让 CI 的某一格永远通过或永远失败，而在日志里只是一行字）。
+
+### 3.1 iOS 侧（CI）
+
+本机**没有 clang**，所以进 CI 之前先把能在 Windows 上做的检查做掉：
+
+```powershell
+node tools\lint-workflow.mjs ..\..\.github\workflows\ios-autoclick.yml  # 工作流 YAML 体检
+node tools\selftest-check-objc.mjs .   # ★ 先证明检查器自己有效
+node tools\check-objc.mjs .            # 再拿它查真代码
+```
+
+`check-objc.mjs` **不是编译器**（不做类型检查），只做三件能在本机抓住的事：
+① 结构配平（`@interface`/`@implementation`/`@protocol` 与 `@end`、括号、CRLF）；
+② 头里声明的方法在 `.m` 里有没有实现；
+③ `@property` 少了分号这类低级错误。
+**为什么必须连自检一起跑**：一个「什么都报不出来」的检查器与「代码很干净」在输出上完全
+无法区分。`selftest-check-objc.mjs` 往 `AMTouch.m`/`AMTouch.h` 里植入 4 个已知必错的变体
+（删一个 `}`、删一个 `@end`、改一个方法名、转成 CRLF），断言检查器**确实报了出来**，然后还原。
+> 这个自检第一次跑就抓到了它自己的 bug：探针里写的声明与头文件里逐字存在的声明不一致
+> （真身是 `- (NSString *)backendName;`，探针写成 `- (nullable NSString *)backendName;`）
+> ⇒ 替换没生效 ⇒ 报 "MISS"。**探针本身也要有判据。**
+
+推送到 `ios/auto/**` 或手动触发 `.github/workflows/ios-autoclick.yml`：2×2 矩阵
+（`tweak|dylib` × `rootless|rootful`），除编译外还跑上面 371 例并**逐个校验 `"N passed"` 数值**
+（只看退出码会漏掉"少跑了一半用例"），再对产物做结构断言 ——
+`lipo -info` 必须 arm64、tweak 必须 `nm -u` 到 `_MSHookMessageEx`（证明 logos 展开了）、
+dylib **绝不能**出现 `MSHook*` 符号（非越狱 App 里会 dyld 报错）、
+deb 里 dylib 与过滤器 plist 同目录、rootless 落在 `/var/jb`、过滤器里必须有 `com.leiting.wf`。
 
 ---
 
@@ -174,3 +226,52 @@ python coord_model.py                         # 复算点击点模型（cv2 参�
 - **不要用 PowerShell 做文本往返**（`Get-Content -Raw | -replace | Set-Content`）：
   会把 UTF-8 中文注释变成 mojibake 并触发 `warning C4819`。
   改文件只用 `edit` / `write` 工具。
+- **取帧尺寸与触摸换算系数必须同源**。`AMCapture` 取帧时同时问 `GL_VIEWPORT` 与
+  当前绑定的 renderbuffer 尺寸，而**不是**只用视口：hook 挂在 `presentRenderbuffer:` 上，
+  present 之前当前绑定的 framebuffer 未必是即将上屏的那个（AIR 可能渲到离屏 renderbuffer
+  再缩放上屏）。两者不一致时触摸坐标的换算系数会整体偏掉 —— 症状是"点偏了但方向对"，
+  15% 级别的偏差在 1200 宽画面上就是 180 像素。
+  同理，**坐标换算的 scale 不是 `nativeScale`**，而是「帧缓冲宽 / 窗口点宽」（见 §7 与
+  `.research/ios-design.md` §10 风险 #11）。
+- **`edit` 往函数体里插代码前先 `read` 那一块**：插一段带 `char path[1024]; int pass, fail;`
+  的代码、而原处已有同样的声明 ⇒ `error C2086: redefinition`。这条重复踩过三次。
+- **本机没有 clang / Xcode / 任何 debugger**。iOS 代码的首次编译发生在 CI 上，
+  **运行行为只能在真机上验**。不要把"CI 绿了"当成"能跑"。
+  没有调试器时的越界定位手段是 `tests/pg_guard.[ch]`（页守护分配器）；
+  验证它自己是否可信，要先同时对**一个合法用例**和**一个非法用例**跑一遍。
+
+---
+
+## 7. 两个交付物怎么出（快速通道）
+
+### ① 越狱 deb
+
+```bash
+cd ios/auto/tweak
+make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_DIR="$PWD/dist/rootless"
+make package FINALPACKAGE=1                          THEOS_PACKAGE_DIR="$PWD/dist/rootful"
+```
+
+装到 iPhone 7 Plus / iOS 15.8.3（A10 = arm64，Dopamine 2.x 或 palera1n rootless + ElleKit）。
+过滤器 `AMAutoClick.plist` = `Bundles: com.leiting.wf` + `Executables: worldflipper`
+（**两者是「或」** —— 即使 bundle id 被重签改了，可执行名还在，仍会注入）。
+脚本放 `Documents/AutoClick/*.auto`，面板开机可选自动弹出。
+
+### ② 非越狱 dylib
+
+```bash
+cd ios/auto/dylib && make package FINALPACKAGE=1
+node tools/inject-dylib.mjs --app=/path/to/worldflipper.app --check   # 先干跑
+node tools/inject-dylib.mjs --app=/path/to/worldflipper.app
+# 然后重新签名整个 .app → 打包 → 侧载
+```
+
+注入器**不移位**（文件长度一个字节不变），并在目标二进制上实测过：
+`ncmds 67→68`、`sizeofcmds 7584→7656`、整份 108 MB 里只有 52 字节不同且全部 `< 0x4000`。
+它拒绝两类输入：`cryptid != 0`（加密包，改头会被设备的解密器拒绝）
+和头部空闲区不够（AIR 的 AOT 加载器按偏移读文件，移位 = 启动黑屏）。
+
+非越狱侧**没有人能点面板**，所以必须靠 `AMConfig` 的 `autoStart` + `preferredScriptName`
+自动起跑；指名的脚本不在设备上时**不启动**（宁可不动，也不要跑错脚本乱点）。
+真机验收按 `.research/ios-design.md` §12 的顺序做 —— **第 0 步（iOS 截图能否匹配上）
+不过就不要往下走**。

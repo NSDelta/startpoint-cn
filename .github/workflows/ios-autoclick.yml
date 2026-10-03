@@ -76,6 +76,19 @@ jobs:
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "Theos HEAD: $(git -C "$THEOS" rev-parse HEAD)"
 
+      # ── 进 clang 之前先做能做的静态检查 ─────────────────────────────────
+      # 这几步都很便宜，且都实测过（本机无 clang，所以它们是"编译失败"的第一道滤网）。
+      # 顺序有意为之：自检 → 体检，这样"检查器自己坏了"和"代码坏了"能分开。
+      - name: 工作流与 ObjC 结构体检
+        run: |
+          set -euo pipefail
+          cd ios/auto
+          node tools/lint-workflow.mjs ../../.github/workflows/ios-autoclick.yml
+          # 先证明检查器自己有效（对 4 个植入错误都能报出来），再拿它查真代码 ——
+          # 一个"什么都报不出来"的检查器与"代码很干净"在输出上无法区分。
+          node tools/selftest-check-objc.mjs .
+          node tools/check-objc.mjs .
+
       # ── core 的编译 + 回归（跨编译器验证）────────────────────────────────
       # 这 371 个用例平时在 Windows/MSVC 上跑。clang 下再跑一遍能同时抓到两类问题：
       #   · core 里 MSVC 容忍而 clang 不容忍的写法（隐式声明、窄化、变长数组…）

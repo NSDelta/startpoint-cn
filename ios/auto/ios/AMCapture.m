@@ -42,13 +42,39 @@
 // -[EAGLContext presentRenderbuffer:] 是**公开**方法（EAGL.h 里有声明），
 // 所以不需要运行时消息转发，直接 hook 即可。
 //
-// 但「当前 renderbuffer 的宽高」只能通过 -[EAGLContext renderbufferStorage:fromDrawable:]
-// 的入参、或 -[EAGLContext drawableProperties] 间接知道。ES2 的 EAGLContext 会把
-// 最近一次 renderbufferStorage 的尺寸记在内部 —— 读取它需要一个私有 selector。
-// **不可靠**，所以本实现改成：从 glGetIntegerv(GL_VIEWPORT) 问默认 framebuffer 的视口。
-// 视口 = 本次绘制的可绘制区域，对 Stage3D 的全屏绘制就等于屏幕像素尺寸。
-// 如果视口比实际 framebuffer 小（有黑边），读到的是子矩形，此时**以视口为准**是对的：
-// 黑边不该参与匹配。
+// 但「当前 renderbuffer 的宽高」早期有人想通过 -[EAGLContext renderbufferStorage:fromDrawable:]
+// 的入参、或 -[EAGLContext drawableProperties] 间接去猜 —— 那需要私有 selector，**不可靠**。
+// 本实现改成直接问 GL：视口 + 当前绑定的 renderbuffer 尺寸（见下面两个函数）。
+
+/// 当前绑定的 renderbuffer 的像素尺寸。
+/// 为什么除了视口还要问它：hook 挂在 `presentRenderbuffer:` 上，而**present 之前**
+/// 当前绑定的 framebuffer 未必等于「即将上屏的那个」。AIR/Stage3D 完全可能把整屏渲到
+/// 一个离屏 renderbuffer 再缩放上屏；此时视口是离屏的尺寸，而窗口的点宽对应的是别的
+/// 尺寸 ⇒ 触摸坐标的换算系数就会整体偏掉（15% 级别的偏差正是「点偏了但方向对」的典型症状）。
+/// 同时记下两者，取帧尺寸才能与换算系数同源。
+static BOOL AMGLRenderbufferSize(GLint *outW, GLint *outH)
+{
+    if (!outW || !outH) return NO;
+    *outW = 0; *outH = 0;
+
+    GLint prev = 0;
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev);
+    while (glGetError() != GL_NO_ERROR) { }      // glGetIntegerv 会清错，先清干净再问
+
+    GLint w = 0, h = 0;
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH,  &w);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &h);
+    while (glGetError() != GL_NO_ERROR) { }
+
+    if (prev != 0) glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prev);   // 别把别人的绑定改掉
+
+    if (prev == 0 || w <= 0 || h <= 0) return NO;   // 0 号 renderbuffer 不是合法对象
+    *outW = w; *outH = h;
+    return YES;
+}
+
+// 视口 = 本次绘制的可绘制区域。如果视口比实际 framebuffer 小（有黑边），读到的是
+// 子矩形，此时**以视口为准**是对的：黑边不该参与匹配。
 static BOOL AMGLViewport(GLint *outX, GLint *outY, GLint *outW, GLint *outH)
 {
     GLint vp[4] = { 0, 0, 0, 0 };
@@ -58,6 +84,19 @@ static BOOL AMGLViewport(GLint *outX, GLint *outY, GLint *outW, GLint *outH)
     // glGetIntegerv 会把当前的 GL 错误清掉，所以这里要先把之前的错误读干净，
     // 免得把别人的错误吞了。
     while (glGetError() != GL_NO_ERROR) { }
+
+    // 视口比 renderbuffer 大是不可能的（GL 会报错），所以只要 renderbuffer 尺寸
+    // 与视口不一致，就一定是在渲一个子矩形或另一个 framebuffer。
+    // 判定：renderbuffer 已知且**不大于**视口 ⇒ 以 renderbuffer 为准（它才是会上屏的东西）；
+    // 否则退回视口（宁可相信黑边不应参与匹配）。
+    GLint rw = 0, rh = 0;
+    if (AMGLRenderbufferSize(&rw, &rh) && rw <= vp[2] && rh <= vp[3] &&
+        (rw != vp[2] || rh != vp[3])) {
+        vp[2] = rw;
+        vp[3] = rh;
+        if (vp[0] + vp[2] > rw) vp[0] = 0;
+        if (vp[1] + vp[3] > rh) vp[1] = 0;
+    }
 
     if (outX) *outX = vp[0];
     if (outY) *outY = vp[1];
