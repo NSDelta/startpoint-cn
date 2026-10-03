@@ -238,6 +238,15 @@ const TEST_GROUPS = Object.freeze({
             "tools/cdn_types.test.cjs",
         ],
     },
+    "quick:ios-importer": {
+        execution: "parallel",
+        tests: [
+            "tools/ios_importer_lint.test.cjs",
+            "tools/ios_importer_plan.test.cjs",
+            "tools/ios_importer_inject.test.cjs",
+            "tools/ios_importer_zip.test.cjs",
+        ],
+    },
     "quick:content": {
         execution: "parallel",
         timeoutMs: 60_000,

@@ -1,0 +1,240 @@
+name: ios-importer
+
+# 非越狱线出包：把 ios/importer 的 ObjC 源码编译成 CdnImporter.dylib（本机是 Windows，编不了）。
+# CI 只负责「编译 + 自检 + 冒烟注入」；真正的注入在用户机器上跑（官方 IPA 139MB 是版权数据，不进仓库/CI）：
+#   node ios/importer/tools/inject-dylib.mjs --ipa <官方 ipa> --dylib CdnImporter.dylib
+# 顺序要求：先跑 client-patch/build/patch-ipa.mjs（服务器改址，它断言 ncmds/sizeofcmds 不变），再跑注入器。
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_base:
+        description: "编译进 dylib 的 baseUrl（真实局域网地址只在派发时传，不要写进仓库文件）"
+        required: false
+        default: "http://192.168.1.10:8001/patch/cn/"
+  push:
+    paths:
+      - "ios/importer/**"
+      - ".github/workflows/ios-importer.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-importer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 占位地址（hygiene 白名单里的唯一局域网 IP）；真实地址用 workflow_dispatch 的 patch_base 传。
+  PATCH_BASE: ${{ github.event.inputs.patch_base || 'http://192.168.1.10:8001/patch/cn/' }}
+
+jobs:
+  test:
+    name: 自检与测试
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: 环境信息（取证）
+        run: |
+          sw_vers
+          node --version
+          uname -m
+
+      - name: ObjC 静态自检（编译期才会暴露的低级错误提前拦）
+        run: node ios/importer/tools/lint-objc.mjs --stats
+
+      # quick:ios-importer 组只依赖 node 内置模块，不需要 npm ci。
+      - name: 导入器测试组
+        run: node tools/test-workflow/run.cjs --group quick:ios-importer
+
+  build:
+    name: 编译 dylib 与冒烟注入
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: 环境信息（取证）
+        run: |
+          set -o pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun -sdk iphoneos clang --version
+          mkdir -p "$RUNNER_TEMP/out"
+
+      - name: 编译 CdnImporter.dylib
+        id: clang
+        run: |
+          set -o pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          DEF_PATCH_BASE="$(printf '@"%s"' "$PATCH_BASE")"
+          echo "编译期宏：CDN_IMPORT_PATCH_BASE=$DEF_PATCH_BASE"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -dynamiclib \
+            -isysroot "$SDK" -miphoneos-version-min=14.0 \
+            -fobjc-arc -O2 -Wall \
+            "-DCDN_IMPORT_PATCH_BASE=$DEF_PATCH_BASE" \
+            -install_name @executable_path/Frameworks/CdnImporter.dylib \
+            ios/importer/*.m \
+            -framework UIKit -framework Foundation -framework UniformTypeIdentifiers -lz \
+            -o "$RUNNER_TEMP/out/CdnImporter.dylib" 2>&1 | tee "$RUNNER_TEMP/clang.log"
+
+      - name: 产物取证（file/lipo/otool/符号表）
+        if: always()
+        run: |
+          DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "没有产物（编译未通过），跳过取证"
+            exit 0
+          fi
+          file "$DYLIB"
+          lipo -info "$DYLIB"
+          otool -hv "$DYLIB" | head -5
+          echo "--- 依赖的动态库 ---"
+          otool -L "$DYLIB"
+          echo "--- 加载命令里的 LC_LOAD_DYLIB ---"
+          otool -l "$DYLIB" | grep -A3 LC_LOAD_DYLIB | head -40
+          echo "--- 大小与指纹 ---"
+          stat -f "%z 字节" "$DYLIB"
+          shasum -a 256 "$DYLIB"
+
+      - name: ad-hoc 签名（Sideloadly 侧载时会重签，这里只是让产物可直接被 dyld 接受）
+        if: always()
+        run: |
+          DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "没有产物，跳过签名"
+            exit 0
+          fi
+          codesign --force --sign - --timestamp=none "$DYLIB"
+          codesign -dv --verbose=4 "$DYLIB" 2>&1 | head -20
+          shasum -a 256 "$DYLIB"
+
+      - name: 冒烟注入（合成迷你 IPA + 真 dylib，端到端走一遍注入器）
+        if: always()
+        run: |
+          set -o pipefail
+          DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "没有产物，跳过冒烟"
+            exit 0
+          fi
+          node ios/importer/tools/make-mini-ipa.mjs --out "$RUNNER_TEMP/out/mini.ipa" --app CdnImporterSmoke \
+            2>&1 | tee "$RUNNER_TEMP/smoke.log"
+          node ios/importer/tools/inject-dylib.mjs \
+            --ipa "$RUNNER_TEMP/out/mini.ipa" \
+            --dylib "$DYLIB" \
+            --app CdnImporterSmoke \
+            --out "$RUNNER_TEMP/out/mini-injected.ipa" \
+            2>&1 | tee -a "$RUNNER_TEMP/smoke.log"
+          node -e "const r=require(process.env.RUNNER_TEMP+'/out/mini-injected.ipa.build-report.json'); const bad=r.assertions.filter(a=>!a.ok); if(bad.length){console.error('注入断言失败：',bad);process.exit(1)} console.log('注入断言 '+r.assertions.length+' 条全过；ncmds '+r.injection.ncmdsBefore+'→'+r.injection.ncmdsAfter+'，sizeofcmds '+r.injection.sizeofcmdsBefore+'→'+r.injection.sizeofcmdsAfter);"
+
+      # ─── 三条零凭据诊断通道：注解 / 一次性分支 / artifact ───
+      - name: 诊断（注解通道：把编译日志与错误摘录贴到运行页）
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/clang.log"
+          if [ ! -f "$log" ]; then
+            echo "没有 clang.log，跳过注解通道"
+            exit 0
+          fi
+          lines="$(wc -l < "$log" | tr -d ' ')"
+          echo "clang.log 共 $lines 行"
+
+          # ① 摘要式注解：每 30 行一条 ::notice（上限 750 行）
+          head -n 750 "$log" | awk 'BEGIN{n=0} {buf[NR]=$0} END{
+            idx=0
+            for (start=1; start<=NR; start+=30) {
+              idx++
+              printf "::notice title=clang-log-%02d::\n", idx
+              for (i=start; i<start+30 && i<=NR; i++) print buf[i]
+            }
+          }'
+
+          # ② 错误摘录：按类别抓关键行 + 上下文（±6 行）
+          #    注意：grep 无匹配会返回 1，必须 || true；循环体里也不能用 `[ … ] && …` 收尾（-e 下会中止步骤）。
+          grep -nE 'error:|fatal error|no member named|no visible @interface|use of undeclared identifier|cannot find interface|expected .* before' "$log" \
+            | head -20 > "$RUNNER_TEMP/errors.txt" || true
+          idx=0
+          while IFS= read -r hit; do
+            if [ -z "$hit" ]; then continue; fi
+            idx=$((idx + 1))
+            lineno="${hit%%:*}"
+            echo "::error title=clang-error-$(printf '%02d' "$idx")::${hit#*:}"
+            start=$((lineno - 6))
+            if [ "$start" -lt 1 ]; then start=1; fi
+            sed -n "${start},$((lineno + 6))p" "$log"
+          done < "$RUNNER_TEMP/errors.txt"
+          echo "注解通道完成"
+
+      - name: 诊断（分支通道：日志与产物推到一次性分支）
+        if: always()
+        run: |
+          set -uo pipefail
+          run_dir="ci-diag/${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan "$run_dir" 2>/dev/null || git checkout "$run_dir"
+          git rm -r --cached . >/dev/null 2>&1 || true
+          mkdir -p "$run_dir"
+          {
+            echo "run=${{ github.run_id }} attempt=${{ github.run_number }}"
+            echo "ref=${{ github.ref }} sha=${{ github.sha }}"
+            echo "patch_base=$PATCH_BASE"
+            sw_vers
+            xcodebuild -version
+          } > "$run_dir/meta.txt"
+          if [ -f "$RUNNER_TEMP/clang.log" ]; then cp "$RUNNER_TEMP/clang.log" "$run_dir/clang.log"; fi
+          if [ -f "$RUNNER_TEMP/smoke.log" ]; then cp "$RUNNER_TEMP/smoke.log" "$run_dir/smoke.log"; fi
+          if [ -f "$RUNNER_TEMP/out/CdnImporter.dylib" ]; then cp "$RUNNER_TEMP/out/CdnImporter.dylib" "$run_dir/CdnImporter.dylib"; fi
+          if [ -f "$RUNNER_TEMP/out/mini-injected.ipa" ]; then cp "$RUNNER_TEMP/out/mini-injected.ipa" "$run_dir/mini-injected.ipa"; fi
+          git add -f "$run_dir/meta.txt"
+          if [ -f "$run_dir/clang.log" ]; then git add -f "$run_dir/clang.log"; fi
+          if [ -f "$run_dir/smoke.log" ]; then git add -f "$run_dir/smoke.log"; fi
+          if [ -f "$run_dir/CdnImporter.dylib" ]; then git add -f "$run_dir/CdnImporter.dylib"; fi
+          if [ -f "$run_dir/mini-injected.ipa" ]; then git add -f "$run_dir/mini-injected.ipa"; fi
+          git commit -m "ci-diag: run ${{ github.run_id }}" >/dev/null
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/$run_dir"
+          echo "已推送诊断分支：$run_dir"
+
+      - name: 上传 dylib
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CdnImporter-dylib
+          path: ${{ runner.temp }}/out/CdnImporter.dylib
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-log
+          path: ${{ runner.temp }}/clang.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传冒烟产物（合成迷你 IPA 与注入报告）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: injection-smoke
+          path: |
+            ${{ runner.temp }}/out/mini.ipa
+            ${{ runner.temp }}/out/mini-injected.ipa
+            ${{ runner.temp }}/out/mini-injected.ipa.build-report.json
+            ${{ runner.temp }}/smoke.log
+          if-no-files-found: warn
+          retention-days: 30

@@ -865,6 +865,9 @@ const SOURCE_RULES = [
     { pattern: /^src\/lib\/bind-gate\.ts$/, groups: ["integration:database"] },
     // 客户端重命名工具（P12）：APK/IPA 包名重写，自带 tools/rename_package.test.cjs（quick:runtime）。
     { pattern: /^client-patch\/tools\/rename-package\.mjs$/, groups: ["quick:runtime"] },
+    // iOS CDN 导入器（非越狱 dylib 线）：ObjC 源码 + 计划生成/注入工具 + 自带三个测试（quick:ios-importer）。
+    // ios/importer/** 的唯一测试入口就是这一组，跑 full 只会重复执行，故这里收窄。
+    { pattern: /^ios\/importer\//, groups: ["quick:ios-importer"] },
     {
         pattern: /^src\/data\/(?!player-save\/|defaultSave\.ts$|domains\/(?:account-binding|bondTokenExchange|gift|item-maintenance|news)\.ts$|schema\/(?:account-binding|server-(?:gifts|news))\.ts$)/,
         groups: ["integration:database", "full"],
