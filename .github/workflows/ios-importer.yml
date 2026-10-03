@@ -108,6 +108,7 @@ jobs:
           echo "--- 大小与指纹 ---"
           stat -f "%z 字节" "$DYLIB"
           shasum -a 256 "$DYLIB"
+          echo "::notice title=dylib-evidence::$(file -b "$DYLIB") | $(lipo -info "$DYLIB" | tr -d '\n') | $(stat -f "%z" "$DYLIB") 字节 | sha256 $(shasum -a 256 "$DYLIB" | cut -c1-16)"
 
       - name: ad-hoc 签名（Sideloadly 侧载时会重签，这里只是让产物可直接被 dyld 接受）
         if: always()
@@ -138,7 +139,10 @@ jobs:
             --app CdnImporterSmoke \
             --out "$RUNNER_TEMP/out/mini-injected.ipa" \
             2>&1 | tee -a "$RUNNER_TEMP/smoke.log"
-          node -e "const r=require(process.env.RUNNER_TEMP+'/out/mini-injected.ipa.build-report.json'); const bad=r.assertions.filter(a=>!a.ok); if(bad.length){console.error('注入断言失败：',bad);process.exit(1)} console.log('注入断言 '+r.assertions.length+' 条全过；ncmds '+r.injection.ncmdsBefore+'→'+r.injection.ncmdsAfter+'，sizeofcmds '+r.injection.sizeofcmdsBefore+'→'+r.injection.sizeofcmdsAfter);"
+          node -e "const r=require(process.env.RUNNER_TEMP+'/out/mini-injected.ipa.build-report.json'); const bad=r.assertions.filter(a=>!a.ok); if(bad.length){console.error('注入断言失败：',bad);process.exit(1)} console.log('注入断言 '+r.assertions.length+' 条全过；ncmds '+r.injection.ncmdsBefore+'→'+r.injection.ncmdsAfter+'，sizeofcmds '+r.injection.sizeofcmdsBefore+'→'+r.injection.sizeofcmdsAfter);" \
+            | tee -a "$RUNNER_TEMP/smoke.log"
+          summary="$(grep -o '注入断言 .*' "$RUNNER_TEMP/smoke.log" | tail -1)"
+          echo "::notice title=inject-smoke::${summary:-注入断言通过}；报告 assertions=$(node -e "console.log(require(process.env.RUNNER_TEMP+'/out/mini-injected.ipa.build-report.json').assertions.length)") 条"
 
       # ─── 三条零凭据诊断通道：注解 / 一次性分支 / artifact ───
       - name: 诊断（注解通道：把编译日志与错误摘录贴到运行页）
