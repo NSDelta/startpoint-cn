@@ -249,3 +249,43 @@ jobs:
             ${{ runner.temp }}/smoke.log
           if-no-files-found: warn
           retention-days: 30
+
+      # artifact 下载必须带 token；release 资产对公开仓库是匿名可取的 ⇒ 同一次构建同时发一份到 release。
+      - name: 发布到 release（滚动标签，公开可匿名下载）
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          DYLIB="$RUNNER_TEMP/out/CdnImporter.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "没有产物（编译未通过），跳过发布"
+            exit 0
+          fi
+          TAG="cdn-importer-latest"
+          files=("$DYLIB")
+          if [ -f "$RUNNER_TEMP/clang.log" ]; then
+            cp "$RUNNER_TEMP/clang.log" "$RUNNER_TEMP/out/clang.log"
+            files+=("$RUNNER_TEMP/out/clang.log")
+          fi
+          if [ -f "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" ]; then
+            cp "$RUNNER_TEMP/out/mini-injected.ipa.build-report.json" "$RUNNER_TEMP/out/inject-report.json"
+            files+=("$RUNNER_TEMP/out/inject-report.json")
+          fi
+          SHA="$(shasum -a 256 "$DYLIB" | awk '{print $1}')"
+          SIZE="$(stat -f "%z" "$DYLIB")"
+          NOTES="CI 自动发布的注入用 dylib（滚动标签，每次 build 覆盖）。
+
+          - 提交：\`${{ github.sha }}\`
+          - 运行：[${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - 大小：${SIZE} 字节
+          - sha256：\`${SHA}\`
+          - 部署：先 \`client-patch/build/patch-ipa.mjs\` 改服务器地址，再 \`ios/importer/tools/inject-dylib.mjs\` 注入，最后 Sideloadly 重签侧载（见 \`ios/importer/README.md\`）。"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --title "CDN 导入器 dylib（滚动发布）" --notes "$NOTES" --target "${{ github.sha }}"
+          fi
+          echo "::notice title=release::https://github.com/${{ github.repository }}/releases/download/$TAG/CdnImporter.dylib （匿名可下载，sha256 ${SHA}）"

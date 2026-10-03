@@ -76,6 +76,10 @@
   `ci-diag/<run_id>` 一次性分支（只保留最近一条，新的一条推送时会自动删掉旧的），编译失败时把 clang
   错误按 `::error` 注解贴到运行页；成功时也会 emit `::notice`：`dylib-evidence`（架构/字节数/sha256）
   与 `inject-smoke`（注入断言条数）。**从运行页下载 `CdnImporter-dylib` artifact 即得可侧载的 dylib**。
+- 同一次构建还会把 dylib 发到 **release 滚动标签 `cdn-importer-latest`**（`gh release upload --clobber`），
+  因为 release 资产对公开仓库**匿名可取**，而 artifact 下载必须带 token。稳定直链：
+  `https://github.com/NSDelta/startpoint-cn/releases/download/cdn-importer-latest/CdnImporter.dylib`
+  （同目录还挂着 `clang.log` 与 `inject-report.json`）。
 - 派发时可传 `patch_base`（写进 `info.json` 的 `baseUrl`；默认是 hygiene 占位地址 `http://192.168.1.10:8001/patch/cn/`，
   真实局域网地址只在派发参数里传，不要写进仓库文件）。
 
