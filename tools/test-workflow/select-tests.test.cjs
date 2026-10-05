@@ -1495,6 +1495,8 @@ test("registers focused runtime state and socket smoke groups", () => {
             "tools/admin_server_status_runtime_config.test.cjs",
             "tools/cn_tool_capabilities.test.cjs",
             "tools/runtime_admin.test.cjs",
+            "tools/admin_auth.test.cjs",
+            "tools/cn_form_body.test.cjs",
             "tools/admin_multi_status.test.cjs",
             "tools/runtime_health.test.cjs",
             "tools/runtime_lifecycle.test.cjs",

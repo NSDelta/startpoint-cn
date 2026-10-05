@@ -130,8 +130,13 @@ function validateManifest(manifest, manifestBytes, options) {
         fail("Runtime Pack Node ABI is incompatible")
     }
 
-    if (safeRelativePath(manifest.entry, "entry") !== "node/bin/node") {
-        fail("entry must be node/bin/node")
+    // entry 必须落在 node/bin/ 下：POSIX 平台是 node，Windows 平台是 node.exe。
+    // 只认这两种具体文件名，避免 entry 变成任意可执行文件。
+    const allowedEntries = manifest.node.platform === "win32"
+        ? ["node/bin/node.exe"]
+        : ["node/bin/node"]
+    if (!allowedEntries.includes(safeRelativePath(manifest.entry, "entry"))) {
+        fail(`entry must be ${allowedEntries.join(" or ")}`)
     }
     if (!Array.isArray(manifest.executables) || manifest.executables.length === 0) {
         fail("executables must be a non-empty array")

@@ -6,7 +6,16 @@
 
 管理后台源码位于 `admin/`，使用 React、TypeScript、Vite、Ant Design 和 React Query，并构建到 `web/dist/`。服务端始终在 `/admin/` 挂载静态产物，为 `/admin/*` 中不带扩展名的客户端路由回退到同一个 `index.html`；`/admin/assets/*` 和带扩展名路径缺失时返回 404。访问 `/` 或 `/admin` 会进入 `/admin/`。
 
-管理后台采用可信网络边界：只允许本机、可信内网、可信 VPN，或部署者自有认证与来源防护反向代理之后的访问。服务端不内置管理员账号、密码、Cookie、CSRF 或公网会话；任何能访问该端口的调用方都可尝试修改或删除存档、清理账号、发送邮件和修改服务器时间，且兼容时间接口仍包含会改变状态的 GET 请求。管理 HTTP 不得直接暴露到不可信公网，也不能依赖浏览器同源策略代替服务端访问控制。
+管理后台界面本身仍按可信网络边界设计；**但自 `src/runtime/admin-auth.ts` 起，服务端内置了一道后台口令闸门**，把 `/admin/*` 与 `/api/*` 管理面整体扣在登录之后。两种模式：
+
+- **口令模式**：设置 `ADMIN_PASSWORD`（≥ 8 字符）即启用。`/admin/login` 校验口令后发一个带 `HttpOnly` / `SameSite=Strict` / `Path=/` 的会话 Cookie（默认 12 小时，进程重启即失效）。口令只以 bcrypt 哈希形式存在于内存中，不落盘、不进日志。
+- **仅本机模式**：未设置 `ADMIN_PASSWORD` 时的缺省行为。只有回环地址（`127.0.0.0/8`、`::1`、`::ffff:127.0.0.1`）能访问后台，其余来源一律 403。
+
+`ADMIN_PASSWORD` 短于 8 字符或首尾带空白会让进程在启动时直接退出——**设计上不允许"配置写错就退化成无认证"**。判定来源地址时默认只信 TCP 对端（不读 `X-Forwarded-For`）；确实在反向代理之后才设 `ADMIN_TRUST_PROXY=1`，否则伪造请求头即可绕过仅本机模式。同一来源连续失败 5 次锁定 10 分钟。
+
+闸门覆盖的路径清单以 `ADMIN_PROTECTED_API_PREFIXES` 为唯一权威，`tools/admin_auth.test.cjs` 会比对 `src/routes/web_api/index.ts` 的注册前缀，新增管理路由却漏加前缀会让测试失败。`/api/index.php/**`（游戏协议）、`/sp-auth/**`（客户端登录）、`/patch/**`（资源下载）与 `/healthz` 刻意不在清单内：前两者是玩家流量，后两者是客户端下载与探活。
+
+仍属边界之内、需要部署者自己负责的部分：游戏 API 端口不设防（任何能连上 8001 的客户端都能进游戏），闸门只有一个共享口令、没有管理员账号体系与操作审计，也没有 CSRF token（会话 Cookie 为 `SameSite=Strict`，跨站表单提交不会带上它）。管理 HTTP 不应直接暴露到不可信公网。
 
 `/player`、`/player/:id`、`/mail` 和 `/seeds` 仅保留到 `/admin/` 对应页面的兼容重定向。旧 `src/routes/web/` 和 `web/pages/` 已删除，不再提供服务器渲染 HTML。缺少或损坏 `web/dist/index.html`，或入口引用的本地脚本、样式、图标缺失时，运行时会在初始化阶段拒绝启动；游戏 API、管理 API和 `/healthz` 不进入 SPA fallback。服务端不再挂载通用 `/public` 静态根。
 
@@ -27,9 +36,9 @@
 - `/api/bindings`：账号绑定控制面——分页查询绑定、补发与吊销注册验证码、手工新增绑定、迁移主绑定和解绑（`src/routes/web_api/binding.ts:312,356,382,404,418,459,480`，前缀注册在 `src/routes/web_api/index.ts:52`）；
 - `/api/bot`：机器人控制面，`bind` / `status` / `unbind` 三条**全部 POST**，凭请求头 `X-Bot-Token` 对服务端 `BOT_API_TOKEN`，**该变量缺失时整组 403**（fail-closed，`src/routes/web_api/bot.ts:234,236`；比较为常数时间 `:63-68`）。
 
-后台请求携带 `Accept: application/json`。新增后台功能应提供明确的 JSON 请求和响应，不在 React 页面中直接访问 SQLite。
+后台请求携带 `Accept: application/json`，因此未登录时拿到的是 **401 `{"error":"需要登录管理后台"}`** 而不是跳转；`admin/src/api/client.ts` 的 `handleAdminSessionExpired` 统一把 401 变成一次 `window.location.replace("/admin/login")`。带 `Accept: text/html` 的浏览器导航（例如直接敲 `/admin/accounts`）则由闸门返回 303 到 `/admin/login`，登录页是服务端内联渲染的独立页面，不依赖 SPA 产物——否则会出现"要加载被保护资源才能登录"的死结。新增后台功能应提供明确的 JSON 请求和响应，不在 React 页面中直接访问 SQLite。
 
-`/api/bindings` 与 `/api` 的其它路由一样**没有后台账号鉴权**，只在可信网络边界内暴露（`src/routes/web_api/binding.ts:31-32`）；数据库未就绪时每个路由先返回 503，主绑定冲突返回 409，绑定不存在返回 404（`src/routes/web_api/binding.ts:313`、`:447`、`:467`）。`/api/bot` 属于**机器人**的控制面，不是后台的接口：后台页面既不调用它也不携带 bot 令牌（`tests/admin-bindings-ui-source.test.js:52-54` 把这条写成了断言），两个控制面的失败码体系也不同——后台用 HTTP 状态码，bot 的业务失败走 200 + `code`。
+`/api/bindings` 与 `/api` 的其它路由一样，由后台口令闸门整体保护，但它**不额外校验管理员身份**——闸门只有一个共享口令，过了闸门就是管理员（`src/routes/web_api/binding.ts:31-32` 仍写着"可信网络边界"的旧假设）；数据库未就绪时每个路由先返回 503，主绑定冲突返回 409，绑定不存在返回 404（`src/routes/web_api/binding.ts:313`、`:447`、`:467`）。`/api/bot` 属于**机器人**的控制面，不是后台的接口：后台页面既不调用它也不携带 bot 令牌（`tests/admin-bindings-ui-source.test.js:52-54` 把这条写成了断言），两个控制面的失败码体系也不同——后台用 HTTP 状态码，bot 的业务失败走 200 + `code`。`/api/bot` 同时被后台闸门与 `X-Bot-Token` 两道门保护。
 
 账号页同时展示账号的设备来源映射、账号备注和清理状态。账号总览使用一次轻量玩家摘要查询并在内存中按账号分组，不随账号或存档数量产生逐账号、逐存档查询。旧设备名称接口仍用于管理员识别设备，空名称表示清除账号保留备注，不改变 `device_id -> account_id` 绑定。账号清理默认保留，可由服主配置无备注账号的超时删除；清理事务会写审计记录。玩家页的“清除 EX 能力”会同时清空该玩家所有角色的 EX 状态 ID 和能力列表，并返回实际受影响的角色数量；重复执行是成功的零修改操作，不返还任何养成材料。
 

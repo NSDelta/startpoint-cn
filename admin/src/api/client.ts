@@ -5,12 +5,31 @@ export class ApiError extends Error {
     }
 }
 
+/**
+ * 部署层后台闸门（服务端 src/runtime/admin-auth.ts）返回 401 时，会话已失效或从未登录。
+ * 跳到登录页，由登录页在口令通过后接管后续导航——页面内 route 状态全部作废，
+ * 因此这里不做"记住原地址再跳回来"的处理。
+ */
+export function handleAdminSessionExpired(status: number): boolean {
+    if (status !== 401) return false
+    const path = window.location.pathname
+    if (path === "/admin/login" || path.startsWith("/admin/login/")) return false
+    window.location.replace("/admin/login")
+    return true
+}
+
+async function readError(res: Response, fallback: string): Promise<string> {
+    const text = await res.text().catch(() => "")
+    let msg = text || fallback
+    // 后端错误多为 { "error": "..." }，提取出来更友好
+    try { const j = JSON.parse(text); if (j && typeof j.error === "string") msg = j.error } catch { /* not json */ }
+    return msg
+}
+
 async function handle<T>(res: Response): Promise<T> {
     if (!res.ok) {
-        const text = await res.text().catch(() => "")
-        let msg = text || res.statusText
-        // 后端错误多为 { "error": "..." }，提取出来更友好
-        try { const j = JSON.parse(text); if (j && typeof j.error === "string") msg = j.error } catch { /* not json */ }
+        const msg = await readError(res, res.statusText)
+        if (handleAdminSessionExpired(res.status)) throw new ApiError(res.status, "登录状态已失效，正在跳转登录页")
         throw new ApiError(res.status, msg)
     }
     const ct = res.headers.get("content-type") ?? ""
@@ -50,14 +69,13 @@ export function apiUpload<T>(url: string, file: File, fieldName = "file"): Promi
         .then(r => handle<T>(r))
 }
 
-// 附件下载：走与其它 /api 相同的 fetch 通道（携带部署层后台认证/凭据），
+// 附件下载：走与其它 /api 相同的 fetch 通道（浏览器自动带上后台会话 Cookie），
 // 错误就地抛 ApiError 供页面显示，成功后按 content-disposition 文件名触发保存。
 export async function apiDownloadFile(url: string, fallbackFilename: string): Promise<void> {
     const res = await fetch(url, { headers: { Accept: "application/json" } })
     if (!res.ok) {
-        const text = await res.text().catch(() => "")
-        let msg = text || res.statusText
-        try { const j = JSON.parse(text); if (j && typeof j.error === "string") msg = j.error } catch { /* not json */ }
+        const msg = await readError(res, res.statusText)
+        if (handleAdminSessionExpired(res.status)) throw new ApiError(res.status, "登录状态已失效，正在跳转登录页")
         throw new ApiError(res.status, msg)
     }
     const blob = await res.blob()

@@ -1,6 +1,4 @@
-import Fastify, { FastifyRequest } from "fastify";
-import { ContentTypeParserDoneFunction } from "fastify/types/content-type-parser";
-import { unpack } from "msgpackr";
+import Fastify from "fastify";
 import path from "path";
 import { getServerTime } from "./utils";
 import { getRealNow, getRealNowMs } from "./runtime/time/game-time";
@@ -29,6 +27,8 @@ import { productionGameCalendarProvider } from "./time/game-calendar-provider";
 import { registerRuntimeHealthRoute } from "./runtime/health";
 import { loadBundleMetadata } from "./runtime/bundle-metadata";
 import { registerAdminUi } from "./runtime/admin";
+import { installAdminAuth, resolveAdminAuthConfig } from "./runtime/admin-auth";
+import { installCnBodyParsers } from "./runtime/cn-body-parsers";
 
 import versionCheckPlugin from "./routes/cn/versionCheck";
 import iosLeitingPlugin from "./routes/cn/ios-leiting";
@@ -145,33 +145,19 @@ installUdidProbeFromEnv(fastify);
 // 绑定闸门（契约 C3，卡 A5）：启动时打一行开/关横幅，服主一眼可见。
 reportBindGateMode();
 
-function jsonParser(_: FastifyRequest, body: string, done: ContentTypeParserDoneFunction) {
-    try {
-        done(null, JSON.parse(body));
-    } catch {
-        done(null, undefined);
-    }
-}
-
-fastify.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" },
-    (_request: FastifyRequest, body: string, done) => {
-        try {
-            done(null, unpack(Buffer.from(body, "base64")));
-        } catch {
-            try {
-                done(null, Object.fromEntries(new URLSearchParams(body)));
-            } catch {
-                jsonParser(_request, body, done);
-            }
-        }
-    }
-);
-fastify.addContentTypeParser("application/json", { parseAs: "string" }, jsonParser);
+// 请求正文解析器（JSON + 表单/base64 msgpack）住在 `src/runtime/cn-body-parsers.ts`：
+// 那里能被契约测试直接喂真实实现（本文件 import 即启动整台服务器，测不了）。
+// 后台登录表单的解析顺序 bug（对正确口令也 401）就栽在那段逻辑上，见该文件头部注释。
+installCnBodyParsers(fastify);
 
 fastify.register(leitingAuthPlugin, { prefix: "/api/index.php" });
 fastify.register(cnTakeOverPlugin, { prefix: "/api/index.php" });
 // 自研客户端登录/绑定 API（契约 C1）：与游戏 API 分开挂载，客户端硬编码地址时用它。
 fastify.register(spAuthPlugin, { prefix: "/sp-auth" });
+
+// 后台口令闸门：必须在所有 /admin/ 与 /api/* 管理路由之前注册（onRequest 钩子按注册顺序生效）。
+// 配置错误（ADMIN_PASSWORD 太短/带空白）在这里抛异常 —— 进程退出，不静默降级成"无认证"。
+installAdminAuth(fastify, { config: resolveAdminAuthConfig() });
 
 const apiPrefix = "/api/index.php";
 
@@ -266,7 +252,10 @@ fastify.register(partyApiPlugin, { prefix: `${apiPrefix}/party` });
 fastify.register(expodApiPlugin, { prefix: `${apiPrefix}/expod` });
 fastify.register(storyQuestApiPlugin, { prefix: `${apiPrefix}/story_quest` });
 fastify.register(optionApiPlugin, { prefix: `${apiPrefix}/option` });
-fastify.register(attentionApiPlugin, { prefix: `${apiPrefix}/attention` });
+fastify.register(attentionApiPlugin, {
+    prefix: `${apiPrefix}/attention`,
+    multiContext: () => multiRuntimeService.getHttpContext(),
+});
 fastify.register(characterApiPlugin, { prefix: `${apiPrefix}/character` });
 fastify.register(characterManaPlugin, { prefix: `${apiPrefix}/character` });
 fastify.register(characterBondPlugin, { prefix: `${apiPrefix}/character` });
