@@ -41,6 +41,10 @@ import {
 import type { RoomConnectionEndpoint } from "../room/serializer"
 import { MultiSettlementVerifier } from "../settlement/verifier"
 import { recordMultiCompatibilityRejection } from "../../lib/admin-multi-status"
+import {
+    RecruitmentRegistry,
+    recruitmentRegistry as defaultRecruitmentRegistry,
+} from "../recruitment/registry"
 
 export const DEFAULT_ADMISSION_TTL_MS = 15_000
 
@@ -81,6 +85,7 @@ export interface MultiHttpContext {
     readonly admissionTtlMs: number
     readonly now: () => number
     readonly settlementVerifier: MultiSettlementVerifier
+    readonly recruitmentRegistry: RecruitmentRegistry
     readonly tcpEndpoint?: () => RoomConnectionEndpoint | null
 }
 
@@ -98,14 +103,22 @@ export interface EmbeddedMultiHttpContextOptions {
         viewerId: number,
     ) => Promise<PreparedAdmissionSnapshot | null>
     readonly tcpEndpoint?: () => RoomConnectionEndpoint | null
+    readonly recruitmentRegistry?: RecruitmentRegistry
 }
 
 export function createEmbeddedMultiHttpContext(
     options: EmbeddedMultiHttpContextOptions = {},
 ): MultiHttpContext {
     const admissionRegistry = options.admissionRegistry ?? embeddedAdmissionRegistry
+    const recruitmentRegistry = options.recruitmentRegistry ?? defaultRecruitmentRegistry
     const coordinator = options.coordinator ?? new EmbeddedMultiCoordinator({
-        onRoomDisband: roomNumber => admissionRegistry.clearRoom(roomNumber),
+        // A disbanded/expired room must drop both its issued admissions and its
+        // pending bell recruitment; the coordinator callback is the single point
+        // where both projections are invalidated.
+        onRoomDisband: roomNumber => {
+            admissionRegistry.clearRoom(roomNumber)
+            recruitmentRegistry.close(roomNumber)
+        },
     })
     const coordinatorOrigin = options.coordinatorOrigin ?? "local"
     const resolvePlayerContext = options.resolvePlayerContext ?? resolveMultiPlayerContext
@@ -162,6 +175,7 @@ export function createEmbeddedMultiHttpContext(
         admissionTtlMs: options.admissionTtlMs ?? DEFAULT_ADMISSION_TTL_MS,
         now,
         settlementVerifier: new MultiSettlementVerifier(coordinator),
+        recruitmentRegistry,
         tcpEndpoint: options.tcpEndpoint,
     })
 }

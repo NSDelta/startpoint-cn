@@ -407,5 +407,18 @@ node tools/inject-dylib.mjs --app=/path/to/worldflipper.app
 
 非越狱侧**没有人能点面板**，所以必须靠 `AMConfig` 的 `autoStart` + `preferredScriptName`
 自动起跑；指名的脚本不在设备上时**不启动**（宁可不动，也不要跑错脚本乱点）。
+这两个键都在 **bundle 根目录的 `AutoClick.plist`** 里（放进 `.app/`，不是 substrate 那个
+过滤器 plist），**键名逐字是代码里读的那几个**：
+
+| 键 | 类型 | 缺省 | 作用 |
+|---|---|---|---|
+| `autoStart` | bool | `NO` | 启动后自动加载并开跑 |
+| `script` | string | 无 | 要跑哪个脚本，写 `"幻想连战.auto"` 或 `"幻想连战"` 都认；**不在设备上就不启动** |
+| `panelVisibleAtLaunch` | bool | `YES` | 悬浮球面板是否开机就显示；非越狱侧通常写 `false` |
+
+★ 属性名与键名**不是一回事**：属性的 `preferredScriptName` 读的键是 **`script`**
+（`ios/AMConfig.m` 的 `-preferredScriptName` 里 `_bundle[@"script"]`）。写文档或
+配置时按上表，按属性名写 `preferredScriptName` 进 plist 是读不到的。
+
 真机验收按 `.research/ios-design.md` §12 的顺序做 —— **第 0 步（iOS 截图能否匹配上）
 不过就不要往下走**。

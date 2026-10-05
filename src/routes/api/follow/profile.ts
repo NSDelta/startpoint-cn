@@ -3,6 +3,7 @@ import { getPlayerSync } from "../../../data/domains/player"
 import { getViewerIdSync } from "../../../data/domains/session"
 import { getLocalFollowRelationSync } from "../../../data/domains/follow"
 import { getPlayerRankLevel } from "../../../lib/player-rank-content"
+import { getRealNowMs } from "../../../runtime/time/game-time"
 import type { LocalFollowRelation, LocalFollowState } from "../../../data/domains/follow"
 
 /** F0 冻结的 follow_info / search_result 投影（CN 1.8.1 必填 + Option 字段）。 */
@@ -30,6 +31,15 @@ function accountPlayerId(playerId: number): number | null {
     return row?.account_id ?? null
 }
 
+/**
+ * 客户端对“粉丝”页排序时无条件读取 followed_time，None 会抛 ClientError 2820
+ * （FollowInfoTools.compareForFollowerList），所以入边时间未知时也不能下发 null。
+ * 该时刻只用于排序；真正的关注时刻仍然优先取入边。
+ */
+function sortableFollowedTime(followedAtMs: number | null): number {
+    return Math.floor((followedAtMs ?? getRealNowMs()) / 1000)
+}
+
 export function projectFollowUser(
     viewerPlayerId: number,
     targetPlayerId: number,
@@ -53,7 +63,9 @@ export function projectFollowUser(
         leader_character_evolution_img_level: 0,
         follow_state: relation.state,
         follow_time: relation.followTime === null ? null : Math.floor(relation.followTime / 1000),
-        followed_time: relation.followedTime === null ? null : Math.floor(relation.followedTime / 1000),
+        followed_time: relation.state === 2 || relation.state === 0
+            ? null
+            : sortableFollowedTime(relation.followedTime),
         profile_image_url: null,
     }
 }

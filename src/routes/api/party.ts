@@ -22,6 +22,12 @@ import { settleMissionCategories, type MissionSettlementResult } from "../../lib
 import { mergeMissionSettlementResponse } from "../../lib/mission/response";
 import { publishActiveMissionOwnerStateWithinTransaction } from "../../lib/mission/active-publication-owner";
 import { mergeCommonResponseFragments } from "../../lib/common-response/merge";
+import {
+    partyCodeRegistry,
+    type PartyCodeCharacter,
+    type PartyCodeEquipment,
+    type PartyCodePayload,
+} from "../../lib/party-code/registry";
 
 interface PartyInfoListItem {
     party_edited: boolean
@@ -412,13 +418,191 @@ function summarizePartyEditRequest(body: Partial<EditBody>, viewerId: unknown) {
 */
 interface PublishBody {
     party_name: string,
-    battle_party: {
-
-    },
+    battle_party: unknown,
     viewer_id: number
 }
 
+/** Refer result codes understood by `PartyReferRemote.errorHandler` (case 8). */
+const PARTY_CODE_NOT_FOUND_RESULT_CODE = 3404
+
+/**
+ * Ceiling on the slots one `battle_party` list may carry. The editor only ever
+ * sends a handful, so this exists to reject a hand-crafted payload that would
+ * otherwise be copied straight into the process-wide code directory.
+ */
+const PARTY_CODE_MAX_SLOTS = 64
+
+function readSafeInteger(value: unknown): number | null {
+    return Number.isSafeInteger(value) ? value as number : null
+}
+
+/**
+ * Reads one `Array<int>` of the client's battle party. `null` and a missing key
+ * both mean "absent", which the client renders as `Option.None`.
+ */
+function readIntegerList(value: unknown): number[] | null {
+    if (value === null || value === undefined) return null
+    if (!Array.isArray(value)) return null
+    const list: number[] = []
+    for (const entry of value) {
+        const parsed = readSafeInteger(entry)
+        if (parsed === null) return null
+        list.push(parsed)
+    }
+    return list
+}
+
+/**
+ * Reads one `Array<Int or null>` slot list, such as `ability_soul_ids`, where an
+ * empty battle slot is a `null` element rather than an absent entry.
+ */
+function readOptionalIntegerList(value: unknown): (number | null)[] | null {
+    if (!Array.isArray(value) || value.length > PARTY_CODE_MAX_SLOTS) return null
+    const list: (number | null)[] = []
+    for (const entry of value) {
+        if (entry === null || entry === undefined) {
+            list.push(null)
+            continue
+        }
+        const parsed = readSafeInteger(entry)
+        if (parsed === null) return null
+        list.push(parsed)
+    }
+    return list
+}
+
+/**
+ * Reads one `ex_boost` slot. `status_id` must stay absent rather than fall back
+ * to 0: the client feeds it straight into `ExStatusLogic`, whose master table
+ * starts at id 1, so a zeroed status throws instead of degrading.
+ */
+function readExBoost(value: unknown): { statusId: number; abilityIdList: number[] } | null {
+    if (value === null || value === undefined) return null
+    if (typeof value !== "object") return null
+    const raw = value as { status_id?: unknown; ability_id_list?: unknown }
+    const statusId = readSafeInteger(raw.status_id)
+    const abilityIdList = readIntegerList(raw.ability_id_list)
+    if (statusId === null || statusId <= 0 || abilityIdList === null) return null
+    return { statusId, abilityIdList }
+}
+
+function readPartyCharacter(value: unknown): PartyCodeCharacter | null {
+    if (value === null || value === undefined) return null
+    if (typeof value !== "object") return null
+    const raw = value as Record<string, unknown>
+    const id = readSafeInteger(raw.id)
+    const evolutionLevel = readSafeInteger(raw.evolution_level)
+    const exp = readSafeInteger(raw.exp)
+    const overLimitStep = readSafeInteger(raw.over_limit_step)
+    if (id === null || id <= 0
+        || evolutionLevel === null || evolutionLevel < 0
+        || exp === null || exp < 0
+        || overLimitStep === null || overLimitStep < 0) {
+        return null
+    }
+    return {
+        id,
+        evolutionLevel,
+        exp,
+        overLimitStep,
+        // An empty array is honest here: the client only copies the ids it can
+        // find in the redeemer's own party, so a fabricated node list is noise.
+        manaNodeIds: readIntegerList(raw.mana_node_ids) ?? [],
+        illustrationSettings: readIntegerList(raw.illustration_settings),
+        exBoost: readExBoost(raw.ex_boost),
+    }
+}
+
+function readPartySlot(
+    value: unknown,
+    read: (entry: unknown) => PartyCodeCharacter | null,
+): (PartyCodeCharacter | null)[] | null {
+    if (!Array.isArray(value) || value.length > PARTY_CODE_MAX_SLOTS) return null
+    const slots: (PartyCodeCharacter | null)[] = []
+    for (const entry of value) {
+        if (entry === null || entry === undefined) {
+            slots.push(null)
+            continue
+        }
+        const character = read(entry)
+        if (character === null) return null
+        slots.push(character)
+    }
+    return slots
+}
+
+function readPartyEquipment(value: unknown): PartyCodeEquipment | null {
+    if (value === null || value === undefined) return null
+    if (typeof value !== "object") return null
+    const raw = value as Record<string, unknown>
+    const equipmentId = readSafeInteger(raw.equipment_id)
+    const level = readSafeInteger(raw.level)
+    if (equipmentId === null || equipmentId <= 0 || level === null || level < 0) return null
+    return { equipmentId, level }
+}
+
+/**
+ * Normalises the client's `party/publish` payload. Every list keeps the slot
+ * count the client sent — the party editor renders slots positionally, so
+ * trimming a trailing empty slot would shift the copied party.
+ */
+function readPartyCodePayload(body: PublishBody): PartyCodePayload | null {
+    const name = typeof body.party_name === "string" ? body.party_name : ""
+    const battleParty = body.battle_party
+    if (battleParty === null || typeof battleParty !== "object") return null
+    const raw = battleParty as Record<string, unknown>
+    const characters = readPartySlot(raw.characters, readPartyCharacter)
+    const unisonCharacters = readPartySlot(raw.unison_characters, readPartyCharacter)
+    const equipments = Array.isArray(raw.equipments) && raw.equipments.length <= PARTY_CODE_MAX_SLOTS
+        ? raw.equipments.map(readPartyEquipment)
+        : null
+    const abilitySoulIds = readOptionalIntegerList(raw.ability_soul_ids)
+    if (characters === null || unisonCharacters === null
+        || equipments === null || abilitySoulIds === null) {
+        return null
+    }
+    return {
+        name: name.substring(0, 20),
+        characters,
+        unisonCharacters,
+        equipments,
+        abilitySoulIds,
+    }
+}
+
+/** Least-normalised view of a published party, in the client's own field names. */
+function serializePartyCodeBattleParty(party: PartyCodePayload) {
+    const character = (slot: PartyCodeCharacter | null) => slot === null ? null : {
+        id: slot.id,
+        evolution_level: slot.evolutionLevel,
+        exp: slot.exp,
+        over_limit_step: slot.overLimitStep,
+        mana_node_ids: [...slot.manaNodeIds],
+        illustration_settings: slot.illustrationSettings === null ? null : [...slot.illustrationSettings],
+        ex_boost: slot.exBoost === null ? null : {
+            status_id: slot.exBoost.statusId,
+            ability_id_list: [...slot.exBoost.abilityIdList],
+        },
+    }
+    return {
+        characters: party.characters.map(character),
+        unison_characters: party.unisonCharacters.map(character),
+        equipments: party.equipments.map(slot => slot === null ? null : {
+            equipment_id: slot.equipmentId,
+            level: slot.level,
+        }),
+        ability_soul_ids: [...party.abilitySoulIds],
+    }
+}
+
 const routes = async (fastify: FastifyInstance) => {
+    /**
+     * `party/publish` hands the *whole* party to the server: the client builds
+     * the code from the response and then never sends the party again, so the
+     * server is the only place the shared party can be kept between the sender
+     * and the redeemer. It is deliberately not persisted — see
+     * `src/lib/party-code/registry.ts`.
+     */
     fastify.post("/publish", async (request: FastifyRequest, reply: FastifyReply) => {
         const body = request.body as PublishBody
 
@@ -442,13 +626,76 @@ const routes = async (fastify: FastifyInstance) => {
             "message": "No players bound to account."
         })
 
+        const party = readPartyCodePayload(body)
+        if (party === null) return reply.status(400).send({
+            "error": "Bad Request",
+            "message": "Invalid battle party."
+        })
+        const record = partyCodeRegistry.publish({
+            ownerPlayerId: playerId,
+            party,
+            nowMs: Date.now(),
+        })
+        if (record === null) return reply.status(503).send({
+            "error": "Service Unavailable",
+            "message": "Party code generation failed."
+        })
+
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send({
             "data_headers": generateDataHeaders({
                 viewer_id: viewerId
             }),
             "data": {
-                "party_code": "https://www.howLongCanThisBe?=+-.comhttps://www.howLongCanThisBe?=+-.comhttps://www.howLongCanThisBe?=+-.com"
+                "party_code": record.code
+            }
+        })
+
+    })
+
+    /**
+     * `party/refer` redeems a code. The client compares the returned characters
+     * against its own save and drops the ones the player does not own, so the
+     * response carries the publisher's growth values rather than a converted
+     * party: an unknown code (3404) is the only failure the player can act on.
+     */
+    fastify.post("/refer", async (request: FastifyRequest, reply: FastifyReply) => {
+        const body = request.body as { party_code?: unknown; viewer_id?: unknown }
+
+        const viewerId = body.viewer_id
+        if (viewerId !== undefined && (!Number.isSafeInteger(viewerId) || (viewerId as number) <= 0)) {
+            return reply.status(400).send({
+                "error": "Bad Request",
+                "message": "Invalid request body."
+            })
+        }
+
+        const rawCode = body.party_code
+        if (typeof rawCode !== "string" || rawCode.length === 0) return reply.status(400).send({
+            "error": "Bad Request",
+            "message": "Invalid request body."
+        })
+
+        const record = partyCodeRegistry.lookUp(rawCode, Date.now())
+        if (record === null) {
+            reply.header("content-type", "application/x-msgpack")
+            return reply.status(200).send({
+                "data_headers": generateDataHeaders({
+                    viewer_id: Number.isSafeInteger(viewerId) ? viewerId as number : 0,
+                    result_code: PARTY_CODE_NOT_FOUND_RESULT_CODE,
+                }),
+                "data": {}
+            })
+        }
+
+        reply.header("content-type", "application/x-msgpack")
+        return reply.status(200).send({
+            "data_headers": generateDataHeaders({
+                viewer_id: Number.isSafeInteger(viewerId) ? viewerId as number : 0
+            }),
+            "data": {
+                "party_name": record.party.name,
+                "battle_party": serializePartyCodeBattleParty(record.party),
             }
         })
 

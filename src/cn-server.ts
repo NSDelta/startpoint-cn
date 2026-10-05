@@ -29,6 +29,7 @@ import { loadBundleMetadata } from "./runtime/bundle-metadata";
 import { registerAdminUi } from "./runtime/admin";
 import { installAdminAuth, resolveAdminAuthConfig } from "./runtime/admin-auth";
 import { installCnBodyParsers } from "./runtime/cn-body-parsers";
+import { installConsoleLogGate, resolveServerLogFilePath, resolveServerLogLevel } from "./runtime/log-level";
 
 import versionCheckPlugin from "./routes/cn/versionCheck";
 import iosLeitingPlugin from "./routes/cn/ios-leiting";
@@ -41,6 +42,7 @@ import { registerCnMsgpackOnSend } from "./routes/cn/msgpack";
 import indexWebApiPlugin from "./routes/web_api";
 import spAuthPlugin from "./routes/sp-auth";
 import seedsWebApiPlugin from "./routes/web_api/seeds";
+import { resolveBotApiToken } from "./routes/web_api/bot";
 import { getDefaultGachaSeedQuarantine } from "./lib/gacha-seed-quarantine";
 import reproduceApiPlugin from "./routes/api/reproduce";
 import tutorialApiPlugin from "./routes/api/tutorial";
@@ -98,9 +100,24 @@ import {
     ReceiveHistoryRetentionService,
     resolveReceiveHistoryRetentionConfig,
 } from "./lib/receive-history-retention";
+// 日志开关（`SP_LOG_LEVEL` / `SP_LOG_FILE`，语义见 src/runtime/log-level.ts）：
+// 缺省 info = 与历史行为一致；低于 info 时窗口只留 warn/error，其余改道落盘（缺省 logs/server.log）。
+// 必须在建 Fastify 之前安装 —— 之后 pino 的请求日志才跟着降级。
+const serverLogLevel = resolveServerLogLevel(process.env);
+if (serverLogLevel !== "info") {
+    const gate = installConsoleLogGate({
+        level: serverLogLevel,
+        filePath: resolveServerLogFilePath(process.env, path.resolve(__dirname, "..")),
+    });
+    console.warn(
+        gate.filePath === null
+            ? `[LOG] SP_LOG_LEVEL=${serverLogLevel}：请求日志与 info 级输出已静默（SP_LOG_FILE=0，不落盘）`
+            : `[LOG] SP_LOG_LEVEL=${serverLogLevel}：请求日志与 info 级输出改道 ${gate.filePath}（窗口只留 warn/error）`,
+    );
+}
 const fastify = Fastify({
     logger: {
-        level: "info"
+        level: serverLogLevel
     },
     bodyLimit: 262144  // 256KB — covers /single_battle_quest/finish large battle stats
 });
@@ -157,7 +174,12 @@ fastify.register(spAuthPlugin, { prefix: "/sp-auth" });
 
 // 后台口令闸门：必须在所有 /admin/ 与 /api/* 管理路由之前注册（onRequest 钩子按注册顺序生效）。
 // 配置错误（ADMIN_PASSWORD 太短/带空白）在这里抛异常 —— 进程退出，不静默降级成"无认证"。
-installAdminAuth(fastify, { config: resolveAdminAuthConfig() });
+installAdminAuth(fastify, {
+    config: resolveAdminAuthConfig(),
+    // 机器人（/api/bot 契约）没有后台会话，它带 X-Bot-Token；闸门据此放行机器人端点与握手元数据，
+    // 其余管理面照旧只认会话（见 src/runtime/admin-auth.ts 的 BOT_TOKEN_PASSTHROUGH_PATHS）。
+    botToken: resolveBotApiToken(process.env),
+});
 
 const apiPrefix = "/api/index.php";
 

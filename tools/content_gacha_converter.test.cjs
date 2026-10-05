@@ -428,6 +428,21 @@ test("gacha converter rejects malformed reachable banner costs and booleans", as
         kind: 1,
         accountPaidTenCost: 1500,
     })
+
+    // kind 0 页面必须把账号限次十连价留空。真实案例：gacha 800100（star_heroes_100）
+    // 由 kind 1 改成 kind 0 时若不清第 9 列，同步会以本案报错——补丁侧必须清空这一列
+    // （tools/rebuild_asset_patch.cjs 的 pageKind 修复一并清列），服务端不为此放宽。
+    const leftover = createFixture()
+    leftover.character[4] = "0"
+    leftover.character[8] = "1500"
+    leftover.flat.set(GACHA_PATH, [
+        row("10", leftover.character),
+        row("20", leftover.equipment),
+    ])
+    await assert.rejects(
+        convertGachas(leftover.reader),
+        /tenTimesPerAccountCost must be blank for this page kind/,
+    )
 })
 
 test("gacha converter requires official fixed table shapes", async () => {

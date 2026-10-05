@@ -1350,3 +1350,29 @@ export function dailyResetPlayerSync(
 
     return dailyResetPlayerDataSync(playerData, getRealNow(), resetHour)
 }
+
+/**
+ * The main quest the player currently sits on, as projected into the `/load`
+ * response (`last_main_quest_id`). Null means "never set", and the client then
+ * derives the current stage from quest progress alone.
+ *
+ * Kept in the player domain rather than in the progression helper so that
+ * `data/utils/serialize-player.ts` can read it without importing back into
+ * `lib/`, which would close an import cycle.
+ */
+export function getPlayerLastMainQuestIdSync(playerId: number): number | null {
+    const row = getDb().prepare(`
+        SELECT last_main_quest_id FROM players WHERE id = ?
+    `).get(playerId) as { last_main_quest_id: number | null } | undefined
+    const value = row?.last_main_quest_id
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+export function setPlayerLastMainQuestIdSync(playerId: number, questId: number | null): void {
+    if (questId !== null && (!Number.isSafeInteger(questId) || questId <= 0)) {
+        throw new TypeError("last main quest id must be a positive safe integer or null")
+    }
+    getDb().prepare(`
+        UPDATE players SET last_main_quest_id = ? WHERE id = ?
+    `).run(questId, playerId)
+}

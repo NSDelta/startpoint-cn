@@ -41,18 +41,21 @@ function loadAdminAuth() {
 
 const PASSWORD = "starpoint-admin-2026"
 
-/** 口令模式下的最小请求上下文；`ip` 可换成非回环以模拟公网来源。 */
-function createPasswordApp(t, { username } = {}) {
+/** 口令模式下的最小请求上下文；给了 `botToken` 就等于服务端注入了 `BOT_API_TOKEN`。 */
+function createPasswordApp(t, { username, botToken } = {}) {
     const auth = loadAdminAuth()
     const app = installFormParser(Fastify({ logger: false }))
     app.get("/api/server/status", async () => ({ ok: true }))
+    app.get("/api/server/capabilities", async () => ({ runtime: { api: 1 } }))
+    app.get("/api/server/accounts", async () => ({ accounts: [] }))
+    app.get("/api/bot/bind", async () => ({ ok: true }))
     app.get("/api/index.php/tool/signup", async () => ({ game: true }))
     app.get("/admin/", async () => "admin shell")
     const config = auth.resolveAdminAuthConfig({
         [auth.ADMIN_PASSWORD_ENV]: PASSWORD,
         ...(username === undefined ? {} : { [auth.ADMIN_USERNAME_ENV]: username }),
     })
-    auth.installAdminAuth(app, { config })
+    auth.installAdminAuth(app, { config, ...(botToken === undefined ? {} : { botToken }) })
     t.after(() => app.close())
     return { app, auth }
 }
@@ -341,4 +344,86 @@ test("repeated failures from one source are rate limited", async t => {
     // 未登录访问后台依然被挡（锁定不影响闸门本身）。
     const blocked = await apiRequest(app, "/api/server/status")
     assert.equal(blocked.statusCode, 401)
+})
+
+// ---------------------------------------------------------------------------
+// 机器人通行证（`BOT_API_TOKEN`）
+//
+// 背景：机器人（`/api/bot` 契约）没有后台会话，它带 `X-Bot-Token`；而 Node 的 fetch 默认发
+// `Accept: */*` —— 闸门原来把它当浏览器，303 到 `/admin/login`，机器人跟随重定向拿到 HTML，
+// 于是握手报"响应不是 JSON（HTTP 200）"并拒绝启动。下面锁住修法：带对令牌只放行两条路径，
+// 且令牌**不能**当后台口令用。
+// ---------------------------------------------------------------------------
+
+const BOT_TOKEN = "starpoint-bot-2026"
+
+test("the bot token header matches the bot contract and only opens two paths", () => {
+    const {
+        BOT_TOKEN_HEADER,
+        BOT_TOKEN_PASSTHROUGH_PATHS,
+        ADMIN_PROTECTED_API_PREFIXES,
+        isAdminProtectedPath,
+    } = loadAdminAuth()
+
+    const botSource = fs.readFileSync(path.join(repositoryRoot, "src/routes/web_api/bot.ts"), "utf8")
+    const declared = /BOT_TOKEN_HEADER\s*=\s*"([^"]+)"/.exec(botSource)
+    assert.equal(declared === null ? null : declared[1], BOT_TOKEN_HEADER, "闸门里的令牌头必须与 bot 契约一致")
+
+    assert.deepEqual([...BOT_TOKEN_PASSTHROUGH_PATHS], ["/api/bot", "/api/server/capabilities"])
+    // 放行清单必须是受保护面的子集：前缀写错就等于开了一扇没人管的门。
+    for (const entry of BOT_TOKEN_PASSTHROUGH_PATHS) {
+        assert.equal(isAdminProtectedPath(entry), true, `${entry} 必须本来就在受保护面内`)
+    }
+    for (const entry of ADMIN_PROTECTED_API_PREFIXES) {
+        assert.equal(isAdminProtectedPath(entry), true)
+    }
+})
+
+test("a valid bot token passes the gate for the bot surface only", async t => {
+    const { app } = createPasswordApp(t, { botToken: BOT_TOKEN })
+    // 机器人的真实请求形态：Node fetch 默认 `Accept: */*` + `X-Bot-Token`。
+    const botHeaders = { accept: "*/*", "x-bot-token": BOT_TOKEN }
+
+    const capabilities = await app.inject({ method: "GET", url: "/api/server/capabilities", headers: botHeaders })
+    assert.equal(capabilities.statusCode, 200, "握手元数据必须回 JSON，而不是登录页")
+    assert.match(String(capabilities.headers["content-type"]), /application\/json/)
+
+    const bind = await app.inject({ method: "GET", url: "/api/bot/bind", headers: botHeaders })
+    assert.equal(bind.statusCode, 200)
+
+    // 令牌不对 / 压根没带：照旧挡在门外。
+    const wrongToken = await app.inject({
+        method: "GET",
+        url: "/api/bot/bind",
+        headers: { accept: "*/*", "x-bot-token": "not-the-token" },
+    })
+    assert.equal(wrongToken.statusCode, 303)
+    const noToken = await app.inject({ method: "GET", url: "/api/server/capabilities", headers: { accept: "*/*" } })
+    assert.equal(noToken.statusCode, 303)
+
+    // 关键：机器人令牌**不能**当后台口令用（否则泄露令牌 = 交出后台）。
+    for (const url of ["/api/server/accounts", "/api/server/status", "/api/player/list", "/api/seeds"]) {
+        const response = await app.inject({ method: "GET", url, headers: botHeaders })
+        assert.notEqual(response.statusCode, 200, `${url} 不能被机器人令牌打开`)
+    }
+})
+
+test("dot segments cannot smuggle a bot token into the admin surface", async t => {
+    const { app } = createPasswordApp(t, { botToken: BOT_TOKEN })
+    const response = await app.inject({
+        method: "GET",
+        url: "/api/bot/../server/accounts",
+        headers: { accept: "*/*", "x-bot-token": BOT_TOKEN },
+    })
+    assert.notEqual(response.statusCode, 200, "点段路径必须先规范化，否则放行前缀会被绕过")
+})
+
+test("without an injected bot token the gate stays closed to the bot", async t => {
+    const { app } = createPasswordApp(t)
+    const response = await app.inject({
+        method: "GET",
+        url: "/api/bot/bind",
+        headers: { accept: "*/*", "x-bot-token": BOT_TOKEN },
+    })
+    assert.equal(response.statusCode, 303)
 })

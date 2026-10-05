@@ -215,14 +215,44 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 
 注册处：`src/routes/web_api/index.ts:53`
 `fastify.register(botApiPlugin, { prefix: "/bot", env: options.botApiEnv })`
-⇒ 对外完整前缀 `/api/bot`。三条路由**全部是 POST**
-（`src/routes/web_api/bot.ts:240,288,312`）。
+⇒ 对外完整前缀 `/api/bot`。四条路由**全部是 POST**
+（`src/routes/web_api/bot.ts:299,348,372,438`）。
 
 | 方法 + 路径 | 用途 |
 | --- | --- |
 | `POST /api/bot/bind` | 用验证码把 QQ/KOOK 身份绑到账号上 |
 | `POST /api/bot/status` | 查某个平台身份已绑定的账号 |
 | `POST /api/bot/unbind` | 自助解绑（只能解非主绑定） |
+| `POST /api/bot/skip_chapter` | 把该身份绑定的存档推到第 N 章开头（`/skip chapter N`） |
+
+### `skip_chapter`：进度捷径
+
+入参 `{platform, uid, chapter}`；作用账号由 `platform` + `uid` 决定
+（恰好一条绑定时用它，多条时用主绑定；多条且无主绑定 ⇒ `NO_BINDING`，
+**不猜**——跳错存档不可回滚）。语义是「推完第 1..N-1 章全部主线，站在第 N 章开头」：
+
+- 写 `players_quest_progress` 的 `section = 1`（`QuestCategory.MAIN`），把第 1..N-1 章
+  每个主线 quest 置 `finished = 1, unlocked = 1`。**只写 `unlocked` 不够**：
+  客户端 `MainStageNodeLogic.isCleared` 与服务端 `singleBattleQuest/start`
+  （`src/routes/api/singleBattleQuest.ts:257-273` 读 `quest_prerequisites.json`）
+  都要求前置 quest 已 `finished`。
+- 顺带按 `recordCompletedMainChapterMilestoneSync` 的公式记章节里程碑
+  （target 2 / slot 1-6 给第 1-6 章，target 3 / slot 1-6 给第 7-12 章，`INSERT OR IGNORE` 幂等）。
+- 把 `players.last_main_quest_id` 指向**目标章的第一个 quest**（schema 新增列，
+  `src/data/schema.ts` 的 `players.last_main_quest_id` + `ensureSchemaColumn` 迁移）。
+  这与正常推进一致：客户端在开始某关时把该关写成当前任务
+  （`src/routes/api/singleBattleQuest.ts:400`）。
+- `chapter = 1` 是合法 no-op：不写任何 quest 行，只清空指针（该列默认 `NULL`）。
+- `chapter` 取值 `1..12`（`MAX_MAIN_CHAPTER`，按 content 实有章节）；`0`/负数/非整数 ⇒ 400
+  `BAD_REQUEST`，`> 12` ⇒ 400 `INVALID_CHAPTER`。
+
+响应 `{ok:true,data:{account_id, viewer_id, username, chapter, last_main_quest_id,
+current_quest, finished_quests, recorded_chapters}}`。
+
+`quest_prerequisites.json` **不是**本功能的判定依据：它含 `1_3001001 -> 3001001`
+这类章内自指条目，字面解读会把第 3 章判成不可达。真正把关的是跨章依赖——每章首节点的
+need_stage_node 指向上一章**最后**一个节点（第 3 章首节点依赖 `2009001..2009007`，
+即第 2 章最后一个节点）。因此「上一章全部主线已通关」是充分条件。
 
 ### 鉴权：fail-closed
 
@@ -248,6 +278,8 @@ CODE_INVALID  CODE_EXPIRED  CODE_USED  CODE_LOCKED  ALREADY_BOUND  ACCOUNT_DISAB
 | 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:253`、`:324` |
 | 业务失败（码过期/已用/锁定/已绑定） | 200 | `{ok:false,code:<C4 码>}` | `:271`、`:328` |
 | 解绑目标不存在 / 是主绑定 | 200 | `{ok:false,code:"BINDING_NOT_FOUND"｜"PRIMARY_BINDING"}` | `:336`、`:337` |
+| `skip_chapter` 的 chapter > 12 | 400 | `{ok:false,code:"INVALID_CHAPTER"}` | `src/routes/web_api/bot.ts:450` |
+| `skip_chapter` 无绑定 / 绑定歧义 / 无存档 | 200 | `{ok:false,code:"NO_BINDING"｜"NO_PLAYER"}` | `:457`、`:459` |
 
 要点：**鉴权失败和参数缺失用 HTTP 状态码；业务判定失败用 200 + `code`**。
 `CODE_INVALID` 一个码同时出现在 400（格式非法）和 200（查无此码，`:197`、`:203`、

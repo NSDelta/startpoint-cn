@@ -45,6 +45,7 @@ import { parseGameCalendarUtcOffsetMinutes } from "./time/game-calendar";
 import { initializeDatabase } from "./data";
 import { configureSerializedAssetVersionProvider } from "./data/utils/serialized-asset-version";
 import { registerAdminUi } from "./runtime/admin";
+import { installAdminAuth, resolveAdminAuthConfig } from "./runtime/admin-auth";
 
 // gc-openapi-zinny3.kakaogames.com
 // gc-infodesk-zinny3.kakaogames.com
@@ -119,7 +120,10 @@ fastify.register(multiBattleRoutes, {
     prefix: `${apiPrefix}/multi_battle_quest`,
     context: multiHttpContext,
 })
-fastify.register(attentionApiPlugin, { prefix: `${apiPrefix}/attention` })
+fastify.register(attentionApiPlugin, {
+    prefix: `${apiPrefix}/attention`,
+    multiContext: () => multiHttpContext,
+})
 fastify.register(characterApiPlugin, { prefix: `${apiPrefix}/character` })
 fastify.register(partyGroupApiPlugin, { prefix: `${apiPrefix}/party_group` })
 fastify.register(equipmentApiPlugin, { prefix: `${apiPrefix}/equipment` })
@@ -141,6 +145,9 @@ fastify.register(openapiPlugin, { prefix: "/openapi/service" })
 
 // infodesk
 fastify.register(infodeskPlugin, { prefix: "/infodesk" })
+
+// 后台口令闸门（与 cn-server.ts 同一实现）：必须在 /admin/ 与 /api 管理路由之前注册。
+installAdminAuth(fastify, { config: resolveAdminAuthConfig() })
 
 // web api routes
 fastify.register(indexWebApiPlugin, { prefix: "/api" })

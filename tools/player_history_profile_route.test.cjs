@@ -564,3 +564,205 @@ test("CN server registers player history and social compatibility route families
     assert.match(serverSource, /\$\{apiPrefix\}\/follow/)
     assert.match(serverSource, /\$\{apiPrefix\}\/sns/)
 })
+
+/**
+ * `profile/get_profile` is the profile card of *another* player, opened from the
+ * follow/follower list, a user search result and the room member list. The client
+ * (`ProfileGetProfileRealRemote.as:100-410`) validates every field and throws
+ * ClientError 870x on a type mismatch, so the contract is asserted field by field
+ * against the four optionals it accepts as `null`.
+ */
+test("profile/get_profile returns the other player card the client validates", async () => {
+    db.prepare(`
+        UPDATE players_characters
+        SET ex_boost_status_id = 1, ex_boost_ability_id_list = '1,2'
+        WHERE player_id = ? AND id = 1
+    `).run(otherPlayer.id)
+    db.prepare(`
+        INSERT INTO players_follows (follower_player_id, followed_player_id, followed_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(follower_player_id, followed_player_id) DO NOTHING
+    `).run(otherPlayer.id, player.id, new Date("2026-01-02T03:04:05.000Z").toISOString())
+
+    const app = await createApp()
+    try {
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/index.php/profile/get_profile",
+            payload: { viewer_id: viewerId, target_viewer_id: otherViewerId, api_count: 0 },
+        })
+        assert.equal(response.statusCode, 200, response.body)
+        const data = decode(response).data
+
+        assert.deepEqual(data.target_user_info, {
+            role: 1,
+            viewer_id: otherViewerId,
+            name: otherPlayer.name,
+            rank: 1,
+            comment: otherPlayer.comment,
+            degree_id: 1,
+            leader_character_full_shot_evolution_level: 0,
+            follow_state: 3,
+            owned_character_count: 1,
+            max_owned_character_count: 505,
+            owned_degree_count: 1,
+            max_owned_degree_count: 1288,
+            opened_mana_board_second_count: null,
+            max_opened_mana_board_second_count: null,
+            last_login_region: "CN",
+        })
+
+        // The four favourite-party arrays are parallel and zipped by index, so they
+        // must stay the same length and carry `null` — never a missing key — for
+        // empty slots.
+        const favorite = data.favorite_character
+        assert.equal(favorite.character_ids.length, favorite.character_ex_boost.length)
+        assert.equal(favorite.unison_character_ids.length, favorite.unison_character_ex_boost.length)
+        assert.notEqual(favorite.character_ids[0], null, "character_ids[0] drives the leader full shot")
+        assert.deepEqual(favorite.character_ex_boost[0], { status_id: 1, ability_id_list: [1, 2] })
+        assert.deepEqual(favorite.unison_character_ids, [null, null, null])
+        assert.deepEqual(favorite.unison_character_ex_boost, [null, null, null])
+    } finally {
+        await app.close()
+    }
+})
+
+test("profile/get_profile hides the counts the target player keeps private", async () => {
+    const { updatePlayerProfileSettingsSync } = require("../src/data/domains/option")
+    updatePlayerProfileSettingsSync(otherPlayer.id, {
+        showOpenedManaBoardSecondCount: false,
+        showOwnedCharacterCount: false,
+        showOwnedDegreeCount: false,
+    })
+
+    const app = await createApp()
+    try {
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/index.php/profile/get_profile",
+            payload: { viewer_id: viewerId, target_viewer_id: otherViewerId, api_count: 0 },
+        })
+        assert.equal(response.statusCode, 200, response.body)
+        const info = decode(response).data.target_user_info
+        // The client accepts null here (Option.None); a missing key would break it.
+        for (const key of [
+            "owned_character_count",
+            "max_owned_character_count",
+            "owned_degree_count",
+            "max_owned_degree_count",
+            "opened_mana_board_second_count",
+            "max_opened_mana_board_second_count",
+        ]) {
+            assert.ok(key in info, `${key} must be present even when hidden`)
+            assert.equal(info[key], null, `${key} must be null when hidden`)
+        }
+    } finally {
+        await app.close()
+    }
+})
+
+test("profile/get_profile reports an unknown target as result code 1457", async () => {
+    const app = await createApp()
+    try {
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/index.php/profile/get_profile",
+            payload: { viewer_id: viewerId, target_viewer_id: 799999999, api_count: 0 },
+        })
+        assert.equal(response.statusCode, 200, response.body)
+        const decoded = decode(response)
+        assert.equal(decoded.data_headers.result_code, 1457)
+        assert.deepEqual(decoded.data, {})
+    } finally {
+        await app.close()
+    }
+})
+
+test("profile/get_profile rejects a malformed request body", async () => {
+    const app = await createApp()
+    try {
+        const response = await app.inject({
+            method: "POST",
+            url: "/api/index.php/profile/get_profile",
+            payload: { viewer_id: viewerId, target_viewer_id: 0, api_count: 0 },
+        })
+        assert.equal(response.statusCode, 400, response.body)
+        assert.equal(JSON.parse(response.body).message, "Invalid target viewer id.")
+    } finally {
+        await app.close()
+    }
+})
+
+/**
+ * The whole "find a player → add them → open their card" loop as the client walks
+ * it: `follow/search_id` discovers the viewer id, `follow/add` writes the edge, and
+ * `profile/get_profile` has to report the edge back as a relation state the client
+ * can turn into its follow button labels (0 none / 1 mutual / 2 me→them / 3 them→me).
+ */
+test("profile/get_profile tracks the follow relation through add and remove", async () => {
+    db.prepare(`
+        DELETE FROM players_follows
+        WHERE (follower_player_id = ? AND followed_player_id = ?)
+           OR (follower_player_id = ? AND followed_player_id = ?)
+    `).run(player.id, otherPlayer.id, otherPlayer.id, player.id)
+
+    const app = await createApp()
+    try {
+        const search = await app.inject({
+            method: "POST",
+            url: "/api/index.php/follow/search_id",
+            payload: { viewer_id: viewerId, search_id: String(otherViewerId), api_count: 0 },
+        })
+        assert.equal(search.statusCode, 200, search.body)
+        const found = decode(search).data.search_result
+        assert.equal(found.viewer_id, otherViewerId)
+        assert.equal(found.follow_state, 0)
+
+        const profile = async () => {
+            const response = await app.inject({
+                method: "POST",
+                url: "/api/index.php/profile/get_profile",
+                payload: { viewer_id: viewerId, target_viewer_id: found.viewer_id, api_count: 0 },
+            })
+            assert.equal(response.statusCode, 200, response.body)
+            return decode(response).data.target_user_info
+        }
+        const add = async () => {
+            const response = await app.inject({
+                method: "POST",
+                url: "/api/index.php/follow/add",
+                payload: { viewer_id: viewerId, follow_id: otherViewerId, api_count: 0 },
+            })
+            assert.equal(response.statusCode, 200, response.body)
+        }
+
+        assert.equal((await profile()).follow_state, 0, "no edge yet")
+
+        await add()
+        assert.equal((await profile()).follow_state, 2, "me -> them")
+
+        const list = await app.inject({
+            method: "POST",
+            url: "/api/index.php/follow/lists",
+            payload: { viewer_id: viewerId, api_count: 0 },
+        })
+        assert.equal(list.statusCode, 200, list.body)
+        assert.deepEqual(decode(list).data.follow_info.map(entry => entry.viewer_id), [otherViewerId])
+
+        db.prepare(`
+            INSERT INTO players_follows (follower_player_id, followed_player_id, followed_at)
+            VALUES (?, ?, ?)
+        `).run(otherPlayer.id, player.id, new Date("2026-01-02T03:04:05.000Z").toISOString())
+        assert.equal((await profile()).follow_state, 1, "mutual")
+
+        const removed = await app.inject({
+            method: "POST",
+            url: "/api/index.php/follow/delete_followed",
+            payload: { viewer_id: viewerId, followed_id: otherViewerId, api_count: 0 },
+        })
+        assert.equal(removed.statusCode, 200, removed.body)
+        assert.equal((await profile()).follow_state, 2, "their edge is gone, mine stays")
+    } finally {
+        await app.close()
+    }
+})

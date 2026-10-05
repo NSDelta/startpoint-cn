@@ -20,10 +20,14 @@
  *   - 会话令牌只用 `randomBytes`，不签名、不落盘 —— 进程内存即真相，重启后所有会话失效；
  *   - 连续失败会按来源地址锁定一段时间（防在线爆破），成功即清零；
  *   - **不信任 `X-Forwarded-For`**，除非显式 `ADMIN_TRUST_PROXY=1`：否则任何人加一个
- *     `X-Forwarded-For: 127.0.0.1` 就能骗过"仅本机模式"。
+ *     `X-Forwarded-For: 127.0.0.1` 就能骗过"仅本机模式"；
+ *   - 机器人（`/api/bot` 契约）没有会话 Cookie，它带 `X-Bot-Token`。闸门对**带有效令牌**的
+ *     请求只放行 `BOT_TOKEN_PASSTHROUGH_PATHS` 里那两条路径，其余管理面照旧要会话 ——
+ *     否则机器人令牌就等价于后台口令。
  */
 
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import path from "node:path"
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
 import { hashPassword, verifyPasswordHash } from "../lib/sp-auth/password"
 
@@ -70,6 +74,40 @@ export const ADMIN_PROTECTED_API_PREFIXES: readonly string[] = [
     "/api/scheduled-resource",
     "/api/seeds",
 ]
+
+/**
+ * 机器人令牌头，与 `src/routes/web_api/bot.ts` 的 `BOT_TOKEN_HEADER` 必须一致。
+ * 这里重写一份而不是 import：闸门要在服务最早期生效，不该连带拉起数据层。
+ * `tools/admin_auth.test.cjs` 会断言两边相等。
+ */
+export const BOT_TOKEN_HEADER = "x-bot-token"
+
+/**
+ * 带**有效** `X-Bot-Token` 时可以穿过口令闸门的路径。
+ *
+ * 为什么需要：机器人没有后台会话 Cookie。闸门原来只认会话，而"是否浏览器"的判定
+ * （`prefersHtml`）把 Node fetch 默认的通配 Accept 头也算进去 → 机器人被判成浏览器 →
+ * 303 到 `/admin/login` → fetch 自动跟随 → 拿到登录页 HTML（HTTP 200）→ 握手 JSON
+ * 解析失败，机器人拒绝启动。
+ *
+ * 为什么只放这两条，而不是整个管理面：
+ *   - `/api/bot` —— 这些路由自己也校验同一个令牌，缺失/不符一律 403（失败关闭）；
+ *   - `/api/server/capabilities` —— 机器人启动握手要读的只读元数据（构建号/模式/内容版本）。
+ * 其余 `/api/server/*`（账号列表、存档、清理）**不放行**：否则拿到机器人令牌就等于拿到后台。
+ */
+export const BOT_TOKEN_PASSTHROUGH_PATHS: readonly string[] = ["/api/bot", "/api/server/capabilities"]
+
+function isBotTokenPassthroughPath(pathname: string): boolean {
+    return BOT_TOKEN_PASSTHROUGH_PATHS.some(entry => pathname === entry || pathname.startsWith(`${entry}/`))
+}
+
+/** 常量时间比较：两侧先 sha256，保证 `timingSafeEqual` 长度一致且不泄露令牌长度。 */
+function botTokenMatches(candidate: unknown, token: string): boolean {
+    if (typeof candidate !== "string") return false
+    const provided = createHash("sha256").update(candidate.trim(), "utf8").digest()
+    const expected = createHash("sha256").update(token, "utf8").digest()
+    return timingSafeEqual(provided, expected)
+}
 
 /** 免登录的后台路径（登录/登出自身，否则会死循环）。 */
 const ADMIN_PUBLIC_PATHS: readonly string[] = ["/admin/login", "/admin/logout"]
@@ -374,6 +412,11 @@ export interface AdminAuthInstallOptions {
     readonly secureCookie?: boolean
     /** 关掉启动横幅（测试用）。 */
     readonly quiet?: boolean
+    /**
+     * 机器人令牌（`BOT_API_TOKEN`）。给了它，带**有效** `X-Bot-Token` 的请求才能穿过闸门
+     * 走到 `BOT_TOKEN_PASSTHROUGH_PATHS`；缺省/空 = 不放行（闸门照旧只认会话）。
+     */
+    readonly botToken?: string | null
 }
 
 /**
@@ -389,6 +432,8 @@ export function installAdminAuth(
     const config = options.config
     const now = options.now ?? (() => Date.now())
     const state: AdminAuthState = { sessions: new Map(), failures: new Map() }
+    const rawBotToken = options.botToken
+    const botToken = typeof rawBotToken === "string" && rawBotToken.trim() !== "" ? rawBotToken.trim() : null
 
     fastify.get("/admin/login", async (request, reply) => {
         if (config.mode === "loopback-only" && !isLoopbackAddress(requestClientAddress(request, config))) {
@@ -474,8 +519,17 @@ export function installAdminAuth(
     fastify.post("/admin/logout", logout)
 
     fastify.addHook("onRequest", async (request, reply) => {
-        const pathname = request.url.split("?", 1)[0] ?? ""
+        // 先规范化点段：否则 `/api/bot/../server/accounts` 这类路径会先命中放行前缀，
+        // 再被路由器解析成管理接口（机器人令牌就变成了后台口令）。
+        const pathname = path.posix.normalize((request.url.split("?", 1)[0] ?? "") || "/")
         if (!isAdminProtectedPath(pathname)) return
+
+        // 机器人：带对令牌就放行（这些路径自己还会再校验一次；未配令牌时这里不放行）。
+        if (botToken !== null
+            && isBotTokenPassthroughPath(pathname)
+            && botTokenMatches(request.headers[BOT_TOKEN_HEADER], botToken)) {
+            return
+        }
 
         if (config.mode === "loopback-only") {
             if (isLoopbackAddress(requestClientAddress(request, config))) return

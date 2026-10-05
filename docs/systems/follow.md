@@ -14,9 +14,13 @@ Follow 关系只存在于同一个 `starpoint-cn` 实例和同一套 SQLite 内�
   复合主键、self-CHECK、双外键 `ON DELETE CASCADE`（删玩家清理双向边），
   反向索引 `(followed_player_id, followed_at DESC)`。
 - 表排除在 player-save 之外（`serverOperation`，见 `src/data/player-save/registry.ts`）。
-- 上限来自 Content `config.json`：`max_follows_count=100`（我方关注，超限 →
+- 上限分两层。**绑定上限**来自 Content `config.json`：`max_follows_count=100`（我方关注，超限 →
   A-error 1451）、`max_followers_count=50`（对方被关注，超限 → 1452）、
   `max_display_followers_count=50`。不硬编码。
+  **投影上限**是 `src/routes/api/follow/read-routes.ts` 的
+  `FOLLOW_LIST_DISPLAY_LIMIT = 100`：一次 `follow/lists` 最多返回 100 条关系，
+  按“最近登录优先、同刻 viewer_id 升序”截断（被关注数 `followed_count` 不受影响）。
+  三个页签共用同一份列表，所以不单独截断粉丝页签——否则截断会按页签清空。
 
 ## 状态派生
 
@@ -24,11 +28,22 @@ Follow 关系只存在于同一个 `starpoint-cn` 实例和同一套 SQLite 内�
 `3` 对方→我单向。由双向边存在性派生（`src/lib/follow/state.ts` 纯函数）；
 `follow_time` = 我→对方边时间，`followed_time` = 对方→我边时间（秒级投影）。
 
+**`followed_time` 在粉丝侧不能为 null**：客户端把 `follow/lists` 的 `follow_info`
+拆成“关注 / 粉丝 / 互关”三个页签（`FollowListsResponseTools.filterFollowFollowers`），
+粉丝页签的排序器 `FollowInfoTools.compareForFollowerList` 无条件读 `followed_time`，
+取到 `None` 就抛 `ClientError 2820`（“フォローされた日時が不明”）
+→ 只要列表里有一个单向粉丝，整个好友页就打不开。
+因此 `state=3`（对方→我）与 `state=1`（互关）**必须**带数值 `followed_time`：
+有入边时用入边时间，入边时间不可用时（例如存档恢复路径没有保留边时间）
+退化为服务器当前时间——该值只用于排序。`state=2`（我→对方）与 `state=0`
+保持 `null`，客户端在这两种状态下不读该字段（`src/routes/api/follow/profile.ts`
+的 `sortableFollowedTime`）。
+
 ## HTTP 协议（`src/routes/api/follow/`）
 
 | 端点 | 行为 |
 |---|---|
-| `follow/lists` | 有任一方向边的同服玩家投影 + `followed_count`；按 last_login_time 降序、viewer_id 升序 |
+| `follow/lists` | 有任一方向边的同服玩家投影 + `followed_count`；按 last_login_time 降序、viewer_id 升序，截断到 100 条 |
 | `follow/add` | 单事务；幂等；上限失败 → HTTP 200 + `result_code` 1451/1452 |
 | `follow/delete` / `follow/delete_followed` | 幂等删除出边 / 入边 |
 | `follow/bulk_edit` | 单事务全或无；成功 `data` 始终包含 `max_follower_user_viewer_id_list` 数组 |

@@ -6,7 +6,7 @@ import { expPoolRealDateToClientTimestamp } from "../../lib/exp-pool-time"
 import { ClientPlayerData, MergedPlayerData, PlayerQuestProgress, RushEventBattleType, UserBoxGacha, UserEquipment, UserPartyGroup, UserQuestProgress, UserRushEvent, UserRushEventPlayedParty, UserRushEventPlayedPartyList, UserTutorial } from "../types"
 import { serializePlayerRushEventPlayedParty } from "../domains/rushEvent"
 import { getPlayerClearedCollectItemEventMissionListSync } from "../domains/mission"
-import { updatePlayerSync } from "../domains/player"
+import { getPlayerLastMainQuestIdSync, updatePlayerSync } from "../domains/player"
 import { getPlayerMailCountSync } from "../domains/mail"
 import { kIdToBusinessCode } from "../codeMap"
 import { getCharacterVisibleManaBoardIndex } from "../../lib/mana-board-availability"
@@ -286,7 +286,7 @@ export function serializePlayerData(
         "user_equipment_list": userEquipmentList,
         "user_character_from_town_history": [],
         "quest_progress": userQuestProgress,
-        "last_main_quest_id": null,
+        "last_main_quest_id": getPlayerLastMainQuestIdSync(toSerialize.player.id),
         "gacha_info_list": toSerialize.gachaInfoList.map(gachaInfo => {
             const detail = gachaDetailsById.get(gachaInfo.gachaId)
             const stars = starsGachaById.get(gachaInfo.gachaId)

@@ -4,6 +4,14 @@ import { getPlayerSync } from "../../data/domains/player"
 import { getSession } from "../../data/domains/session"
 import { resolvePlayerIdSync } from "../../data/activeAccount";
 import { generateDataHeaders } from "../../utils";
+import type { MultiHttpContext } from "../../multi/http/context";
+import { getPlayerRankLevel } from "../../lib/player-rank-content";
+import { resolveRoomEstablisherFollowStateSafeSync } from "../../multi/follow-policy";
+import {
+    collectAttentionRecruitments,
+    type RecruitmentHostFacts,
+} from "../../multi/recruitment/query";
+import type { AttentionMultiList } from "../../multi/recruitment/attention";
 
 interface CheckBody {
     viewer_id: number
@@ -24,7 +32,80 @@ interface LoggerBody {
     api_count: number
 }
 
-const routes = async (fastify: FastifyInstance) => {
+export interface AttentionApiOptions {
+    /**
+     * Resolves the multi-battle HTTP context lazily. The attention routes are
+     * registered before the multi runtime is guaranteed to be listening, and the
+     * check route must keep answering `config` even when it is not.
+     */
+    multiContext?: () => MultiHttpContext | null
+}
+
+/**
+ * Bell notifications (`data.multi`) for this viewer.
+ *
+ * Recruiting is a same-node feature: rooms live in this process, the registry
+ * that tracks them is process-local, and nothing is ever routed to a Hub. When
+ * the multi runtime is unavailable we therefore return an empty list instead of
+ * failing the poll — the client must still receive its `config` block.
+ */
+async function collectAttentionMulti(
+    options: AttentionApiOptions,
+    viewerId: number,
+    requesterPlayerId: number,
+    body: CheckBody,
+): Promise<AttentionMultiList> {
+    let multi: MultiHttpContext | null = null
+    try {
+        multi = options.multiContext?.() ?? null
+    } catch (error) {
+        console.log(`[ATTENTION] multi context unavailable: ${String(error)}`)
+    }
+    if (!multi) return { multi: [] }
+
+    // One request can mention several rooms; resolve each host once.
+    const hostCache = new Map<number, Promise<RecruitmentHostFacts | null>>()
+    const resolveHost = (hostViewerId: number): Promise<RecruitmentHostFacts | null> => {
+        const cached = hostCache.get(hostViewerId)
+        if (cached) return cached
+        const pending = (async () => {
+            const context = await multi!.resolvePlayerContext(hostViewerId)
+            if (!context) return null
+            return {
+                hostPlayerId: context.playerId,
+                mainCharacterId: context.player.leaderCharacterId || 1,
+                rankLevel: getPlayerRankLevel(context.player.rankPoint),
+                // Same newbie proxy the TCP/snapshot path uses; a cleared
+                // tutorial sets tutorial_step to null.
+                isNewbie: !!context.player.tutorialStep,
+            }
+        })()
+        hostCache.set(hostViewerId, pending)
+        return pending
+    }
+
+    return collectAttentionRecruitments({
+        viewerId,
+        requesterPlayerId,
+        holdingNumber: body.holding_number,
+    }, {
+        registry: multi.recruitmentRegistry,
+        coordinator: multi.coordinator,
+        resolveHost,
+        participantFor: viewerId => multi!.snapshotProvider.getParticipant(viewerId),
+        resolveEstablisherFollow: input => resolveRoomEstablisherFollowStateSafeSync({
+            requester: input.requester,
+            host: multi!.snapshotProvider.getParticipant(input.hostViewerId),
+            requesterPlayerId: input.requesterPlayerId,
+            hostPlayerId: input.hostPlayerId,
+        }),
+        onResolveError: (roomNumber, error) => {
+            console.log(`[ATTENTION] dropping recruitment room=${roomNumber}: ${String(error)}`)
+        },
+    })
+}
+
+const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {}) => {
     fastify.post("/check", async (request: FastifyRequest, reply: FastifyReply) => {
         const body = request.body as CheckBody
 
@@ -49,12 +130,15 @@ const routes = async (fastify: FastifyInstance) => {
             "message": "No players bound to account."
         })
 
+        const multi = await collectAttentionMulti(options, viewerId, playerId, body)
+
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send({
             "data_headers": generateDataHeaders({
                 viewer_id: viewerId
             }),
             "data": {
+                ...multi,
                 "config": {
                     "attention_recruitment_interval_seconds": 15,
                     "attention_recruitment_redeliver_limit": 20,

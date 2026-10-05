@@ -172,12 +172,17 @@ export default function init(
         tutorial_step INTEGER,
         tutorial_skip_flag INTEGER,
         tutorial_gacha_character_id INTEGER DEFAULT NULL,
+        last_main_quest_id INTEGER DEFAULT NULL,
         time_offset INTEGER DEFAULT NULL,
         FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE
     )`).run();
 
     // migration: add tutorial_gacha_character_id to existing tables
     ensureSchemaColumn(database, "players.tutorial_gacha_character_id")
+
+    // migration: add last_main_quest_id for the bot `/skip chapter` progression
+    // shortcut — it is projected as `last_main_quest_id` in the `/load` response.
+    ensureSchemaColumn(database, "players.last_main_quest_id")
 
     // migration: add total_stamina_used for mission progress tracking
     ensureSchemaColumn(database, "players.total_stamina_used")

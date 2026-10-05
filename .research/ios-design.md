@@ -266,9 +266,15 @@ z8 = (c8 == 1 || c8 != 2) ? (z8 & d8) : (z8 | d8);   // relation==2 → OR，其
 ```
 
 **结论：核函数与业务必须解耦，性能靠换核解决。** 具体：
-1. iOS 侧 `am_fft` 整体替换为 **Accelerate/vDSP**（`vDSP_fft_zrip` 实数 FFT + `vDSP_fft_zop`），预期比标量 C 快 5~20 倍 ⇒ 最差搜索降到 10 ms 量级，可进预算。core 的接口（`am_fft_plan_create` / `am_fft_execute`）已为此隔离，替换不触碰 `auto_match.c`。
+1. iOS 侧把 FFT 的快路径换成 **Accelerate/vDSP**。**已落地**（`core/am_fft_accel.c`，只在 `__APPLE__ && AM_FFT_ACCELERATE` 下编译，非 Apple 退化成空实现 ⇒ Windows 单测照跑标量）：
+   - 接法**不是**替换 `am_fft`，而是在 `core/am_fft.c` 的 `fft_pow2()` 开头问一句「有加速后端吗」。只有**相邻的（stride == 1）、2 的幂长度**的一维变换走 vDSP；带跨距的行与非 2 的幂长度仍走标量。ND 驱动里最后一维的 stride 恒为 1，二维匹配的绝大多数工作量都在这一维。
+   - 用的是 **Double** 那一套（`vDSP_create_fftsetupD` / `vDSP_fft_zipD` / `vDSP_ctozD` / `vDSP_ztocD` + `DSPDoubleSplitComplex`）。第一次写错成单精度的 `DSPSplitComplex`，clang 报三条 `-Wincompatible-pointer-types` —— 那不只是警告，vDSP 会按 4 字节步长去读 double 数据，跑出来是垃圾。
+   - 逆变换在 `am_fft_execute()` 里是「共轭 → 正向 → 除 N → 再共轭」拼的，所以生产路径**只走正向**，不涉及 vDSP 的符号/缩放约定。
+   - 等价性验证**不能拿标量版当参考实现**（macOS 上标量路径根本不会被调用，那是「自己跟自己对」）。`tests/test_fft.c` 的 `[6]` 段改用与实现无关的不变量：`X[0] == Σx`、单位冲激 ⇒ 全 1、Parseval、以及「逆变换后再正变换应还原同一谱」。段尾还有一条断言：Apple 上若 `am_fft_accelerate_active()` 为假就报错 ⇒ 忘加 `-DAM_FFT_ACCELERATE=1` 的后果是当轮 CI 变红，而不是悄悄少测一截。
 2. **不要每帧匹配所有模板**。复刻 Android 的单调索引（§2.2）：每帧只评估可达的节点，正常稳态是 1~3 次匹配/帧。
 3. FFT 与模板尺寸无关 ⇒ **模板频域结果跨帧复用**（已实现），搜索区频域在 `expand_size`/crop 固定时也可复用。
+
+> ⚠️ 仍未在真机上量过 vDSP 版的实际耗时。§4.2.1 的 4.26 倍是**标量 C 在 Windows/MSVC 上**的数字；A10 上 vDSP 的收益只是预期（5~20 倍），要到 §12 验收清单第 6 步才能确认是否进 30 ms 预算。
 
 > 混合基（5-smooth）路径保留且有测试覆盖（`am_fft_plan_create` 接受 5-smooth 长度），在小尺寸 1D 上有用；**大尺寸 N 维变换不要用它**。理由与数据已写进 `core/am_fft.h` 的注释，防止后人"优化"回 5-smooth。
 
@@ -422,7 +428,7 @@ ios/auto/
 ├─ dylib/                    # Theos：dylib ✅
 │   ├─ Makefile  control  dylib.x  tools/inject-dylib.mjs
 │   └─ tools/make-fake-dylib.mjs   # 造无代码 Mach-O，验证注入器头部算术
-├─ tests/                    # ✅ 七套（371 例）
+├─ tests/                    # ✅ 七套（377 例）
 │   ├─ test_fft test_json test_script test_matcher
 │   ├─ test_matcher_neg test_package test_engine
 │   └─ pg_guard.{c,h}  bench_*.c  bench_cases.h
@@ -453,7 +459,7 @@ cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_package.exe /Fo:tes
 cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_script.exe /Fo:tests\build\ $inc tests\test_script.c $core"
 # 执行引擎（60 例：条件折叠/场景派发/点击矩形/缓存/超时/合成夹具自检）
 cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_engine.exe /Fo:tests\build\ $inc tests\test_engine.c core\auto_engine.c $core"
-# FFT 自身（119 例：与直接 DFT 逐元素对比 + 卷积定理 + 尺寸查询）
+# FFT 自身（125 例：与直接 DFT 逐元素对比 + 卷积定理 + 尺寸查询 + [6] 加速后端一致性 6 例）
 cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_fft.exe /Fo:tests\build\ /I core tests\test_fft.c core\am_fft.c"
 # JSON 解析（84 例）
 cmd /c "call `"$vcvars`" >nul && cl $cf /Fe:tests\build\test_json.exe /Fo:tests\build\ /I core tests\test_json.c core\am_json.c"
@@ -487,8 +493,8 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 > `"N passed"` 数值（而不只看退出码）的原因。
 
 结果：`test_engine` **60 passed** / `test_script` **56 passed** / `test_package` **21 passed** /
-`test_fft` **119 passed** / `test_json` **84 passed** / `test_matcher` **13 passed** /
-`test_matcher_neg` **18 passed**，**合计 371 例，全部 0 failed、零 warning**。
+`test_fft` **125 passed** / `test_json` **84 passed** / `test_matcher` **13 passed** /
+`test_matcher_neg` **18 passed**，**合计 377 例，全部 0 failed、零 warning**。
 （`test_matcher_neg` 另报「错配峰值区间上界 = 0.422071，sim = 0.80，最小余量 = 0.378」。）
 
 > `test_engine` 的合成夹具（`tests\test_engine.c` 的 `write_gray_png`）是**手写 PNG**：
@@ -500,15 +506,66 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 > 出错时会静默解出错误像素。
 
 
-### 9.2 iOS/theos（CI 侧）`[源码]`
+### 9.2 iOS/theos（CI 侧）`[实证]`
 
-- `TARGET = iphone:clang:16.5:15.0` —— **必须写死 SDK**；写 `latest` 会静默选中 iOS 26 SDK。
-- `brew install ldid-procursus xz`（**不是** `ldid`；`xz` 提供 `lzma`，否则 dm.pl 打包失败）。不需要 fakeroot/dpkg。
+- **`TARGET` 的 SDK 版本必须从系统探测，不能写死**：初稿写的 `iphone:clang:16.5:15.0`
+  在 GitHub 的 `macos-latest` 上直接
+  `Error: Your chosen SDK, "iPhoneOS16.5.sdk", does not appear to exist.` ⇒ 整个构建挂掉，
+  **而失败信息只有一行**。实测 runner 上是 Xcode 26.6 / `iPhoneOS26.5.sdk`。
+  现在的写法（`tweak/Makefile` 与 `dylib/Makefile` 同）：
+  ```make
+  SDKVER := $(shell xcodebuild -showsdks 2>/dev/null | sed -n 's/.*-sdk iphoneos\([0-9.]*\)$$/\1/p' | sort -V | tail -1)
+  TARGET = iphone:clang:$(SDKVER):15.0
+  $(info [AMAutoClick] xcodebuild -showsdks 选出的 iPhoneOS SDK = "$(SDKVER)" …)
+  ```
+  `$(info)` 那行是承重的：它被 `tee` 抓进 build.log，**SDK 到底选了哪个是可观测的**。
+  （写死版本的动机——"防 SDK 漂移"——在真 runner 上被反噬了。）
+- **`dylib` 必须自己加 `-Wl,-not_for_dyld_shared_cache`**：rootful 那条腿报
+  `ld: Shared cache eligible dylibs cannot use '-undefined dynamic_lookup' or '-U' …` 而
+  rootless 成功（是否给这个标志取决于 Theos 的 packaging scheme，不是源码）。
+  语义上也对：这个 dylib 被注入 App 包的 `Frameworks/`、靠 `LC_LOAD_DYLIB` 载入，
+  本来就不该进 dyld 共享缓存。★ **写法不能统一**：`-undefined dynamic_lookup` 是 clang
+  认识的驱动选项，而 `-not_for_dyld_shared_cache` 只认链接器 ⇒ 必须写 `-Wl,-not_for_dyld_shared_cache`
+  （裸写会得到 `clang: error: unknown argument`）。
+- **Theos 的 Debug 构建带 `-Werror`** ⇒ `-Wdeprecated-declarations` 是**硬失败**而不是警告。
+  `ios/AMCapture.m` 是平台层**唯一** include OpenGLES 并大量调用 GL 的文件（66 处），
+  所以在那一个文件顶部 `#pragma clang diagnostic push` + `ignored "-Wdeprecated-declarations"`、
+  文件末尾 `pop`；**不要**用全局 `-DGLES_SILENCE_DEPRECATION`（那是把整个项目的
+  deprecation 都关掉，越权）。
+- **属性的存储不是 ivar 时，既不要写 `@synthesize` 也不要声明 ivar**。
+  `AMCapture` 的 `hasFrame`/`backend` 读写文件级 `gFrame`/`gBackend`，加了 `@synthesize`
+  之后 clang 报 `error: ivar '_backend' which backs the property is not referenced in this
+  property's accessor [-Werror,-Wunused-property-ivar]`。（class extension 只能把 readonly
+  「升级」成 readwrite，且内存修饰符集合必须与头里**逐字一致**。）
+- `brew install ldid xz dpkg`（**不是** `ldid`；`xz` 提供 `lzma`，否则 dm.pl 打包失败；
+  `dpkg` 是 deb 结构断言要用的 `dpkg-deb`，macOS runner 上默认没有）。
 - `Architecture: iphoneos-arm`（rootless 时 Theos 自动改写为 `iphoneos-arm64`）；`Depends: mobilesubstrate`（ElleKit 声明 `Provides: mobilesubstrate (= 99)`）。
-- 过滤器 plist：`Filter = { Bundles = ("com.leiting.wf"); }`（**不要写 `Mode` 键**，无任何证据）。
+- 过滤器 plist：`Filter = { Bundles = ("com.leiting.wf"); Executables = ("worldflipper"); }`
+  （**不要写 `Mode` 键**，无任何证据）。★ 这个文件是 **NeXTSTEP 旧 ASCII 格式**
+  （Cydia/Substrate 的老写法，148 B / 10 行），**`plistlib` 只认 XML 与 binary、对它一律
+  `InvalidFileException`** —— 校验要用 `ios/auto/tools/check-plist.sh` 的三级降级。
+  另注：substrate 的语义是「不同键之间是**或**」⇒ 只要可执行名叫 `worldflipper` 就会注入，
+  即使 bundle id 被重签改了（这正是想要的兜底）。
 - 引用私有框架符号用 `-undefined dynamic_lookup`（Theos 不会自动加）。
 - 双 deb：`make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_DIR="$PWD/dist/rootless"` 与不带 scheme 的 rootful 版。
 - 越狱设备：iPhone 7 Plus / iOS 15.8.3 / **A10 = arm64（非 arm64e）** ⇒ Dopamine 2.x 或 palera1n rootless + ElleKit。
+
+#### 9.2.1 CI 里的「验证验证者」`[实证]`
+
+**本机没有 clang/Xcode/调试器**，iOS 代码的首次编译发生在 CI 上，所以 CI 里有一半的
+步骤在检查「刚才那个结论本身是不是假的」。踩过的三类假绿：
+
+| 假绿 | 真实症状 | 现在的对照 |
+|---|---|---|
+| 检查器自己不工作 | `lint-workflow.mjs` 的块标量判据把 `$` 写成 `\$`（JS 正则里 = 字面美元符），一条都没匹配到，**而它照样打印「体检通过」** | `--selftest` 注入 5 个已知必错的变异，断言报错（5/5） |
+| 解析别人文件的检查器失配 | `check-test-patterns.mjs` 的正则以 `$` 结尾，而工作流为绕开 `bash -e` 的守卫陷阱给每行加了 `|| true` ⇒ **7 行一条都匹配不上**，脚本打印「0 个不匹配 / 模式与真实输出一致」 | 正则去掉 `$` 锚 + **断言至少解析出 7 条** + `--selftest` 把期望值全改成 `1 passed` 断言报错 |
+| 诊断通道自己把 job 判红 | `::notice::` 后的文本**就是 shell 源码**（GitHub 把它写进下一步的临时脚本）⇒ 含 `$Binary` 的那行让脚本 `unbound variable` 退出，**而编译/打包/断言全绿** | 源头换文本 + 出口 `sanitize()` + `tsan-sanitize.sh`（要求「原样文本确实会炸」的阳性对照） |
+
+另有 `tests/audit_caps.c`（core 回归末尾）：量出真脚本在每个 `AM_MAX_*` 上的用量并要求
+一个都不溢出 —— **上限估小了只会置 `s->overflow_*` 计数，脚本照样"加载成功"**，
+现场表现是「有些按钮不点」而日志里什么都看不出。实测这份脚本完整装进引擎：
+11/128 组、9/128 变量、10/256 场景、单场景 1 事件、单事件 2 条件 / 1 动作、
+单变量 1 裁切、单组 3 变体，`sizeof(am_script) = 371264` 字节。
 
 ### 9.3 非越狱侧载
 
@@ -548,8 +605,8 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 | 5 | 非越狱侧载 7 天续签 | 中 | 用户体验问题，文档说明 |
 | 6 | ~~`am_inflate_zlib` 已改非 static 但头文件未声明~~ | — | ✅ 已补进 `core/am_container.h` |
 | 7 | 风控：固定轨迹点击可能被判定为脚本 | 低（私服） | 已复刻「矩形内随机取点」，天然带抖动 |
-| 8 | **标量 C 的 FFT 比预算慢 4.26 倍**（§4.2.1） | **高**（掉帧 → 反应迟钝） | iOS 侧换 Accelerate/vDSP；并复刻 Android 的单调索引，每帧只评估可达节点。**这是已知的最大性能缺口**。缓解：`am_engine_match` 已有帧号缓存（同一帧不重算），且场景门每轮只评估可达节点 |
-| 9 | FFT 内核已在 Windows 上被证正确（119 例 vs 直接 DFT），但 vDSP 版是**另一份实现** | 中 | 换核后必须重跑 `test_package` 的 21 个用例（其中 17 个是真实图像）做等价性验证，不能只信"能跑" |
+| 8 | **标量 C 的 FFT 比预算慢 4.26 倍**（§4.2.1） | 高 → **中** | ✅ 已落地 vDSP 后端（`core/am_fft_accel.c`，见 §4.2.1 第 1 条）。**剩余风险改为"没在真机上量过"**：4.26 倍是 Windows/MSVC 上的标量数字，A10 上 vDSP 的 5~20 倍只是预期。缓解：`am_engine_match` 已有帧号缓存（同一帧不重算），场景门每轮只评估可达节点，正常稳态 1~3 次匹配/帧 |
+| 9 | FFT 内核已在 Windows 上被证正确（125 例，含 `[6]` 段的实现无关不变量），但 vDSP 路径是**另一份实现** | 中 | 已处置：CI 在 macOS 上**开着** vDSP 跑全部七套（377 例），其中 `test_package` 的 21 个用例有 17 个是真实图像 ⇒ 等价性验证在每轮 CI 上都做。**注意不能拿标量版当参考实现**（macOS 上标量路径根本不会被调用，那是自己跟自己对） |
 | 10 | ~~`am_match_template` 的 ROI 缓存键只含尺寸不含内容~~ | — | ✅ 已修：`ctx_prepare` 现在也 `memcmp` 模板与 ROI 的像素副本（见 §4.4） |
 | 11 | ~~iOS 版 `nativeScale` 需合成伪 densityDpi 供变体选择（§2.5）~~ | 中 | ✅ 口径已纠正：density **不是**由 `nativeScale` 算，而是 **`帧缓冲宽 / 窗口点宽 × 160`**（`AMTouch -pixelToPointScaleInWindow:` 现算，优先用 `[AMCapture shared].frameSize.width / window.bounds.size.width`）。iPhone 7 Plus 逻辑 1242×2208（scale 3.0）/ 物理 1080×1920（nativeScale 2.608），**GL 帧缓冲是 1242×2208** ⇒ 用 nativeScale 会让 density 偏小 13%、**触摸坐标整体偏 1.15 倍**（1200 宽画面上 180 像素）。变体选择只比 density，故该值必须与录制机同一量纲 |
 | 12 | 本机**没有任何 iOS 编译能力**（无 clang / 无 Xcode / 无 debugger） | 中 | 平台层代码的正确性只能靠 **CI 编译 + `nm -u` 符号断言**兜住；**运行时行为（hook 是否装上、触摸是否生效）必须在真机上验**。不要把"CI 绿了"当成"能跑" |
@@ -572,12 +629,14 @@ tests\build\test_matcher.exe   matcher_golden ;  tests\build\test_matcher_neg.ex
 6. ✅ **Windows 侧端到端验证**：`test_engine` 的 `[A]` 段用「幻想连战.auto」+ `matcher_golden_pkg`
    的真实 ori 截图喂帧，断言点击点落在动作自己的 `crop` 矩形内；`[B]` 段用手写 PNG 合成的
    两张互不相同的标记图，验证「条件折叠 → 场景派发 → 点击落点」整条链（**60 例全绿**）。
-7. ⬜ iOS 侧换 FFT 核（Accelerate/vDSP）+ 重跑等价性验证（风险 #9）
+7. ✅ iOS 侧换 FFT 核（Accelerate/vDSP）—— **已落地且每轮 CI 都在验**（`core/am_fft_accel.c`；
+   等价性靠 `test_fft` `[6]` 段的「与实现无关不变量」+ `test_package` 的 17 个真实图像用例，
+   CI 在 macOS 上是**开着 vDSP** 跑完 377 例的）。**仍未在真机上量过耗时**（§10 风险 #8）。
 8. ✅ `ios/auto/ios/` 五个类（`AMCapture` / `AMTouch` / `AMRuntime` / `AMConfig` / `AMControlPanel`）
    —— 源码已完成。**注意：本机无 clang，首次编译发生在 CI 上，运行行为必须真机验（风险 #12）**
 9. ✅ `tweak/`（deb）+ `dylib/` 两个 Theos 工程 + `dylib/tools/inject-dylib.mjs`（已在真实
    `worldflipper` 上跑通，见 §9.3）
-10. ✅ CI（`.github/workflows/ios-autoclick.yml`，2×2 矩阵 + 371 例回归 + 产物结构断言）；
+10. ✅ CI（`.github/workflows/ios-autoclick.yml`，2×2 矩阵 + 377 例回归 + 产物结构断言）；
     ⬜ **真机验收清单**（见 §12）
 11. ⬜ 真机：先验风险 #1（iOS 截图跑匹配），再验 #2/#3（注入），最后跑完整脚本
 

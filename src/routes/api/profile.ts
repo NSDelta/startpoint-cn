@@ -1,5 +1,5 @@
 /**
- * Profile API — get_my_profile.
+ * Profile API — get_my_profile (own profile) and get_profile (another player).
  * Returns player profile info, settings, and party groups.
  */
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -15,14 +15,60 @@ import {
     getPlayerProfileSettingsSync,
     updatePlayerProfileSettingsSync,
 } from "../../data/domains/option";
-import { getFavoritePartyGroupListSync } from "../../lib/profileFavorite";
+import { getLocalFollowRelationSync } from "../../data/domains/follow";
+import { getFavoritePartyGroupListSync, getFavoritePartySelectionSync } from "../../lib/profileFavorite";
 import { getPlayerProfileStatsSync } from "../../lib/player-profile-stats";
+import { getPlayerRankLevel } from "../../lib/player-rank-content";
+import type { PlayerCharacterExBoost } from "../../data/types";
 
 const PROFILE_SETTING_FIELDS = [
     "show_opened_mana_board_second_count",
     "show_owned_character_count",
     "show_owned_degree_count",
 ] as const
+
+/**
+ * `data.favorite_character` of `profile/get_profile`: the target's favourite party.
+ * `character_ids` / `unison_character_ids` / `*_ex_boost` are parallel arrays — the
+ * client zips them by index — so every one of them must be the same length and may
+ * contain `null` for empty slots (`ProfileGetProfileDummyRemote.as:55-66`).
+ */
+function serializeFavoriteCharacter(
+    playerId: number,
+    leaderCharacterId: number,
+    characters: ReturnType<typeof getPlayerCharactersSync>,
+) {
+    const favorite = getFavoritePartySelectionSync(playerId, leaderCharacterId)
+    const exBoost = (characterId: number | null) => {
+        if (characterId === null) return null
+        const boost: PlayerCharacterExBoost | undefined =
+            characters[String(characterId)]?.exBoost
+        if (boost === undefined) return null
+        return {
+            status_id: boost.statusId,
+            ability_id_list: [...boost.abilityIdList],
+        }
+    }
+    return {
+        favorite_character: {
+            character_ids: [...favorite.characterIds],
+            unison_character_ids: [...favorite.unisonCharacterIds],
+            character_ex_boost: favorite.characterIds.map(exBoost),
+            unison_character_ex_boost: favorite.unisonCharacterIds.map(exBoost),
+        },
+    }
+}
+
+/**
+ * Resolves a `profile/get_profile` target inside the same-server boundary, which is
+ * the local session table — the same rule `follow/search_id` uses.
+ */
+async function resolveProfileTargetPlayerId(targetViewerId: number): Promise<number | null> {
+    const session = await getSession(String(targetViewerId))
+    if (!session) return null
+    const playerId = resolvePlayerIdSync(session.accountId)
+    return playerId === null || getPlayerSync(playerId) === null ? null : playerId
+}
 
 function serializeProfileSettings(
     settings: ReturnType<typeof getPlayerProfileSettingsSync>,
@@ -304,6 +350,90 @@ const routes = async (fastify: FastifyInstance) => {
         return reply.status(200).send({
             data_headers: generateDataHeaders({ viewer_id: viewerId }),
             data: { name },
+        })
+    })
+
+    /**
+     * Another player's profile card — opened from the follow/follower list, from a
+     * user search result, and from the room member list. The client validates every
+     * field of `target_user_info` and all four `favorite_character` arrays and throws
+     * ClientError 870x on a type mismatch, so the counts are gated by the *target's*
+     * visibility settings instead of being dropped (a missing key would blank the page).
+     */
+    fastify.post("/get_profile", async (request: FastifyRequest, reply: FastifyReply) => {
+        const body = request.body as any
+        const viewerId = body.viewer_id
+        if (!viewerId || isNaN(viewerId)) return reply.status(400).send({
+            error: "Bad Request",
+            message: "Invalid request body."
+        })
+
+        const session = await getSession(viewerId.toString())
+        if (!session) return reply.status(400).send({
+            error: "Bad Request",
+            message: "Invalid viewer id."
+        })
+
+        const viewerPlayerId = resolvePlayerIdSync(session.accountId)!
+        if (viewerPlayerId === null) return reply.status(400).send({
+            error: "Bad Request",
+            message: "No player bound to account."
+        })
+
+        const targetViewerId = body.target_viewer_id
+        if (!Number.isSafeInteger(targetViewerId) || targetViewerId <= 0) {
+            return reply.status(400).send({
+                error: "Bad Request",
+                message: "Invalid target viewer id."
+            })
+        }
+
+        const targetPlayerId = await resolveProfileTargetPlayerId(targetViewerId)
+        if (targetPlayerId === null) {
+            reply.header("content-type", "application/x-msgpack")
+            return reply.status(200).send({
+                data_headers: generateDataHeaders({ viewer_id: viewerId, result_code: 1457 }),
+                data: {},
+            })
+        }
+
+        const target = getPlayerSync(targetPlayerId)!
+        const characters = getPlayerCharactersSync(targetPlayerId)
+        const stats = getPlayerProfileStatsSync(characters)
+        const settings = getPlayerProfileSettingsSync(targetPlayerId)
+        const relation = getLocalFollowRelationSync(viewerPlayerId, targetPlayerId)
+        const leaderCharacterId = target.leaderCharacterId || 1
+
+        reply.header("content-type", "application/x-msgpack")
+        return reply.status(200).send({
+            data_headers: generateDataHeaders({ viewer_id: viewerId }),
+            data: {
+                ...serializeFavoriteCharacter(targetPlayerId, leaderCharacterId, characters),
+                target_user_info: {
+                    role: target.role || 1,
+                    viewer_id: targetViewerId,
+                    name: target.name,
+                    rank: getPlayerRankLevel(target.rankPoint || 0),
+                    comment: target.comment ?? "",
+                    degree_id: target.degreeId || 1,
+                    // 0 keeps the base full shot: the client clamps evolution level to 1.
+                    leader_character_full_shot_evolution_level: 0,
+                    follow_state: relation.state,
+                    owned_character_count: settings.showOwnedCharacterCount
+                        ? Object.keys(characters).length : null,
+                    max_owned_character_count: settings.showOwnedCharacterCount
+                        ? stats.maxOwnedCharacterCount : null,
+                    owned_degree_count: settings.showOwnedDegreeCount
+                        ? getOwnedPlayerDegreeIdsSync(targetPlayerId, target.degreeId).length : null,
+                    max_owned_degree_count: settings.showOwnedDegreeCount
+                        ? stats.maxOwnedDegreeCount : null,
+                    opened_mana_board_second_count: settings.showOpenedManaBoardSecondCount
+                        ? stats.openedManaBoardSecondCount : null,
+                    max_opened_mana_board_second_count: settings.showOpenedManaBoardSecondCount
+                        ? stats.maxOpenedManaBoardSecondCount : null,
+                    last_login_region: "CN",
+                },
+            }
         })
     })
 }

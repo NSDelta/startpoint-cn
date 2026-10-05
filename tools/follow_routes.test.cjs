@@ -29,6 +29,7 @@ const { getViewerIdSync } = require("../src/data/domains/session")
 const followRoutes = require("../src/routes/api/follow").default
 const {
     addLocalFollowSync,
+    getLocalFollowRelationSync,
 } = require("../src/data/domains/follow")
 const { getSocialCapacityPolicySync } = require("../src/lib/config-content")
 const { registerCnMsgpackOnSend } = require("../src/routes/cn/msgpack")
@@ -135,6 +136,7 @@ test("lists starts empty and add/delete drive the projected relation", async () 
     // 对方视角：被关注
     const listB = decode(await postFollow("lists", { viewer_id: viewerB }))
     assert.equal(listB.data.follow_info[0].follow_state, 3)
+    assert.equal(typeof listB.data.follow_info[0].followed_time, "number")
     assert.equal(listB.data.followed_count, 1)
 
     // 互关
@@ -283,4 +285,185 @@ test("self add, missing target and invalid viewer keep existing failure semantic
         payload: pack({}).toString("base64"),
     })
     assert.equal(badBody.statusCode, 400)
+})
+
+/**
+ * 客户端两个页签在排序时无条件读取时间戳：
+ * `FollowInfoTools.compareForFollowList` 读 follow_time、
+ * `compareForFollowerList` 读 followed_time，取到 None 就抛 ClientError 2820
+ * （common\data\follow\FollowInfoTools.as:30-70）。这里复刻这两个比较器，
+ * 保证服务端投影在任何 follow_state 下都能被客户端排序。
+ */
+function clientCompareForFollowList(left, right) {
+    if (Number(left.last_login_time) !== Number(right.last_login_time)) {
+        return Number(right.last_login_time) - Number(left.last_login_time)
+    }
+    return Number(left.viewer_id) - Number(right.viewer_id)
+}
+
+function clientCompareForFollowerList(left, right) {
+    if (left.followed_time === null || left.followed_time === undefined) {
+        throw new Error(`ClientError 2820: viewer_id=${left.viewer_id}`)
+    }
+    if (Number(left.followed_time) !== Number(right.followed_time)) {
+        return Number(right.followed_time) - Number(left.followed_time)
+    }
+    return Number(left.viewer_id) - Number(right.viewer_id)
+}
+
+// 客户端页签过滤（FollowListsResponseTools.filterFollowFollowers）
+const isFollowingTab = entry => entry.follow_state === 2
+const isFollowerTab = entry => entry.follow_state === 3
+const isMutualTab = entry => entry.follow_state === 1
+
+test("follower tab entries always carry a sortable followed_time", async () => {
+    const center = await createViewer("tab-center")
+    const following = await createViewer("tab-following")   // center → 对方（出边）
+    const fan = await createViewer("tab-fan")               // 对方 → center（入边）
+    const mutual = await createViewer("tab-mutual")         // 双向
+
+    addLocalFollowSync({
+        sourcePlayerId: center.playerId, targetPlayerId: following.playerId, followedAtMs: 1_500,
+    })
+    addLocalFollowSync({
+        sourcePlayerId: fan.playerId, targetPlayerId: center.playerId, followedAtMs: 2_500,
+    })
+    addLocalFollowSync({
+        sourcePlayerId: center.playerId, targetPlayerId: mutual.playerId, followedAtMs: 3_500,
+    })
+    addLocalFollowSync({
+        sourcePlayerId: mutual.playerId, targetPlayerId: center.playerId, followedAtMs: 4_500,
+    })
+
+    const list = decode(await postFollow("lists", { viewer_id: center.viewerId })).data
+    const byViewer = new Map(list.follow_info.map(entry => [entry.viewer_id, entry]))
+
+    const followingEntry = byViewer.get(following.viewerId)
+    assert.equal(followingEntry.follow_state, 2)
+    assert.equal(followingEntry.follow_time, 1)
+    assert.equal(followingEntry.followed_time, null, "出边没有入边时刻，保持 null")
+
+    const fanEntry = byViewer.get(fan.viewerId)
+    assert.equal(fanEntry.follow_state, 3)
+    assert.equal(fanEntry.follow_time, null)
+    assert.equal(fanEntry.followed_time, 2, "入边时刻按秒下发")
+
+    const mutualEntry = byViewer.get(mutual.viewerId)
+    assert.equal(mutualEntry.follow_state, 1)
+    assert.equal(mutualEntry.follow_time, 3)
+    assert.equal(mutualEntry.followed_time, 4)
+
+    // 两个页签各自排序都不允许抛 ClientError 2820
+    const followTab = list.follow_info.filter(isFollowingTab).slice()
+    followTab.sort(clientCompareForFollowList)
+    const mutualTab = list.follow_info.filter(isMutualTab).slice()
+    mutualTab.sort(clientCompareForFollowList)
+
+    const followerTab = list.follow_info.filter(entry => isFollowerTab(entry) || isMutualTab(entry))
+    assert.ok(followerTab.length >= 2)
+    followerTab.sort(clientCompareForFollowerList)
+    assert.deepEqual(
+        followerTab.map(entry => entry.viewer_id),
+        [mutual.viewerId, fan.viewerId],
+        "粉丝页签（被关注 + 互关）按 followed_time 降序",
+    )
+})
+
+// 关注容量上限（Content config.json 的 max_follows_count）与列表投影上限同值，
+// 都在 100；这里造 105 个目标，把两个上限的边界一起钉住。
+async function createCapFixture() {
+    const { getDb } = require("../src/data/db")
+    const center = await createViewer("cap-center")
+    const targets = []
+    for (let index = 0; index < 105; index += 1) {
+        targets.push(await createViewer(`cap-${index}`))
+    }
+
+    // 全部置为同一次登录时刻，锁死唯一排序键后再写关注时间。
+    getDb().prepare(`
+        UPDATE players
+        SET last_login_time = ?
+        WHERE id IN (${targets.map(() => "?").join(", ")})
+    `).run(new Date("2026-01-01T00:00:00.000Z").toISOString(), ...targets.map(target => target.playerId))
+
+    const accepted = []
+    const rejected = []
+    targets.forEach((target, index) => {
+        const result = addLocalFollowSync({
+            sourcePlayerId: center.playerId, targetPlayerId: target.playerId, followedAtMs: 1_000_000 + index,
+        })
+        // 容量已满时返回 source_limit，而不是抛错：这条边根本没写进去。
+        if (result.ok) accepted.push(target)
+        else rejected.push({ target, result })
+    })
+
+    const byViewerId = accepted.slice().sort((left, right) => left.viewerId - right.viewerId)
+    return { getDb, center, targets, accepted, rejected, byViewerId }
+}
+
+test("follow/lists caps the projection at 100 relations", async () => {
+    const { center, targets, accepted, rejected, byViewerId } = await createCapFixture()
+
+    assert.equal(accepted.length, 100, "关注容量上限放行 100 条")
+    assert.equal(rejected.length, 5)
+    for (const entry of rejected) {
+        assert.equal(entry.result.ok, false)
+        assert.equal(entry.result.reason, "source_limit")
+    }
+    assert.deepEqual(
+        rejected.map(entry => entry.target.playerId),
+        targets.slice(100).map(target => target.playerId),
+        "被容量上限拒绝的是最后加入的 5 个目标",
+    )
+
+    const data = decode(await postFollow("lists", { viewer_id: center.viewerId })).data
+    assert.equal(data.follow_info.length, 100, "一份列表最多投影 100 条")
+    assert.equal(data.followed_count, 0, "followed_count 是被关注总数，不受投影上限影响")
+
+    // 全部同 last_login_time → 按 viewer_id 升序取最小的 100 个
+    assert.deepEqual(
+        data.follow_info.map(entry => entry.viewer_id),
+        byViewerId.slice(0, 100).map(target => target.viewerId),
+    )
+})
+
+test("follow/lists drops the least recent logins first", async () => {
+    const { getDb } = require("../src/data/db")
+    // 独立玩家与独立批次：这里只验证排序与截断的语义，不碰关注容量上限。
+    const center = await createViewer("rank-center")
+    const targets = []
+    for (let index = 0; index < 50; index += 1) {
+        targets.push(await createViewer(`rank-${index}`))
+    }
+    getDb().prepare(`
+        UPDATE players
+        SET last_login_time = ?
+        WHERE id IN (${targets.map(() => "?").join(", ")})
+    `).run(new Date("2026-01-01T00:00:00.000Z").toISOString(), ...targets.map(target => target.playerId))
+    targets.forEach((target, index) => {
+        const result = addLocalFollowSync({
+            sourcePlayerId: center.playerId, targetPlayerId: target.playerId, followedAtMs: 2_000_000 + index,
+        })
+        assert.equal(result.ok, true, "独立批次必须全部写入")
+    })
+
+    const before = decode(await postFollow("lists", { viewer_id: center.viewerId })).data
+    const nearBottom = before.follow_info[before.follow_info.length - 1]
+    const promoted = targets[targets.length - 1]
+
+    getDb().prepare(`
+        UPDATE players SET last_login_time = ? WHERE id = ?
+    `).run(new Date("2026-02-01T00:00:00.000Z").toISOString(), promoted.playerId)
+
+    const refreshed = decode(await postFollow("lists", { viewer_id: center.viewerId })).data
+    assert.equal(refreshed.follow_info[0].viewer_id, promoted.viewerId, "最近登录的关系排在最前")
+    assert.ok(
+        refreshed.follow_info.some(entry => entry.viewer_id === nearBottom.viewer_id),
+        "50 条关系都在投影上限内，抬升排序不会把任何人挤出去",
+    )
+    assert.equal(
+        getLocalFollowRelationSync(center.playerId, promoted.playerId).state,
+        2,
+        "排序变化不改变关系本身",
+    )
 })

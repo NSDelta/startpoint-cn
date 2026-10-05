@@ -3,6 +3,7 @@ import { PrepareBody, SummonBody, RestoreRoomBody, ShareRoomBody } from "../type
 import { generateDataHeaders } from "../../utils";
 import { serializeRoomStatusConnection } from "../room/serializer";
 import { buildNpcMates } from "../npc/builder";
+import { requestsRandomRecruitment } from "../recruitment/attention";
 import { isValidMultiViewerId, type MultiHttpContext } from "./context";
 import type { CoordinatorErrorCode } from "../coordinator/contracts";
 import { classifyRoomJoin } from "./join-result";
@@ -261,6 +262,43 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
             return forbidden(reply);
         }
         if (viewerId !== room.value.host.viewerId) return forbidden(reply);
+
+        // A mismatch means the caller is advertising something other than the
+        // live room, which would let a stale bell point at the wrong quest.
+        if (body.category !== undefined
+            && body.category !== null
+            && body.category !== room.value.category) {
+            return reply.status(400).send({
+                "error": "Bad Request", "message": "Room quest mismatch."
+            });
+        }
+        if (body.quest_id !== undefined
+            && body.quest_id !== null
+            && body.quest_id !== room.value.questId) {
+            return reply.status(400).send({
+                "error": "Bad Request", "message": "Room quest mismatch."
+            });
+        }
+
+        // The share type list never reaches the log: only whether this call armed
+        // or disarmed the room's recruitment.
+        const recruited = body.share_type_list === undefined
+            ? true
+            : requestsRandomRecruitment(body.share_type_list);
+        const roomNumber = room.value.roomNumber;
+        const record = context.recruitmentRegistry.share({
+            recruited,
+            nowMs: Date.now(),
+            room: {
+                roomNumber,
+                category: room.value.category,
+                questId: room.value.questId,
+                hostViewerId: room.value.host.viewerId,
+            },
+        });
+        console.log(record
+            ? `[ATTENTION] recruitment open room=${roomNumber} category=${record.category} quest=${record.questId} share#=${record.shareCount}`
+            : `[ATTENTION] recruitment closed room=${roomNumber} recruited=${recruited}`);
 
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send({

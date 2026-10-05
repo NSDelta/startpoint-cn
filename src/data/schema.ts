@@ -21,6 +21,13 @@ const schemaColumns = {
         column: "tutorial_gacha_character_id",
         definition: "INTEGER DEFAULT NULL",
     },
+    // Main quest the player is currently on, projected as `last_main_quest_id`
+    // in `/load`. Null means "let the client decide from quest progress".
+    "players.last_main_quest_id": {
+        table: "players",
+        column: "last_main_quest_id",
+        definition: "INTEGER DEFAULT NULL",
+    },
     "players_gacha_info.crazy_draw_count": {
         table: "players_gacha_info",
         column: "crazy_draw_count",

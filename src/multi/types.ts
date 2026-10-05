@@ -173,6 +173,15 @@ export interface ShareRoomBody {
     viewer_id: number
     room_number: string
     api_count: number
+    /**
+     * Share channels the host selected, e.g. `[3]` for random (bell)
+     * recruitment. Absent on legacy requests, which are treated as a plain
+     * share so old clients keep advertising their room.
+     */
+    share_type_list?: number[]
+    /** Present on the client's random-recruitment share; must match the room. */
+    category?: number
+    quest_id?: number
 }
 
 export interface VerifyAccessTokenBody {

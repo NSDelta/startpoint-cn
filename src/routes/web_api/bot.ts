@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "crypto"
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
 
 import { getDatabaseStatus } from "../../data"
+import { resolvePlayerIdSync } from "../../data/activeAccount"
 import { getAccountSync } from "../../data/domains/account"
 import {
     SIGNUP_CODE_MAX_ATTEMPTS,
@@ -15,6 +16,12 @@ import {
 } from "../../data/domains/account-binding"
 import { getViewerIdSync } from "../../data/domains/session"
 import { getRealNow } from "../../runtime/time/game-time"
+import {
+    ChapterSkipError,
+    MAX_MAIN_CHAPTER,
+    getChapterStartQuestId,
+    skipPlayerToChapterSync,
+} from "../../lib/player-progress/chapter-skip"
 import type { BindingPlatform } from "../../data/types"
 
 // Bot control plane of contract 3.4 (`/api/bot`), owned by contract C4/C8.
@@ -165,6 +172,30 @@ function readUnbindRequest(body: unknown): { platform: BindingPlatform, uid: str
         uid: requireUid(raw.uid),
         code: requireCode(raw.code),
     }
+}
+
+function readSkipChapterRequest(body: unknown): { platform: BindingPlatform, uid: string, chapter: number } {
+    const raw = requireBody(body)
+    const chapter = raw.chapter
+    if (typeof chapter !== "number" || !Number.isSafeInteger(chapter) || chapter < 1) {
+        throw new BotRequestError()
+    }
+    return { platform: requirePlatform(raw.platform), uid: requireUid(raw.uid), chapter }
+}
+
+/**
+ * The account a platform identity may act on: its primary binding, or the
+ * single binding it has. Several bindings without a primary one are ambiguous,
+ * and guessing could skip a chapter on the wrong save, so it is refused.
+ */
+function resolveBoundAccountId(platform: BindingPlatform, uid: string): number | null {
+    const bindings = listBindingsSync({
+        platform,
+        platformUid: uid,
+        limit: MAX_BINDINGS_PER_UID,
+    })
+    if (bindings.length === 1) return bindings[0].accountId
+    return bindings.find(binding => binding.isPrimary)?.accountId ?? null
 }
 
 function readUsername(accountId: number): string | null {
@@ -388,6 +419,66 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
                 },
             })
         } catch (error) {
+            return sendBotError(request, reply, error)
+        }
+    })
+
+    /**
+     * `/skip chapter N` on the bot side: fast-forwards the bound save to the
+     * start of chapter N by marking chapters 1..N-1 finished.
+     *
+     * Story progress is a boolean per quest (`players_quest_progress.finished`),
+     * and both the client (`MainStageNodeLogic.isCleared`) and
+     * `singleBattleQuest/start` require the whole prerequisite stage node to be
+     * cleared before a later chapter is playable, so unlocking alone would not
+     * let the player in. `N = 1` is a valid no-op, and `N = MAX_MAIN_CHAPTER + 1`
+     * means "everything in content". The action targets the caller's own bound
+     * save and needs no confirmation code: it can only move that save forward.
+     */
+    fastify.post("/skip_chapter", async (request, reply) => {
+        if (!isDatabaseReady()) return reply.status(503).send({ ok: false, code: "SERVICE_UNAVAILABLE" })
+        let body: { platform: BindingPlatform, uid: string, chapter: number }
+        try {
+            body = readSkipChapterRequest(request.body)
+        } catch (error) {
+            if (error instanceof BotRequestError) {
+                return reply.status(400).send({ ok: false, code: "BAD_REQUEST" })
+            }
+            throw error
+        }
+        if (body.chapter > MAX_MAIN_CHAPTER) {
+            return reply.status(400).send({ ok: false, code: "INVALID_CHAPTER" })
+        }
+        if (!limiter.check(`${body.platform}:${body.uid}`)) {
+            return reply.status(200).send({ ok: false, code: "RATE_LIMITED" })
+        }
+        try {
+            const accountId = resolveBoundAccountId(body.platform, body.uid)
+            if (accountId === null) return reply.status(200).send({ ok: false, code: "NO_BINDING" })
+            const playerId = resolvePlayerIdSync(accountId)
+            if (playerId === null) return reply.status(200).send({ ok: false, code: "NO_PLAYER" })
+
+            const result = skipPlayerToChapterSync(playerId, body.chapter)
+            return reply.status(200).send({
+                ok: true,
+                data: {
+                    account_id: accountId,
+                    viewer_id: getViewerIdSync(accountId),
+                    username: readUsername(accountId),
+                    chapter: result.chapter,
+                    // The quest the player is now on: the first quest of the
+                    // chapter, which is also what was written as the persisted
+                    // current-quest pointer.
+                    last_main_quest_id: result.lastMainQuestId,
+                    current_quest: getChapterStartQuestId(result.chapter),
+                    finished_quests: result.newlyFinished,
+                    recorded_chapters: result.recordedChapters,
+                },
+            })
+        } catch (error) {
+            if (error instanceof ChapterSkipError) {
+                return reply.status(400).send({ ok: false, code: "INVALID_CHAPTER" })
+            }
             return sendBotError(request, reply, error)
         }
     })

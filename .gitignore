@@ -38,6 +38,10 @@ tmp/
 _out/
 _inspect/
 
+# 云端迁移打包的临时区（Server Bundle 暂存、Node Linux 运行时、装配中的平台包）。
+# 全部可由 tools/server-bundle 与 tools/runtime-pack 重放，不进仓库。
+_release/
+
 # ios/auto/decomp 是 自动化编辑器-v4.3.8.apk 的反编译产物（5558 个 .java + dex/jar）。
 # 它是**只读参考**，不是源码，也不该进仓库。重建方式见 ios/auto/README.md。
 ios/auto/decomp/
@@ -46,3 +50,12 @@ ios/auto/*.dex
 ios/auto/*.jar
 ios/auto/*.pyc
 ios/auto/__pycache__/
+
+# 本机排障/分析临时区（不进仓库；同步上游前的快照整理）
+.ghkey/
+.ttft/
+node_modules.locked/
+.research/_src/
+.research/q*.txt
+.research/*.ps1
+ios-autoclick-feasibility-report.md

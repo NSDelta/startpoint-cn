@@ -1,6 +1,6 @@
 # 玩家资料与玩家履历
 
-本文记录 `/profile/get_my_profile` 与 `/player_history/index` 的真实数据边界。资料卡会被分享到游戏外，因此完成日期属于真实世界事实，不跟随服务器虚拟时间回拨或前进。
+本文记录 `/profile/get_my_profile`、`/profile/get_profile` 与 `/player_history/index` 的真实数据边界。资料卡会被分享到游戏外，因此完成日期属于真实世界事实，不跟随服务器虚拟时间回拨或前进。
 
 ## 数据来源
 
@@ -16,6 +16,16 @@
 - `max_owned_degree_count`：当前称号主数据总数。
 
 `max_*` 表示当前 CDN 能证明的全量上限，不使用玩家当前持有数量代替。
+
+### 他人资料页
+
+`/profile/get_profile` 提供好友列表、玩家搜索和多人大厅点开的**他人**资料卡，请求体只带 `target_viewer_id`。目标解析与 `follow/search_id` 使用同一条同服边界（本地 `sessions` 表），解析不到时返回 HTTP 200 + `result_code` 1457，客户端据此显示「查无此人」而不是崩溃。
+
+- `target_user_info.follow_state` 是**观看者视角**的关系派生（`src/lib/follow/state.ts`：0 无关系、1 互相关注、2 我→对方、3 对方→我），与 `follow/lists` 的 `follow_info` 同一来源。
+- `owned_*` / `max_*` / `opened_mana_board_second_count` 六项由**目标玩家自己的**可见性设置（`players_options` 的 `profile.*` 私有键）门控：隐藏时字段仍然存在，值为 `null`。客户端把这六个字段声明为可选（`Option`），但要求键存在——缺键会让资料页解析失败。
+- `favorite_character` 的四个数组成员按索引配对，长度必须一致，空槽位用 `null`。`character_ids[0]` 恒有值（缺少收藏队伍时回落到 `players.leader_character_id`），因为客户端用它取领队全屏立绘，为空会直接抛异常。
+- `character_ex_boost` 只在角色真正拥有 EX 强化时给出 `{status_id, ability_id_list}`；没有时给 `null`。不伪造 `status_id`，因为客户端会用该 id 查 `ex_status` 主数据。
+- `last_login_region` 固定为 `"CN"`，客户端在为空时抛 `ClientError 2821`；`leader_character_full_shot_evolution_level` 固定为 `0`（基础全屏立绘），客户端只接受 0 与 1。
 
 ### 可重算履历
 

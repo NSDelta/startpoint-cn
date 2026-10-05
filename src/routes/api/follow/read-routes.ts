@@ -33,6 +33,17 @@ function parseSearchViewerId(value: unknown): number | null {
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
+/**
+ * 一次 `follow/lists` 最多投影多少条关系。
+ *
+ * 客户端把这一份列表拆成“关注 / 粉丝 / 互关”三个页签，三个页签共用同一个上限；
+ * 100 与 Content `config.json` 的 `max_follows_count`（我方关注上限）一致，
+ * 所以正常玩家的“关注”页签永远拿得到全部出边。粉丝数上限（50）不单独截断：
+ * 玩家自己的关注与粉丝合并后可能超过 100，此时按活跃度截断，
+ * 被截掉的是最久未登录的关系，且不会把某个页签单独清空。
+ */
+const FOLLOW_LIST_DISPLAY_LIMIT = 100
+
 export function registerFollowReadRoutes(fastify: FastifyInstance): void {
     // follow/lists：与当前玩家有任一方向边的同服玩家 + 被关注数
     fastify.post("/lists", async (request: FastifyRequest, reply: FastifyReply) => {
@@ -53,7 +64,7 @@ export function registerFollowReadRoutes(fastify: FastifyInstance): void {
             || (left.viewer_id ?? 0) - (right.viewer_id ?? 0)
         ))
         return ok(viewer.viewerId, {
-            follow_info: followInfo,
+            follow_info: followInfo.slice(0, FOLLOW_LIST_DISPLAY_LIMIT),
             followed_count: countLocalFollowersSync(viewer.playerId),
         }, reply)
     })
