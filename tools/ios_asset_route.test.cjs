@@ -13,7 +13,7 @@ const Fastify = require("fastify")
 const assetPlugin = require("../src/routes/cn/asset").default
 const assetInTitlePlugin = require("../src/routes/cn/assetInTitle").default
 const cdnFilesPlugin = require("../src/routes/cn/cdnFiles").default
-const { prepareIosCompat, resolveIosEntityList } = require("../src/content/cdn/ios-compat")
+const { getIosArchiveLocations, prepareIosCompat, resolveIosEntityList } = require("../src/content/cdn/ios-compat")
 
 const SHA = "a".repeat(64)
 
@@ -831,4 +831,334 @@ test("invalid ios entity list rows yield unavailable(invalid ios entity list), n
         assert.equal(info.statusCode, 503, item.label)
         assert.equal(info.json().code, "IOS_ASSETS_UNAVAILABLE", item.label)
     }
+})
+
+// 一次 /get_path 响应里所有会下载的归档路径。
+// 首装计划把 full 边放 `data.full`（带 `archive`），增量链放 `data.diff` ——
+// 注意 `data.diff` 是**边数组**（每项 `{original_version, version, archive}`），不是单个对象。
+function planArchiveLocations(payload) {
+    const archives = [
+        ...(payload?.data?.full?.archive ?? []),
+        ...(payload?.data?.diff ?? []).flatMap(edge => edge?.archive ?? []),
+    ]
+    return archives.map(item => String(item.location))
+}
+
+// ---------------------------------------------------------------------------
+// 补丁的 iOS 层（patches/<版本>/patch-manifest.json 里 layer:"ios"）
+//
+// 背景：Android Catalog 刻意不接受 iOS 归档（`archive-ios-*` 不进 catalog-builder 的
+// ARCHIVE_DIRECTORIES），所以补丁的 iOS 层只能由 ios-compat 单独拾取并**顶掉同一条
+// 版本边的官方基线 iOS 归档**。没有这层拾取，CDN 作者给补丁写 `layer:"ios"` 只是让启动
+// 校验通过，iOS 客户端永远拿不到那些字节。
+// ---------------------------------------------------------------------------
+
+const PATCH_IOS_BASELINE_BODY = "baseline-ios-bytes!"
+const PATCH_IOS_BODY = "patched-ios-bytes"
+const PATCH_BASELINE_EDGE_FROM = "1.4.53"
+const PATCH_TARGET_VERSION = "1.4.99"
+// 夹具让基线与补丁**只差 token**（同一槽位 `<from>-<to>-1`，两条都在，order 各自独立编号）：
+// 视图按槽位去重、补丁胜出，所以计划里只剩补丁那一条；被顶掉的基线那条不再被引用
+// （allowlist 仍可寻址它 —— 见下方"已知可接受残留"注释）。
+// 实盘 1.4.55/1.4.56 里两边的 token 恰好相同（同名同字节），同样收敛成一条。
+const PATCHED_BASELINE_RELATIVE_PATH =
+    `archive-ios-diff/pinball-${PATCH_BASELINE_EDGE_FROM}-${PATCH_TARGET_VERSION}-1-cccccc.zip`
+
+// 与 `_inspect/build_ios_layer.py` 产出的实盘补丁同形：目录名 = manifest.targetVersion，
+// archives 多层齐（common 给 Android 目录视图，ios 由本模块拾取），
+// 且 **iOS 归档的文件名版本边 = 补丁引入的那条边的 toVersion = targetVersion**
+// （`readPackageIosArchives` 要求 `parsePatchArchiveName(...).toVersion === manifest.targetVersion`）。
+function writeIosPatchPackage(patchesRoot, {
+    targetVersion = PATCH_TARGET_VERSION,
+    fromVersion = PATCH_BASELINE_EDGE_FROM,
+    token = "b04f3ee8",
+    body = PATCH_IOS_BODY,
+} = {}) {
+    const packageRoot = path.join(patchesRoot, targetVersion)
+    const archiveName = `pinball-${fromVersion}-${targetVersion}-1-${token}.zip`
+    fs.mkdirSync(path.join(packageRoot, "archive-ios-diff"), { recursive: true })
+    const bytes = Buffer.byteLength(body)
+    fs.writeFileSync(path.join(packageRoot, "archive-ios-diff", archiveName), Buffer.from(body))
+    fs.writeFileSync(path.join(packageRoot, "patch-manifest.json"), JSON.stringify({
+        schema: 1,
+        baseVersion: fromVersion,
+        targetVersion,
+        compatibleClient: "CN 1.8.1",
+        archives: [
+            {
+                relativePath: `archive-common-diff/pinball-${fromVersion}-${targetVersion}-1-c0ffee00.zip`,
+                layer: "common",
+                order: 1,
+                bytes: 1,
+                sha256: "b".repeat(64),
+            },
+            {
+                relativePath: `archive-ios-diff/${archiveName}`,
+                layer: "ios",
+                order: 1,
+                bytes,
+                sha256: crypto.createHash("sha256").update(Buffer.from(body)).digest("hex"),
+            },
+        ],
+    }, null, 2))
+    return { packageRoot, archiveName, relativePath: `archive-ios-diff/${archiveName}` }
+}
+
+// 带补丁边的快照替身：基线到此为止 1.4.53，补丁把它推到 1.4.99，
+// 那条新边的 platform 层由补丁自带的 iOS 归档顶替。
+// 形状取自真实 Release —— `snapshot.archiveSources` 只覆盖 Android Catalog 归档，
+// iOS 归档**永远不出现在 `cdn.edges[].archives` 里**（catalog-builder 不收 `archive-ios-*`），
+// 所以 ios-compat 只能靠"标成 patch 的路径"甄别落点。
+function createPatchBackedSnapshot() {
+    return Object.freeze({
+        cdn: Object.freeze({
+            schemaVersion: 1,
+            fullBaseVersion: "1.4.0",
+            targetVersion: PATCH_TARGET_VERSION,
+            installedBytes: 987_654,
+            entityListsRelativePath: "EntityLists/android_medium.csv",
+            edges: Object.freeze([
+                edge(null, "1.4.0", [archive("archive-common-full/base.zip", 100)]),
+                edge("1.4.0", "1.4.53", [archive("archive-common-diff/first.zip", 53)]),
+                edge(PATCH_BASELINE_EDGE_FROM, PATCH_TARGET_VERSION, [
+                    archive(`archive-common-diff/pinball-${PATCH_BASELINE_EDGE_FROM}-${PATCH_TARGET_VERSION}-1-5f083b4d.zip`, 8611),
+                ]),
+            ]),
+        }),
+        archiveSources: Object.freeze({
+            schemaVersion: 1,
+            archives: Object.freeze([
+                { relativePath: "archive-common-full/base.zip", source: Object.freeze({ kind: "baseline" }) },
+                { relativePath: "archive-common-diff/first.zip", source: Object.freeze({ kind: "baseline" }) },
+                { relativePath: `archive-common-diff/pinball-${PATCH_BASELINE_EDGE_FROM}-${PATCH_TARGET_VERSION}-1-5f083b4d.zip`, source: Object.freeze({ kind: "patch", targetVersion: PATCH_TARGET_VERSION }) },
+            ]),
+        }),
+    })
+}
+
+// 与 buildIosFixture 同一形状，但基线 iOS 覆盖到补丁边为止，
+// 且补丁那条边的基线 iOS 归档写成可辨认的字节，便于断言"回的是补丁字节还是基线字节"。
+function buildPatchedIosFixture() {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cn-ios-patch-"))
+    const cn = path.join(tempRoot, "cn")
+    const patchesRoot = path.join(tempRoot, "patches")
+    fs.mkdirSync(path.join(cn, "archive-ios-full"), { recursive: true })
+    fs.mkdirSync(path.join(cn, "archive-ios-diff"), { recursive: true })
+    fs.mkdirSync(path.join(cn, "EntityLists"), { recursive: true })
+    fs.writeFileSync(path.join(cn, "archive-ios-full", "pinball-1.4.0-1-abc123.zip"), Buffer.from("full-archive"))
+    fs.writeFileSync(path.join(cn, "archive-ios-diff", "pinball-1.4.0-1.4.53-1-def456.zip"), Buffer.from("diff-archive"))
+    fs.writeFileSync(path.join(cn, PATCHED_BASELINE_RELATIVE_PATH), Buffer.from(PATCH_IOS_BASELINE_BODY))
+    fs.writeFileSync(path.join(cn, "EntityLists", "android_medium.csv"), "path,version,size,hash,layer\n")
+    fs.writeFileSync(path.join(cn, "EntityLists", "ios_medium.csv"), IOS_ENTITY_LIST)
+    fs.mkdirSync(patchesRoot, { recursive: true })
+    const pkg = writeIosPatchPackage(patchesRoot)
+    // common 层也真的落盘：快照把它标成 patch 来源，`getIosArchiveLocations` 对 patch 来源
+    // 的路径只认补丁根（这正是"补丁文件不见了就别再发"的那条门禁）。
+    // 真实发布里它必然在（`scanPatchOverlay` 启动时就会校验存在性与 sha256），
+    // 夹具少这一个文件会让整个补丁边从 iOS 计划里消失 —— 那是夹具失真，不是产品行为。
+    fs.mkdirSync(path.join(pkg.packageRoot, "archive-common-diff"), { recursive: true })
+    fs.writeFileSync(
+        path.join(pkg.packageRoot, `archive-common-diff/pinball-${PATCH_BASELINE_EDGE_FROM}-${PATCH_TARGET_VERSION}-1-5f083b4d.zip`),
+        Buffer.from("patched-common-bytes"),
+    )
+    return { tempRoot, cn, patchesRoot, pkg }
+}
+
+test("a patch ios layer shadows the baseline ios archive for the same version edge", async t => {
+    const fixture = buildPatchedIosFixture()
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    const snapshot = createPatchBackedSnapshot()
+    const app = Fastify({ logger: false })
+    app.register(cdnFilesPlugin, {
+        getSnapshot: () => snapshot,
+        paths: { cdnRoot: fixture.cn, patchesRoot: fixture.patchesRoot },
+        iosCompat: IOS_COMPAT,
+    })
+    await app.ready()
+    t.after(() => app.close())
+
+    // 目录视图：补丁 iOS 层替换掉该边的 platform 层
+    const state = prepareIosCompat(snapshot, fixture.cn, fixture.patchesRoot)
+    assert.equal(state.kind, "ready")
+    assert.deepEqual(state.patchIosArchives, [fixture.pkg.relativePath])
+    const patchedEdge = state.catalog.edges.find(item => item.toVersion === PATCH_TARGET_VERSION)
+    assert.ok(patchedEdge, "the patched edge must exist in the ios view")
+    assert.ok(
+        patchedEdge.archives.some(item =>
+            item.relativePath === fixture.pkg.relativePath && item.layer === "platform"),
+        `patch ios archive must take the platform layer, got: ${JSON.stringify(patchedEdge.archives)}`,
+    )
+    // 补丁优先级 + 按路径去重：补丁与基线**各自目录内独立从 1 编号**（实盘两条都是 order 1），
+    // 撞号不能靠 order 消重（实盘基线 order 是 readdir 序号，往往也不撞），
+    // 所以按相对路径去重、补丁胜出 —— 被顶掉的基线条目**从视图里消失**，
+    // 否则同一个文件会被下两遍。基线归档本身仍在（别的边还要用）。
+    const platformEntries = patchedEdge.archives.filter(item => item.layer === "platform")
+    assert.equal(
+        platformEntries.length,
+        1,
+        `the shadowed baseline entry must leave the platform layer, got: ${JSON.stringify(platformEntries)}`,
+    )
+    assert.equal(
+        platformEntries[0].relativePath,
+        fixture.pkg.relativePath,
+        `the patch archive must lead the platform layer, got: ${JSON.stringify(platformEntries)}`,
+    )
+    assert.equal(
+        platformEntries.filter(item => item.relativePath === fixture.pkg.relativePath).length,
+        1,
+        "the patch archive must appear exactly once",
+    )
+    assert.deepEqual(
+        platformEntries.map(item => item.order),
+        [1],
+        "the platform layer must be renumbered contiguously from 1",
+    )
+
+    // allowlist：补丁路径落点在 patches/<版本> 且 pinned；同边基线路径不再可服务
+    const locations = getIosArchiveLocations(snapshot, fixture.cn, fixture.patchesRoot)
+    const patchLocation = locations.get(fixture.pkg.relativePath)
+    assert.ok(patchLocation, "the patch ios archive must be allowlisted")
+    assert.equal(patchLocation.kind, "patch")
+    assert.equal(patchLocation.targetVersion, PATCH_TARGET_VERSION)
+    assert.equal(patchLocation.physicalRoot, fs.realpathSync(fixture.pkg.packageRoot))
+    assert.equal(patchLocation.pinned, true)
+    assert.equal(patchLocation.expectedIdentity !== null, true)
+    // 别的边的基线归档照旧放行。
+    assert.ok(locations.get("archive-ios-diff/pinball-1.4.0-1.4.53-1-def456.zip"))
+    // 被同槽位去重顶掉的基线那条：视图里不再引用它 ⇒ allowlist 里也没有它（allowlist 只收
+    // 视图引用到的路径），GET 会落到"不是 zip 就发 baseline 目录"的老路径上并因文件不在
+    // cdnRoot 下而 404。这是预期的：客户端按计划下载，计划里已经没有它了。
+    assert.equal(
+        locations.get(PATCHED_BASELINE_RELATIVE_PATH),
+        undefined,
+        "the shadowed baseline archive must leave the allowlist",
+    )
+
+    // 补丁那条必须回补丁字节
+    const patched = await app.inject({ method: "GET", url: `/patch/cn/${fixture.pkg.relativePath}` })
+    assert.equal(patched.statusCode, 200)
+    assert.equal(patched.body, PATCH_IOS_BODY)
+    // 被顶掉的基线那条不再可服务（视图不再引用它）
+    const shadowed = await app.inject({ method: "GET", url: `/patch/cn/${PATCHED_BASELINE_RELATIVE_PATH}` })
+    assert.equal(shadowed.statusCode, 404, "the shadowed baseline path must no longer be served")
+})
+
+test("get_path prefers the patch ios archive and never falls back to the android platform layer", async t => {
+    // 与上一条同一夹具，走完整 HTTP 计划链路（这是真机实际走的那条）。
+    const fixture = buildPatchedIosFixture()
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    const snapshot = createPatchBackedSnapshot()
+    const app = Fastify({ logger: false })
+    app.register(assetPlugin, {
+        prefix: "/asset",
+        getSnapshot: () => snapshot,
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    await app.ready()
+    t.after(() => app.close())
+
+    const ios = await app.inject({
+        method: "POST",
+        url: "/asset/get_path",
+        headers: { device: "1" },
+        payload: {},
+    })
+    assert.equal(ios.statusCode, 200)
+    const iosArchives = planArchiveLocations(ios.json())
+    assert.ok(
+        iosArchives.some(location => location.endsWith(fixture.pkg.relativePath)),
+        `the ios plan must carry the patch archive, got: ${JSON.stringify(iosArchives.slice(-6))}`,
+    )
+    assert.equal(
+        iosArchives.some(location => location.includes("archive-android-")),
+        false,
+        `the ios plan must never reference android platform archives, got: ${JSON.stringify(iosArchives)}`,
+    )
+    // 计划里的 iOS platform 层只该剩补丁那一条（基线被同槽位去重顶掉）：
+    // 槽位 = `<from>-<to>-<index>`，token 不参与判定，所以两条不同 token 的同一槽位收敛成一条。
+    const patchedDiffArchives = (ios.json().data.diff ?? [])
+        .filter(edge => edge.version === PATCH_TARGET_VERSION)
+        .flatMap(edge => edge.archive.map(item => item.location))
+    assert.deepEqual(
+        patchedDiffArchives,
+        [
+            `${ANDROID_BASE}/archive-common-diff/pinball-1.4.53-1.4.99-1-5f083b4d.zip`,
+            `${ANDROID_BASE}/${fixture.pkg.relativePath}`,
+        ],
+        `the patched edge must lead with the patch platform archive and drop the shadowed baseline, got: ${JSON.stringify(patchedDiffArchives)}`,
+    )
+
+    // 同一个快照，Android 设备走的是 Android 目录视图：拿到的是 archive-android-diff
+    const android = await app.inject({
+        method: "POST",
+        url: "/asset/get_path",
+        headers: { device: "2" },
+        payload: {},
+    })
+    assert.equal(android.statusCode, 200)
+    const androidArchives = planArchiveLocations(android.json())
+    assert.ok(
+        androidArchives.some(location => location.includes("archive-common-diff/pinball-1.4.53-1.4.99-1-5f083b4d.zip")),
+        `the android plan must keep using the catalog archives, got: ${JSON.stringify(androidArchives.slice(-6))}`,
+    )
+    assert.equal(
+        androidArchives.some(location => location.includes("archive-ios-diff/")),
+        false,
+        "the android plan must never reference ios archives",
+    )
+})
+
+test("a redeployed ios patch layer is picked up without a restart", async t => {
+    // 缓存键带"补丁存在性指纹"（各版本 patch-manifest.json 的 size:mtimeMs）：
+    // 运维往 patches/ 里重新投放同一个版本包后，下一次请求就该重建 iOS 视图与 allowlist
+    // （旧进程里 allowlist 的 expectedIdentity 会钉住旧 inode，不重建就会一直 404 或发旧字节）。
+    const fixture = buildPatchedIosFixture()
+    t.after(() => fs.rmSync(fixture.tempRoot, { recursive: true, force: true }))
+
+    const snapshot = createPatchBackedSnapshot()
+    const app = Fastify({ logger: false })
+    app.register(assetPlugin, {
+        prefix: "/asset",
+        getSnapshot: () => snapshot,
+        env: localEnv(fixture.tempRoot),
+        resolveListenHost: () => "10.0.0.5",
+        iosCompat: IOS_COMPAT,
+    })
+    app.register(cdnFilesPlugin, {
+        getSnapshot: () => snapshot,
+        paths: { cdnRoot: fixture.cn, patchesRoot: fixture.patchesRoot },
+        iosCompat: IOS_COMPAT,
+    })
+    await app.ready()
+    t.after(() => app.close())
+
+    const before = await app.inject({ method: "POST", url: "/asset/get_path", headers: { device: "1" }, payload: {} })
+    assert.equal(before.statusCode, 200)
+    assert.ok(
+        planArchiveLocations(before.json()).some(location => location.includes(fixture.pkg.archiveName)),
+        `the plan must reference the installed patch archive, got: ${before.body.slice(0, 400)}`,
+    )
+    const servedBefore = await app.inject({ method: "GET", url: `/patch/cn/${fixture.pkg.relativePath}` })
+    assert.equal(servedBefore.statusCode, 200)
+    assert.equal(servedBefore.body, PATCH_IOS_BODY)
+
+    // 重新投放：删掉旧包目录，落一份新的（归档字节不同；正是运维的 Copy-Item -Force）
+    const redeployedBody = "patched-ios-bytes-v2"
+    fs.rmSync(fixture.pkg.packageRoot, { recursive: true, force: true })
+    const pkg2 = writeIosPatchPackage(fixture.patchesRoot, { body: redeployedBody })
+    assert.equal(pkg2.relativePath, fixture.pkg.relativePath, "same edge, same token ⇒ same relative path")
+
+    const after = await app.inject({ method: "POST", url: "/asset/get_path", headers: { device: "1" }, payload: {} })
+    assert.equal(after.statusCode, 200)
+    assert.ok(
+        planArchiveLocations(after.json()).some(location => location.includes(fixture.pkg.archiveName)),
+        `the plan must still reference the archive after redeploy, got: ${after.body.slice(0, 400)}`,
+    )
+    const servedAfter = await app.inject({ method: "GET", url: `/patch/cn/${fixture.pkg.relativePath}` })
+    assert.equal(servedAfter.statusCode, 200)
+    assert.equal(servedAfter.body, redeployedBody, "the new bytes must be served without a restart")
 })

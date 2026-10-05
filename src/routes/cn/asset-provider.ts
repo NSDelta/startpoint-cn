@@ -52,12 +52,12 @@ export function registerCnAssetProviderRoutes(
     })
 
     if (options.config.mode === "local") {
+        const cdnRoot = path.resolve(options.config.cdnRoot)
+        // 资产 CDN 的布局固定为 <CDN_DIR>/cn + <CDN_DIR>/patches（与 src/content/paths.ts 同源）。
+        const patchesRoot = path.resolve(path.dirname(cdnRoot), "patches")
         fastify.register(cdnFilesPlugin, {
             getSnapshot,
-            paths: {
-                cdnRoot: path.resolve(options.config.cdnRoot),
-                patchesRoot: path.resolve(path.dirname(options.config.cdnRoot), "patches"),
-            },
+            paths: { cdnRoot, patchesRoot },
             fileSystem: options.fileSystem,
             handleObserver: options.handleObserver,
             patchUploadRoot: options.patchUploadRoot ?? options.config.patchUploadRoot,
@@ -67,9 +67,11 @@ export function registerCnAssetProviderRoutes(
 
     if (options.iosCompat?.enabled === true && options.config.mode === "local") {
         // iOS 目录在适配器初始化时扫描一次并冻结（幂等；目录/实体表缺失时缓存"不可用"状态）。
-        // 扫描失败只影响 iOS 请求，不影响 Android 服务启动。
+        // 扫描失败只影响 iOS 请求，不影响 Android 服务启动。补丁的 iOS 层一并扫入，
+        // 缓存键含补丁存在性指纹 ⇒ 之后装补丁不必重启。
         try {
-            prepareIosCompat(getSnapshot(), path.resolve(options.config.cdnRoot))
+            const cdnRoot = path.resolve(options.config.cdnRoot)
+            prepareIosCompat(getSnapshot(), cdnRoot, path.resolve(path.dirname(cdnRoot), "patches"))
         } catch (error) {
             console.warn("[ios-compat] startup scan failed", error)
         }

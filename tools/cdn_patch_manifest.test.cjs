@@ -7,6 +7,7 @@ require("ts-node/register/transpile-only")
 
 const {
     PatchManifestError,
+    parsePatchArchiveName,
     parsePatchManifest,
 } = require("../src/content/cdn/patch-manifest")
 
@@ -122,8 +123,54 @@ test("publishes a machine-readable schema matching the runtime manifest contract
         schema.properties.archives.items.required,
         ["relativePath", "layer", "order", "bytes", "sha256"],
     )
-    assert.deepEqual(schema.properties.archives.items.properties.layer.enum, ["common", "medium", "android"])
+    assert.deepEqual(
+        schema.properties.archives.items.properties.layer.enum,
+        ["common", "medium", "android", "ios"],
+    )
+    assert.equal(
+        schema.properties.archives.items.properties.relativePath.pattern,
+        "^archive-(common|medium|android|ios)-diff/[^/]+\\.zip$",
+    )
     assert.equal(schema.properties.archives.items.properties.order.minimum, 1)
     assert.equal(schema.properties.archives.items.properties.bytes.minimum, 1)
     assert.equal(schema.properties.archives.items.properties.sha256.pattern, "^[a-f0-9]{64}$")
+})
+
+test("accepts the ios platform layer and keeps quality reserved for the catalog", () => {
+    const parsed = parsePatchManifest(manifest({
+        archives: [archive({
+            relativePath: "archive-ios-diff/pinball-1.4.54-1.4.55-1-abcd.zip",
+            layer: "ios",
+        })],
+    }))
+
+    assert.equal(parsed.archives[0].layer, "ios")
+    assert.equal(parsed.archives[0].relativePath, "archive-ios-diff/pinball-1.4.54-1.4.55-1-abcd.zip")
+    // 四层之外仍是硬错误：`quality` 只在 Catalog 里存在，作者不该写进 manifest。
+    assertCode("PATCH_ARCHIVE_LAYER_INVALID", () => parsePatchManifest(manifest({
+        archives: [archive({ layer: "quality" })],
+    })))
+    assertCode("PATCH_ARCHIVE_LAYER_INVALID", () => parsePatchManifest(manifest({
+        archives: [archive({ layer: "IOS" })],
+    })))
+})
+
+test("parsePatchArchiveName derives the version edge from the inner ZIP name", () => {
+    assert.deepEqual(
+        parsePatchArchiveName("pinball-1.4.54-1.4.55-1-abcd.zip"),
+        { fromVersion: "1.4.54", toVersion: "1.4.55" },
+    )
+    assert.deepEqual(
+        parsePatchArchiveName("pinball-1.4.5-1.4.56-12-ABCDEF.zip"),
+        { fromVersion: "1.4.5", toVersion: "1.4.56" },
+    )
+    for (const fileName of [
+        "pinball-1.4.54-1.4.55-abcd.zip",
+        "pinball-1.4.54-1.4.55-1-abcd.zip.tmp",
+        "pinball-1.4.54-1.04.55-1-abcd.zip",
+        "1.4.54-1.4.55-1-abcd.zip",
+        "",
+    ]) {
+        assert.equal(parsePatchArchiveName(fileName), null, fileName)
+    }
 })

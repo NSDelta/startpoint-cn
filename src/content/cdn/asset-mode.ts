@@ -1,5 +1,6 @@
 import { isIP } from "node:net"
 import os from "node:os"
+import path from "node:path"
 
 import { resolveCnCdnRoot } from "../paths"
 import {
@@ -17,6 +18,12 @@ export type AssetProviderConfig =
         readonly mode: "local"
         readonly baseUrl: string
         readonly cdnRoot: string
+        /**
+         * 补丁根 `<CDN_DIR>/patches`（`resolveContentPaths` 同源）。
+         * 与 `patchUploadRoot` 不是一回事：那个是 dummy upload 的落点，在 DATA_DIR 下。
+         * iOS 目录视图要靠它拿到补丁自带的 iOS 层归档。
+         */
+        readonly patchesRoot: string
         readonly patchUploadRoot: string
     }>
     | Readonly<{
@@ -179,10 +186,13 @@ export function parseAssetProviderConfig({
         return Object.freeze({ mode, baseUrl: normalizeCdnBaseUrl(env.CDN_BASE_URL) })
     }
 
+    const cdnRoot = resolveCnCdnRoot(env.CDN_DIR ?? ".cdn", projectRoot)
     return Object.freeze({
         mode,
         baseUrl: resolveLocalBaseUrl(env, resolveListenHost),
-        cdnRoot: resolveCnCdnRoot(env.CDN_DIR ?? ".cdn", projectRoot),
+        cdnRoot,
+        // 与 `resolveContentPaths` 同源：补丁根是 `<CDN_DIR>/patches`，即 `cdnRoot` 的兄弟目录。
+        patchesRoot: path.join(path.dirname(cdnRoot), "patches"),
         patchUploadRoot: resolveRuntimeDataPaths(env, projectRoot).assetPatchUploadDir,
     })
 }

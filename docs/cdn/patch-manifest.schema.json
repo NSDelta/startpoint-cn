@@ -38,13 +38,14 @@
         "properties": {
           "relativePath": {
             "type": "string",
-            "pattern": "^archive-(common|medium|android)-diff/[^/]+\\.zip$"
+            "pattern": "^archive-(common|medium|android|ios)-diff/[^/]+\\.zip$"
           },
           "layer": {
             "enum": [
               "common",
               "medium",
-              "android"
+              "android",
+              "ios"
             ]
           },
           "order": {

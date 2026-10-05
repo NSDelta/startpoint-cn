@@ -8,6 +8,8 @@
 |---|---|---|
 | 官方 CN 1.8.1 客户端，仅修改服务器 IP 和跳过登录 | 保证 | 唯一保证的客户端；协议与行为以该版本为准 |
 | 停服前从官方 CDN 主机下载的 CN 1.4.54 dump | 有限保证 | 支持资源清单目录为 `EntityLists/` 或 `entities/` 的两种已知官方布局；物理 dump 有 736 个 ZIP，运行时只保证 tracked manifest 引用的 677 个 Android common、medium（Catalog `quality` 层）和 platform 归档完整；启用 iOS 兼容（`iosCompat`）时，iOS 视图另行使用 `archive-ios-full`（5 个）与 `archive-ios-diff`（54 个）归档，且绝不回退 Android platform 归档 |
+| 补丁的 iOS 平台层（`layer: "ios"`） | 保证 | `patches/<version>/archive-ios-diff/` 里由 manifest 声明的归档替换对应版本边的 iOS platform 层，由 `/patch/cn/archive-ios-diff/*.zip` 从补丁版本目录供给；它不进 Android Catalog，Android 计划里不会出现。补丁层按文件名槽位覆盖同边的基线 iOS 归档（两边各自从 1 编号必然撞号），被顶掉的基线条目离开视图与 allowlist（GET 404） |
+| 补丁安装的生效时机 | 保证 | 启动时扫描一次并冻结 iOS 目录视图；补丁归档的落点、大小与文件身份在**每次请求**时按落点根现算，因此补齐或替换 `archive-ios-diff/` 后无需重启即可下载。补丁 manifest 与 Android Catalog 仍只在受支持入口启动时校验一次 |
 | latest 更新计划 | 保证 | 当前版本等于 active Catalog 目标版本时返回 `full=null`、`diff=null`；无补丁时目标为 1.4.54，安装合法补丁后以 Overlay 计算出的唯一末端为目标 |
 | incremental 更新计划 | 有限保证 | 官方 manifest 提供 1.4.0 至 1.4.54 的基线链；合法 patch manifest 声明的 inner ZIP 可继续形成唯一、允许跳号的后续链；未知或不可达版本返回错误 |
 | initial 更新计划 | 保证 | 返回 1.4.0 full 和到 active Catalog 目标版本的唯一链 |
@@ -33,7 +35,7 @@
 - 非官方 CN 1.4.54 基线；合法 Overlay 补丁目标版本不受此条限制；
 - CN 1.8.1 之外的客户端；
 - 除服务器 IP 和跳过登录外，还修改资源下载器、战斗逻辑或其他客户端行为的包；
-- 只向 `cn` 写入 ZIP，或放入 `patches` 但没有合法 patch manifest、匹配版本边和三层 inner ZIP 的内容。
+- 只向 `cn` 写入 ZIP，或放入 `patches` 但没有合法 patch manifest、匹配版本边和四层 inner ZIP 的内容。
 
 运行时不会为这些输入降级安全边界、猜测版本图或自动生成缺失数据。完整 SHA-256 的实际命令、参数和目录约束统一见 [`catalog-planner.md` 的“显式离线 SHA-256”章节](catalog-planner.md#显式离线-sha-256)，本页不重复维护命令副本。
 
@@ -63,7 +65,7 @@
 
 ## 已实现的 Patch Overlay
 
-项目支持 `CDN_DIR/cn + CDN_DIR/patches/<version>` 多根 Overlay。运行时只接受版本目录内 `patch-manifest.json` 明确声明且通过完整校验的 inner ZIP；外层分发 ZIP、未知 ZIP和没有 manifest 的目录不会自动激活。manifest 一旦出现，目录版本、内容依赖、三层归档、字节数、SHA-256 或升级图不合法都会阻止受支持入口启动。完整的安装、版本、失败关闭和组件边界见 [`patch-overlay.md`](./patch-overlay.md)。
+项目支持 `CDN_DIR/cn + CDN_DIR/patches/<version>` 多根 Overlay。运行时只接受版本目录内 `patch-manifest.json` 明确声明且通过完整校验的 inner ZIP；外层分发 ZIP、未知 ZIP和没有 manifest 的目录不会自动激活。manifest 一旦出现，目录版本、内容依赖、四层归档、字节数、SHA-256 或升级图不合法都会阻止受支持入口启动。完整的安装、版本、失败关闭和组件边界见 [`patch-overlay.md`](./patch-overlay.md)。
 
 CDN 作者工具可使用 [`patch-manifest.schema.json`](./patch-manifest.schema.json) 生成清单，并在完整本地 CDN 布局中运行 `npm run cdn:patch:check` 做只读发布前校验。该入口不生成补丁、不修改 CDN，也不激活 Content Release。
 

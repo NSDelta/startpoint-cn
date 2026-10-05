@@ -132,6 +132,15 @@ const LAYER_DIRECTORIES: Readonly<Record<PatchManifest["archives"][number]["laye
     common: { directory: "archive-common-diff", catalogLayer: "common" },
     medium: { directory: "archive-medium-diff", catalogLayer: "quality" },
     android: { directory: "archive-android-diff", catalogLayer: "platform" },
+    // iOS 层是 Android 目录之外的第四条边：名字同样落在"平台"层（客户端侧的 platform
+    // 语义），但字节只面向 iOS 设备。它不进入 Android 目录视图，由 ios-compat 的
+    // 平台视图单独拾取（见 src/content/cdn/ios-compat.ts 的补丁层扫描）。
+    ios: { directory: "archive-ios-diff", catalogLayer: "platform" },
+}
+
+/** iOS 层不出现在 Android 目录视图里：由 iOS 平台视图单独消费。 */
+export function isIosPatchLayer(layer: PatchManifest["archives"][number]["layer"]): boolean {
+    return layer === "ios"
 }
 
 function isMissing(error: unknown): boolean {
@@ -885,6 +894,12 @@ export async function scanPatchOverlay(
     const archives: PatchArchiveScan[] = []
     for (const candidate of resolveDependencies(packages, baselineCatalog.targetVersion)) {
         for (const archive of candidate.manifest.archives) {
+            // iOS 层不进入 Android 目录视图：它对 Android Catalog/Content Release 是
+            // 未解析来源（只由 ios-compat 的平台视图放行），因此记入 ignoredPaths。
+            if (isIosPatchLayer(archive.layer)) {
+                ignoredPaths.push(`${candidate.directoryName}/${archive.relativePath}`)
+                continue
+            }
             archives.push(await scanArchive(candidate, archive, dependencies))
         }
     }

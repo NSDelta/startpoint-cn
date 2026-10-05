@@ -32,6 +32,12 @@ assets/gacha_odds/
 .cdn/zip_index.json
 tmp/
 
+# 本地交付件与一次性探针（外层分发 ZIP、iOS 空壳、只读校验脚本）。
+# 它们是投放用的产物而不是源码：可由 tools/pack_ios_patch_delivery.cjs 与
+# tools/make_ios_stub_archives.cjs 随时重放，固定工序见 docs/cdn/patch-sop.md。
+_out/
+_inspect/
+
 # ios/auto/decomp 是 自动化编辑器-v4.3.8.apk 的反编译产物（5558 个 .java + dex/jar）。
 # 它是**只读参考**，不是源码，也不该进仓库。重建方式见 ios/auto/README.md。
 ios/auto/decomp/

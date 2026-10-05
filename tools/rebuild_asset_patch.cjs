@@ -83,12 +83,16 @@ function buildGachaTablePatch(gacha) {
         if (!row) continue;
         const pk = String(row[4] || "0");
         if (PROBLEMATIC_PK.has(pk)) {
-            // Clone and fix pageKind to "0" (Normal)
+            // Clone and fix pageKind to "0" (Normal).
+            // 改成 kind 0 后必须同时清空第 9 列（tenTimesPerAccountCost）：kind 0 页面
+            // 不允许带这一列，否则 Content Sync 会以
+            // 「invalid gacha content: tenTimesPerAccountCost must be blank for this page kind」拒收整份补丁。
             const fixedRow = [...row];
             fixedRow[4] = "0";
+            fixedRow[8] = "";
             entries.push({ key: gid, row: toCsv(fixedRow) });
             fixed++;
-            console.log(`  gid=${gid}: pk=${pk}→0 ${String(row[1] || '')}`);
+            console.log(`  gid=${gid}: pk=${pk}→0 清空第9列 ${String(row[1] || '')}`);
         } else {
             entries.push({ key: gid, row: toCsv(row) });
         }

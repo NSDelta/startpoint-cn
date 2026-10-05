@@ -12,7 +12,7 @@ import {
 import type { ContentSnapshot } from "../../content/runtime/content-snapshot"
 import { getContentSnapshot } from "../../content/runtime/content-snapshot"
 import { parseHttpByteRange, type HttpByteRange } from "./httpRange"
-import { getIosZipAllowlist } from "../../content/cdn/ios-compat"
+import { getIosArchiveLocations } from "../../content/cdn/ios-compat"
 
 export interface CdnFileSystem {
     realpath(filePath: string): Promise<string>
@@ -447,20 +447,23 @@ const routes = async (fastify: FastifyInstance, options: CnCdnFilesRouteOptions)
             if (path.posix.extname(relativePath).toLowerCase() === ".zip") {
                 if (options.iosCompat?.enabled === true) {
                     // archive-ios-* 独立 allowlist：仅放行冻结 iOS 目录视图中解析出的归档
-                    // （relativePath → 期望压缩字节数），不按目录名前缀放行未解析来源。
-                    const expectedSize = getIosZipAllowlist(snapshot, paths.cdnRoot).get(relativePath)
-                    if (expectedSize !== undefined) {
+                    // （relativePath → 磁盘落点与期望字节数），不按目录名前缀放行未解析来源。
+                    // 补丁自带 iOS 层时落点在 `<patchesRoot>/<版本>/archive-ios-diff`，
+                    // 因此这里不能用固定的 CDN root 打开，必须逐条取 location 里的根。
+                    const location = getIosArchiveLocations(snapshot, paths.cdnRoot, paths.patchesRoot)
+                        .get(relativePath)
+                    if (location !== undefined) {
                         return sendFile(
                             request,
                             reply,
-                            logicalRoot,
-                            physicalRoot,
+                            location.logicalRoot,
+                            location.physicalRoot,
                             relativePath,
                             fileSystem,
                             observer,
-                            expectedSize,
-                            undefined,
-                            true,
+                            location.expectedSize,
+                            location.expectedIdentity ?? undefined,
+                            location.pinned,
                         )
                     }
                 }

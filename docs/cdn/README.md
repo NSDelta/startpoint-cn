@@ -7,10 +7,11 @@
 1. [机制总览](./overview.md)：CDN 文件布局与客户端访问方式。
 2. [运行支持边界](./runtime-support.md)：当前明确支持和不支持的输入。
 3. [补丁 Overlay](./patch-overlay.md)：已实现的 `cn + patches` 多根加载、校验与失败关闭契约。
-4. [Content Sync](./content-sync.md)：启动同步、Release 和快照选择。
-5. [Catalog 与 Planner](./catalog-planner.md)：归档目录、版本图与下载计划。
-6. [客户端流程](./client-flow.md)：版本检查、清单与下载交互。
-7. [排查手册](./debugging.md)：同步、归档和客户端错误定位。
+4. [新增 CDN 补丁的固定工序](./patch-sop.md)：从出内容到投放验收的六步命令清单。
+5. [Content Sync](./content-sync.md)：启动同步、Release 和快照选择。
+6. [Catalog 与 Planner](./catalog-planner.md)：归档目录、版本图与下载计划。
+7. [客户端流程](./client-flow.md)：版本检查、清单与下载交互。
+8. [排查手册](./debugging.md)：同步、归档和客户端错误定位。
 
 ## 职责边界
 

@@ -19,7 +19,9 @@ CDN_DIR/
         |   `-- *.zip
         |-- archive-medium-diff/
         |   `-- *.zip
-        `-- archive-android-diff/
+        |-- archive-android-diff/
+        |   `-- *.zip
+        `-- archive-ios-diff/       # 只服务 iOS 目录视图，不进 Android Catalog
             `-- *.zip
 ```
 
@@ -71,9 +73,19 @@ CDN_DIR/
 - 文件存在且为普通文件；
 - `layer`、`order` 和 inner ZIP 文件名一致；
 - 文件大小和完整 SHA-256 与 manifest 一致；
-- common、medium 和 android 三层为同一版本边并具有从 1 开始的连续顺序。
+- common、medium、android 和 ios 四层为同一版本边并具有从 1 开始的连续顺序。
 
 同一逻辑归档路径不得指向不同字节。Catalog、Content Release 和运行时快照只接受 manifest 声明的 inner ZIP；未知文件不进入 allowlist。
+
+### ios 层只服务 iOS 目录视图
+
+`layer: "ios"` 的归档放在 `archive-ios-diff/`，**不进入 Android Catalog**：Catalog 每条边仍然只认 common、quality、platform 三层，`npm run cdn:patch:check` 的摘要里 `archiveCount` 也不含它。它只被 iOS 目录视图（`src/content/cdn/ios-compat.ts`）另路拾取，替换对应版本边的 platform 层，并由 `/patch/cn/archive-ios-diff/<file>.zip` 从补丁版本目录（不是 `CDN_DIR/cn`）供给。
+
+这样切分的理由是两边对"平台层"的语义不同：Android 平台层是 Catalog 的一部分，参与每层 order 连续性与 `archiveSources` 完整覆盖校验；iOS 平台层只是视图层的替换件，官方发布里本来就是 111 B `.empty` 占位包（真正的 mod 内容走 common 层）。若把 iOS 归档塞进 Android Catalog，会与 android 层撞 order、破坏覆盖校验，还会让 Android 客户端照单下载 iOS 字节。
+
+补丁 iOS 层与基线 iOS 归档**各自目录内独立从 1 编号**，同一条版本边上必然撞号。`platformArchiveCandidates()` 因此按**文件名槽位**（`pinball-<from>-<to>-<index>.zip` 里的 `<from>-<to>-<index>`，不含末尾 token）去重，且**补丁无条件胜出**（实现上先写基线、再写补丁，后写覆盖先写）：视图里该边只保留补丁那一条并按 order 重新连续编号，被顶掉的基线条目**离开视图**——不再出现在 `get_path` 的 `band` 里，也从 `/patch/cn/` 的 allowlist 消失（GET 返回 404）。
+
+去重键刻意不含 token，因为 token 只是发布方派生值、与字节无因果关系。官方发布里同一个 iOS 空壳常常在基线目录和补丁目录各存一份（名字与字节都可能完全相同，例如 1.4.55 的 111 B `.empty` 空壳），按 token 判定就会被当成两条依次下发两遍。
 
 ### 作者工具与机器可读契约
 
@@ -82,7 +94,7 @@ CDN_DIR/
 作者工具的推荐输出流程为：
 
 ```text
-生成三层 inner ZIP
+生成四层 inner ZIP
   -> 计算 bytes 与完整 SHA-256
   -> 写入版本 staging 目录
   -> 最后写 patch-manifest.json
@@ -97,7 +109,7 @@ CDN_DIR/
 npm run cdn:patch:check
 ```
 
-命令使用当前 `CDN_DIR` 的官方基线和 `patches/` 安装布局，执行目录、manifest、三层归档、版本图、大小和完整 SHA-256 校验，输出一行 JSON 摘要。它不会取得 Content Sync 锁、转换 orderedmap、写对象或激活 Content Release。作者工具可以在自己的临时 CDN 布局中调用同一命令作为发布门禁。
+命令使用当前 `CDN_DIR` 的官方基线和 `patches/` 安装布局，执行目录、manifest、四层归档、版本图、大小和完整 SHA-256 校验，输出一行 JSON 摘要（摘要里的归档计数只算进 Android Catalog 的 common/medium/android，不含 ios 层）。它不会取得 Content Sync 锁、转换 orderedmap、写对象或激活 Content Release。作者工具可以在自己的临时 CDN 布局中调用同一命令作为发布门禁。
 
 ## 安装依赖与客户端升级图
 
@@ -109,7 +121,7 @@ npm run cdn:patch:check
 
 ### inner ZIP 是升级图的唯一来源
 
-客户端升级边只从 inner ZIP 文件名和三层归档组合推导。版本号允许跳号：
+客户端升级边只从 inner ZIP 文件名和四层归档组合推导。版本号允许跳号：
 
 ```text
 1.4.54 -> 1.4.55 -> 1.4.58
@@ -122,7 +134,7 @@ npm run cdn:patch:check
 - 官方基线版本和每个已安装包的目标版本都能到达最终版本；
 - 每个受支持起点到最终版本恰好只有一条路径；
 - 图中没有断路、分叉、循环、重复边或相互冲突的边；
-- Catalog 三层在每条边上保持一致。
+- Catalog 的 common、quality、platform 三层在每条边上保持一致（ios 层不参与该证明，它由 iOS 目录视图单独对齐）。
 
 例如原链为 `1.4.54 -> 1.4.55 -> 1.4.58`，后来加入只提供 `1.4.55 -> 1.4.56` 的包，会产生无法到达 1.4.58 的第二末端并阻止启动。服务端可以重新扫描并重算已有版本图，但不能把 `1.4.55 -> 1.4.58` 的差分字节改写成 `1.4.56 -> 1.4.58`。
 
@@ -199,7 +211,7 @@ Content Release 不保存部署机器绝对路径。启动时 Locator 把来源�
 - 版本目录没有 manifest；
 - 合法升级链跳过某些数字版本。
 
-manifest 出现后，schema、兼容客户端、目录版本、安装依赖、相对路径、文件类型、字节数、SHA-256、三层归档或版本图任一不合法都失败关闭并阻止启动。错误必须包含稳定分类、补丁版本和相对路径，不得只输出模糊的加载失败信息。
+manifest 出现后，schema、兼容客户端、目录版本、安装依赖、相对路径、文件类型、字节数、SHA-256、四层归档或版本图任一不合法都失败关闭并阻止启动。错误必须包含稳定分类、补丁版本和相对路径，不得只输出模糊的加载失败信息。
 
 请求阶段不重复计算完整 SHA-256，也不生成 spool 或合并副本。完整摘要在启动前 Content Sync 中校验，可使用现有稳定文件元数据约束下的 digest cache；请求阶段复核固定来源、文件身份和大小。
 
@@ -218,7 +230,8 @@ Overlay 不复制约 10 GB 的官方基线，也不生成永久合并 CDN。新�
 - 可选 `baseVersion`、缺失依赖和依赖循环；
 - 目录名、包内目标版本和 manifest 目标版本一致性；
 - 路径逃逸、符号链接、文件类型、大小和 SHA-256；
-- 三层归档缺失、顺序错误和版本边冲突；
+- 四层归档缺失、顺序错误和版本边冲突；
+- 合法 `layer: "ios"` 归档替换对应版本边的 iOS platform 层、且不出现在 Android Catalog 与 Android 计划里；
 - 跳号链 `1.4.54 -> 1.4.55 -> 1.4.58` 通过；
 - 加入断路的 `1.4.55 -> 1.4.56` 后阻止启动；
 - Content Sync 从 `cn` 与 `patches` 共同读取并发布无绝对路径的 Release；

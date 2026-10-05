@@ -203,9 +203,12 @@ const routes = async (fastify: FastifyInstance, options: CnAssetRouteOptions) =>
     })
     const prepareIos = (contentSnapshot: ContentSnapshot, provider: AssetProviderConfig): IosCompatState => {
         const projectRoot = path.resolve(__dirname, "../../..")
-        const cdnRoot = provider.mode === "local"
-            ? provider.cdnRoot
-            : resolveCnCdnRoot(env.CDN_DIR ?? ".cdn", projectRoot)
+        if (provider.mode === "local") {
+            // patchesRoot 必须一起下传：补丁自带的 iOS 层归档落在 `patches/<版本>/`，
+            // 只给 cdnRoot 会退回按兄弟目录猜（单测里 cdnRoot 是临时夹具，猜不出真落点）。
+            return prepareIosCompat(contentSnapshot, provider.cdnRoot, provider.patchesRoot)
+        }
+        const cdnRoot = resolveCnCdnRoot(env.CDN_DIR ?? ".cdn", projectRoot)
         return prepareIosCompat(contentSnapshot, cdnRoot)
     }
 

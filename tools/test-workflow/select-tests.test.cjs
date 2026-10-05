@@ -1569,6 +1569,7 @@ test("routes multiplayer management adapters to the runtime regressions", () => 
 test("registers the full server acceptance smoke suite as one bounded serial group", () => {
     const group = "integration:multi-hub"
     const tests = [
+        "tests/multi-attention-recruitment.test.js",
         "tests/multi-hub-battle-flow.test.js",
         "tests/multi-hub-process-harness.test.js",
         "tools/perf/multi_hub_load_metrics.test.cjs",
@@ -1672,6 +1673,7 @@ test("registers the focused CDN path contract", () => {
             "tools/cdn_patch_manifest.test.cjs",
             "tools/cdn_patch_overlay.test.cjs",
             "tools/cdn_patch_check.test.cjs",
+            "tools/pack_ios_patch_delivery.test.cjs",
             "tools/admin_content_status.test.cjs",
             "tools/cdn_paths.test.cjs",
             "tools/cdn_planner.test.cjs",
@@ -2411,6 +2413,7 @@ test("quick protocol includes multi runtime lifecycle coverage", () => {
             "tools/gift_code_lifecycle.test.cjs",
             "tools/gift_receive_route.test.cjs",
             "tools/attention_config_route.test.cjs",
+            "tools/attention_recruitment_route.test.cjs",
             "tools/active_account_state_cache.test.cjs",
         "tools/load_identity_boundary.test.cjs",
     ])

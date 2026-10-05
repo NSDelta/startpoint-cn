@@ -77,6 +77,7 @@ test("ASSET_MODE defaults to a frozen local provider with the project CDN", () =
         mode: "local",
         baseUrl: "http://127.0.0.1:8001/patch/cn",
         cdnRoot: path.join(projectRoot, ".cdn", "cn"),
+        patchesRoot: path.join(projectRoot, ".cdn", "patches"),
         patchUploadRoot: path.join(
             projectRoot,
             ".database",
@@ -119,6 +120,7 @@ test("local preserves parent-of-cn CDN_DIR semantics and validates only configur
         mode: "local",
         baseUrl: "https://cdn.example.test/patch/cn",
         cdnRoot: path.join(projectRoot, "runtime-cdn", "cn"),
+        patchesRoot: path.join(projectRoot, "runtime-cdn", "patches"),
         patchUploadRoot: path.join(
             projectRoot,
             ".database",
