@@ -4,6 +4,7 @@ import {
     CHARACTER_LEVEL_SEED_TABLE,
 } from "../character-level-seed"
 import { ADDITIONAL_REWARD_PATHS } from "../converters/additional-reward"
+import { EVENT_FAMILY_SOURCE_PATHS } from "../converters/event-family"
 import { PERIODIC_REWARD_TABLE_SOURCES } from "../converters/periodic-reward"
 import { LOGIN_BONUS_SOURCE } from "../converters/login-bonus"
 import {
@@ -123,6 +124,7 @@ const REWARD_TABLES = [
     ["score_reward.json", "master/reward/score_reward.orderedmap"],
     ["rare_score_reward.json", "master/reward/rare_score_reward.orderedmap"],
     ["score_attack_border_reward.json", "master/quest/event/score_attack_border_reward.orderedmap"],
+    ["ranking_event_ranking_reward.json", "master/quest/event/ranking_event_ranking_reward.orderedmap"],
     ["rush_event_quest_folder.json", "master/quest/event/rush_event_quest_folder.orderedmap"],
     ["rush_event_ranking_reward.json", "master/quest/event/rush_event_ranking_reward.orderedmap"],
 ] as const
@@ -413,6 +415,14 @@ const definitionInputs: TableSourceInput[] = [
         scope: "cdn",
         sourceOrderedMaps: ["master/character/character_text.orderedmap"],
         converterId: "character",
+        converterVersion: 1,
+        outputShapeVersion: 1,
+    },
+    {
+        tableName: "event_activity.json",
+        scope: "cdn",
+        sourceOrderedMaps: EVENT_FAMILY_SOURCE_PATHS,
+        converterId: "event-family",
         converterVersion: 1,
         outputShapeVersion: 1,
     },

@@ -17,9 +17,11 @@ import { getPlayerCharactersSync } from "../../data/domains/character"
 import { getActivePlayerId, getAdminPlayerSelectionState, setActivePlayerId, saveAccountDefaultPlayer, getAccountDefaultPlayer } from "../../data/activeAccount";
 import { saveDefaultSaveTemplate, loadDefaultSaveTemplate, clearDefaultSaveTemplate, getDefaultSaveMeta } from "../../data/defaultSave";
 import { getEffectiveVersion } from "../../lib/version";
-import { buildShortUpCharacterGachaTimeline } from "../../lib/admin-clairvoyance";
+import { buildShortUpCharacterGachaTimeline } from "../../lib/admin-clairvoyance"
+import { buildAdminActivityTimeline } from "../../lib/admin-activity";
 import { buildAdminContentStatus } from "../../lib/admin-content-status";
 import { getRankDegree } from "../../lib/stamina";
+import { getFavoriteCharacterIdSync } from "../../lib/profileFavorite";
 import { getContentSnapshot } from "../../content/runtime/content-snapshot";
 import type { CnRuntimeConfig } from "../../runtime/config";
 import { DEFAULT_SERVER_PORTS } from "../../runtime/release-contract";
@@ -213,6 +215,14 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         })
     })
 
+    fastify.get("/clairvoyance/activity", async (_request: FastifyRequest, reply: FastifyReply) => {
+        return reply.status(200).send({
+            cdnVersion: getEffectiveVersion(),
+            baseline: "fixed-cn-final",
+            ...buildAdminActivityTimeline(getServerDate()),
+        })
+    })
+
     // === Account list (JSON, for admin SPA) ===
 
     fastify.get("/accounts", async (_request: FastifyRequest, reply: FastifyReply) => {
@@ -259,8 +269,12 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
                         name: player.name,
                         degreeId: player.degreeId,
                         rank: getRankDegree(player.rankPoint),
+                        characterCount: player.characterCount,
+                        lastLoginTime: player.lastLoginTime.toISOString(),
                         isDefault: defaultPid === player.id,
                         isActive: activePlayerId === player.id,
+                        // 只读投影: 游戏内收藏编队主角色（存档子卡头像, task-38）
+                        favoriteCharacterId: getFavoriteCharacterIdSync(player.id),
                     }
                 }),
                 playerIds
@@ -457,7 +471,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         const pid = parseInt(playerId)
         if (isNaN(pid)) {
             if (wantsJson(request)) return reply.status(400).send({ error: "Invalid playerId" })
-            return reply.redirect('/player')
+            return reply.redirect('/admin/accounts')
         }
         setActivePlayerId(pid)
         const allAccounts = getAllAccountsSync()
@@ -468,7 +482,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
             }
         }
         if (wantsJson(request)) return reply.send({ ok: true, playerId: pid })
-        return reply.redirect('/player')
+        return reply.redirect('/admin/accounts')
     })
 
     // Create new empty save under the given account
@@ -477,7 +491,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         const accId = parseInt(aid)
         if (isNaN(accId)) {
             if (wantsJson(request)) return reply.status(400).send({ error: "Invalid accountId" })
-            return reply.redirect('/player')
+            return reply.redirect('/admin/accounts')
         }
         const player = insertDefaultPlayerSync(accId)
         // 若管理员配置了默认存档模板，用它替换新建的空存档
@@ -492,7 +506,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         setActivePlayerId(player.id)
         saveAccountDefaultPlayer(accId, player.id)
         if (wantsJson(request)) return reply.send({ ok: true, playerId: player.id, appliedTemplate })
-        return reply.redirect('/player')
+        return reply.redirect('/admin/accounts')
     })
 
     // Delete a save
@@ -501,37 +515,31 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         const pid = parseInt(playerId)
         if (isNaN(pid)) {
             if (wantsJson(request)) return reply.status(400).send({ error: "Invalid playerId" })
-            return reply.redirect('/player')
+            return reply.redirect('/admin/accounts')
         }
         const allAccounts = getAllAccountsSync()
         let accountId = 0
         for (const a of allAccounts) {
             if (getAccountPlayersSync(a.id).includes(pid)) { accountId = a.id; break }
         }
+        // 单存档账号不允许通过删除存档间接删号(维护者指定): 破坏性必须与按钮语义对齐,
+        // 删号(含设备绑定解绑)只能走显式的 deleteAccount; UI 禁用是引导, 这里是兜底
         if (accountId && getAccountPlayersSync(accountId).length <= 1) {
-            deletePlayerSync(pid)
-            deleteAccountSync(accountId)
-            try {
-                const db = require("../../data/db").getDb()
-                db.prepare(`DELETE FROM device_bindings WHERE account_id = ?`).run(accountId)
-            } catch (_) {}
-            try {
-                const { readState, writeState } = require("../../data/activeAccount")
-                const state = readState()
-                delete state.defaultPlayers[accountId]
-                writeState(state)
-            } catch (_) {}
-        } else {
-            deletePlayerSync(pid)
+            if (wantsJson(request)) {
+                return reply.status(400).send({ error: "该账号仅剩这一个存档，请使用删除账号" })
+            }
+            return reply.redirect('/admin/accounts')
+        }
+        deletePlayerSync(pid)
+        if (accountId) {
             const remainingPlayerIds = getAccountPlayersSync(accountId)
             if (getAccountDefaultPlayer(accountId) === pid && remainingPlayerIds.length > 0) {
                 saveAccountDefaultPlayer(accountId, remainingPlayerIds[0])
             }
         }
-        const accountAlsoDeleted = accountId && getAccountPlayersSync(accountId).length === 0
         if (getActivePlayerId() === pid) setActivePlayerId(null)
-        if (wantsJson(request)) return reply.send({ ok: true, deleted: pid, accountAlsoDeleted: !!accountAlsoDeleted })
-        return reply.redirect('/player')
+        if (wantsJson(request)) return reply.send({ ok: true, deleted: pid, accountAlsoDeleted: false })
+        return reply.redirect('/admin/accounts')
     })
 
     // Delete entire account + all saves + device binding
@@ -554,7 +562,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
             writeState(state)
         } catch (_) {}
         if (wantsJson(request)) return reply.send({ ok: true, accountId, deletedSaves: playerIds.length })
-        return reply.redirect('/player')
+        return reply.redirect('/admin/accounts')
     })
 
     // Rename a save
@@ -565,7 +573,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         if (isNaN(playerId) || !name) return reply.status(400).send({ error: "Missing params" })
         updatePlayerSync({ id: playerId, name: String(name) })
         if (wantsJson(request)) return reply.send({ ok: true, playerId, name: String(name) })
-        return reply.redirect('/player')
+        return reply.redirect('/admin/accounts')
     })
 
     // Clone a save to another account
@@ -575,12 +583,12 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         const accountId = parseInt(aid)
         if (isNaN(playerId) || isNaN(accountId)) {
             if (wantsJson(request)) return reply.status(400).send({ error: "Invalid playerId or accountId" })
-            return reply.redirect('/player')
+            return reply.redirect('/admin/accounts')
         }
 
         if (getPlayerSync(playerId) === null) {
             if (wantsJson(request)) return reply.status(404).send({ error: "Source player not found" })
-            return reply.redirect('/player')
+            return reply.redirect('/admin/accounts')
         }
 
         let snapshot
@@ -589,7 +597,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
         } catch (error: any) {
             const message = `存档导出失败：${error?.message ?? error}`
             if (wantsJson(request)) return reply.status(500).send({ error: message })
-            return reply.redirect(`/player/${playerId}?error=${encodeURIComponent(message)}`)
+            return reply.redirect(`/admin/players/${playerId}?error=${encodeURIComponent(message)}`)
         }
 
         const cloned = clonePlayerSaveV2Sync(snapshot, accountId)
@@ -597,7 +605,7 @@ const routes = async (fastify: FastifyInstance, options: ServerRoutesOptions) =>
 
         saveAccountDefaultPlayer(accountId, cloned.playerId)
         if (wantsJson(request)) return reply.send({ ok: true, newPlayerId: cloned.playerId })
-        return reply.redirect('/player')
+        return reply.redirect('/admin/accounts')
     })
 
     // Device binding rename

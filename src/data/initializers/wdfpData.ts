@@ -6,12 +6,14 @@ import {
     ensureActiveQuestEntryItemCountStorageSync,
     ensureActiveQuestResourceCostStorageSync,
     ensureActiveQuestRescueFragmentEligibilityStorageSync,
+    ensureActiveQuestNewbieRescueEligibilityStorageSync,
 } from "../../lib/quest/active-quest-persistence";
 import { ensureSchemaColumn } from "../schema";
 import { initializeServerNewsSchemaSync } from "../schema/server-news";
 import { initializeServerGiftsSchemaSync } from "../schema/server-gifts";
 import { initializePlayerFollowsSchemaSync } from "../schema/player-follows";
 import { initializeAccountBindingSchemaSync } from "../schema/account-binding";
+import { initializeRankingRewardClaimsSchemaSync } from "../schema/ranking-reward-claims";
 import { pruneSpecialEventPartyGroupsSync } from "../../lib/party-group-persistence";
 import { getRealNow } from "../../runtime/time/game-time";
 
@@ -62,6 +64,7 @@ export default function init(
     initializeServerNewsSchemaSync(database)
     initializeServerGiftsSchemaSync(database)
     initializePlayerFollowsSchemaSync(database)
+    initializeRankingRewardClaimsSchemaSync(database)
 
     // create players table
     database.prepare(`CREATE TABLE IF NOT EXISTS accounts (
@@ -168,6 +171,7 @@ export default function init(
         max_combo_achieved INTEGER NOT NULL DEFAULT 0,
         total_login_days INTEGER NOT NULL DEFAULT 0,
         last_daily_challenge_real_business_day TEXT DEFAULT NULL,
+        last_daily_reset_real_business_day TEXT DEFAULT NULL,
         account_id INTEGER NOT NULL,
         tutorial_step INTEGER,
         tutorial_skip_flag INTEGER,
@@ -282,6 +286,7 @@ export default function init(
     // migration: add total_login_days for weekly mission tracking
     ensureSchemaColumn(database, "players.total_login_days")
     ensureSchemaColumn(database, "players.last_daily_challenge_real_business_day")
+    ensureSchemaColumn(database, "players.last_daily_reset_real_business_day")
 
     database.prepare(`CREATE TABLE IF NOT EXISTS players_party_member_co_clears (
         player_id INTEGER NOT NULL,
@@ -360,6 +365,20 @@ export default function init(
     ensureSchemaColumn(database, "players_mission_battle_counters.single_clear_time_min")
     ensureSchemaColumn(database, "players_mission_battle_counters.boss_battle_clear_count")
     ensureSchemaColumn(database, "players_mission_battle_counters.skill_use_count")
+
+    database.prepare(`CREATE TABLE IF NOT EXISTS players_mission_counters (
+        player_id INTEGER NOT NULL,
+        counter_key TEXT NOT NULL,
+        dimension TEXT NOT NULL,
+        scope_type TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        qualifier_json TEXT NOT NULL DEFAULT '{}',
+        value INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (player_id, counter_key),
+        FOREIGN KEY (player_id) REFERENCES players (id) ON DELETE CASCADE
+    )`).run()
+    database.prepare(`CREATE INDEX IF NOT EXISTS idx_players_mission_counters_dimension
+        ON players_mission_counters (player_id, dimension)`).run()
 
     database.prepare(`CREATE TABLE IF NOT EXISTS players_degree_battle_stats (
         player_id INTEGER PRIMARY KEY,
@@ -705,6 +724,7 @@ export default function init(
         best_elapsed_time_ms INTEGER,
         leader_character_id INTEGER,
         multi_clear_count INTEGER NOT NULL DEFAULT 0,
+        single_clear_count INTEGER NOT NULL DEFAULT 0,
         host_finished INTEGER,
         player_id INTEGER NOT NULL,
         PRIMARY KEY (section, quest_id, player_id),
@@ -810,6 +830,16 @@ export default function init(
     ensureSchemaColumn(database, "players_quest_progress.leader_character_id")
     ensureSchemaColumn(database, "players_quest_progress.multi_clear_count")
     ensureSchemaColumn(database, "players_quest_progress.unlocked")
+    // Recomputable single-clear archive (mission completion D-3): legacy
+    // archives and restores of saves taken before the column gain it at
+    // zero; a finished row proves at least one clear, so the backfill pins
+    // the safe lower bound. Idempotent by the zero guard.
+    ensureSchemaColumn(database, "players_quest_progress.single_clear_count")
+    database.prepare(`
+        UPDATE players_quest_progress
+        SET single_clear_count = 1
+        WHERE finished = 1 AND single_clear_count = 0
+    `).run()
 
     ensureQuestHostFinishedStorageSync(database)
 
@@ -1018,6 +1048,17 @@ export default function init(
     )`).run()
 
     database.prepare(`CREATE TABLE IF NOT EXISTS players_event_mission_login_days (
+        player_id INTEGER NOT NULL,
+        mission_id INTEGER NOT NULL,
+        last_counted_day INTEGER NOT NULL,
+        PRIMARY KEY (player_id, mission_id),
+        FOREIGN KEY (player_id) REFERENCES players (id) ON DELETE CASCADE
+    )`).run()
+
+    // Collect-table login dedup lives in its own table: collect and event
+    // mission id spaces overlap (both carry e.g. id 1660), so the event
+    // table's (player_id, mission_id) key cannot host both categories.
+    database.prepare(`CREATE TABLE IF NOT EXISTS players_collect_mission_login_days (
         player_id INTEGER NOT NULL,
         mission_id INTEGER NOT NULL,
         last_counted_day INTEGER NOT NULL,
@@ -1270,6 +1311,8 @@ export default function init(
         event_id INTEGER,
         rescue_fragment_eligible INTEGER NOT NULL DEFAULT 0
             CHECK (rescue_fragment_eligible IN (0, 1)),
+        newbie_rescue_eligible INTEGER NOT NULL DEFAULT 0
+            CHECK (newbie_rescue_eligible IN (0, 1)),
         continue_count INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (player_id) REFERENCES players (id) ON DELETE CASCADE
     )`).run()
@@ -1278,4 +1321,5 @@ export default function init(
     ensureActiveQuestCoordinatorOriginStorageSync(database)
     ensureActiveQuestResourceCostStorageSync(database)
     ensureActiveQuestRescueFragmentEligibilityStorageSync(database)
+    ensureActiveQuestNewbieRescueEligibilityStorageSync(database)
 }

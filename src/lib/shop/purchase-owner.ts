@@ -4,12 +4,16 @@ import {
     getPlayerShopPurchaseCountsByTypeBulkSync,
 } from "../../data/domains/shopPurchase"
 import { incrementActiveMissionUsedManaCountSync } from "../../data/domains/active_mission_counters"
+import { recordCollectMissionManaSpend } from "../mission/collect-battle-facts"
+import { getServerTime } from "../../utils"
 import { publishActiveMissionOwnerStateWithinTransaction } from "../mission/active-publication-owner"
 import { getPlayerSync } from "../../data/domains/player"
 import { getDb } from "../../data/db"
 import { deepFreeze } from "../../content/deep-freeze"
 import { withDeferredInventoryBatchContextWithinTransactionSync } from "../inventory"
 import { settleMissionOperationFactsSync } from "../mission/operation-fact-settlement"
+import { settleMissionCategories } from "../mission/settlement"
+import { getDegreeMissionIdsForConditionTypes } from "../mission/degree-candidates"
 import { grantShopRewardsTypedInTransactionOwnerWithInventorySync } from "../shop-reward-grant"
 import { ShopType } from "../types/shop"
 import {
@@ -185,8 +189,10 @@ export function executeShopPurchaseSync(
             })
 
             let missionSettlement = null
+            let purchaseCountSettlement = null
             if (plan.manaSpent > 0) {
                 incrementActiveMissionUsedManaCountSync(input.playerId, plan.manaSpent)
+                recordCollectMissionManaSpend(input.playerId, plan.manaSpent, new Date(getServerTime() * 1000))
                 if (input.shopType === ShopType.TREASURE) {
                     missionSettlement = settleMissionOperationFactsSync(
                         input.playerId,
@@ -194,12 +200,24 @@ export function executeShopPurchaseSync(
                         plan.manaSpent,
                         virtualNow,
                     )
+                    // 宝石店购买次数是购买计数称号(cat5 condition 45)的事实时点,
+                    // 该族不在战斗 finish 白名单,与消耗任务同事务当场结算。
+                    // best-effort:极简测试 DB 缺 mission 表时不阻塞购买
+                    try {
+                        purchaseCountSettlement = settleMissionCategories(
+                            input.playerId,
+                            [{ category: 5, missionIds: getDegreeMissionIdsForConditionTypes([45]) }],
+                            virtualNow,
+                        )
+                    } catch {
+                        console.warn("[MISSION] purchase count settlement degraded (best-effort)")
+                    }
                     if (missionSettlement !== null) {
                         Object.assign(itemList, missionSettlement.itemList)
                     }
                 }
             }
-            const missionUser = missionSettlement?.userInfo
+            const missionUser = missionSettlement?.userInfo ?? purchaseCountSettlement?.userInfo
             const activeMission = publishActiveMissionOwnerStateWithinTransaction({
                 playerId: input.playerId,
                 now: virtualNow,
@@ -208,6 +226,7 @@ export function executeShopPurchaseSync(
             return deepFreeze({
                 playerId: input.playerId,
                 shopType: input.shopType,
+                purchaseCountSettlement,
                 playerAfter: {
                     ...plan.playerAfterPayment,
                     freeMana: reward.execution.playerAfter.freeMana,

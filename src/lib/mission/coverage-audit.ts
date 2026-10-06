@@ -6,6 +6,7 @@ import { getProducerBackedEventEntryMissionIds } from "./event-entry-facts"
 import { getAwakeMissionRuleFamilies } from "./awake-rule-catalog"
 import type { AwakeMissionRuleFamilyName } from "./awake-rule-catalog"
 import { MissionMasterDefinition, getMissionCatalog } from "./mission-catalog"
+import { getMissionRequirementDraft } from "./requirements/providers"
 
 export interface MissionCoverageEntry {
     readonly category: number
@@ -27,9 +28,11 @@ export interface MissionCoveragePartition {
 }
 
 export interface MissionCoverageAudit {
-    readonly schemaVersion: 1
+    readonly schemaVersion: 2
     readonly regular: MissionCoveragePartition
+    readonly daily: MissionCoveragePartition
     readonly event: MissionCoveragePartition
+    readonly collect: MissionCoveragePartition
     readonly degree: MissionCoveragePartition
     readonly awake: {
         readonly total: number
@@ -45,6 +48,7 @@ export interface MissionCoverageAudit {
         readonly unresolvedMissionIds: readonly number[]
     }
     readonly pass: MissionCoveragePartition
+    readonly weekly: MissionCoveragePartition
 }
 
 function eventFallbackReason(row: readonly unknown[]): string {
@@ -59,18 +63,8 @@ function eventFallbackReason(row: readonly unknown[]): string {
     return `authoritative-event-fact-unavailable:type-${Number.isSafeInteger(patternType) ? patternType : "unknown"}`
 }
 
-const DEFERRED_DEGREE_REASON_BY_MISSION_ID: ReadonlyMap<number, string> = new Map([
-    [25000, "attention-source-unavailable"],
-    [25010, "attention-source-unavailable"],
-    [25020, "attention-source-unavailable"],
-    [70004, "newbie-classification-unavailable"],
-    [70005, "newbie-classification-unavailable"],
-    [70006, "newbie-classification-unavailable"],
-])
-
 function degreeFallbackReason(missionId: number): string {
-    return DEFERRED_DEGREE_REASON_BY_MISSION_ID.get(missionId)
-        ?? "authoritative-degree-fact-unavailable"
+    return "authoritative-degree-fact-unavailable"
 }
 
 const REGULAR_FALLBACK_REASON_BY_MISSION_ID: ReadonlyMap<number, string> = new Map([
@@ -82,13 +76,58 @@ const REGULAR_FALLBACK_REASON_BY_MISSION_ID: ReadonlyMap<number, string> = new M
     [89, "rescue-source-unavailable"],
     [100, "rescue-source-unavailable"],
     [107, "external-social-check-not-supported"],
-    [108, "anniversary-window-semantics-unverified"],
 ])
 
+function dailyFallbackReason(definition: MissionMasterDefinition): string {
+    const patternType = Number(definition.row[2])
+    if (patternType === 20) return "rescue-source-unavailable"
+    return `authoritative-daily-fact-unavailable:type-${Number.isSafeInteger(patternType) ? patternType : "unknown"}`
+}
+
+function collectFallbackReason(definition: MissionMasterDefinition): string {
+    const draft = getMissionRequirementDraft(definition, getMissionCatalog())
+    if (draft.mode === "unsupported" && draft.reason !== undefined
+        && draft.reason !== "Collect mission shape has no authoritative fact source.") {
+        return draft.reason
+    }
+    const patternType = Number(definition.row[4])
+    return `authoritative-collect-fact-unavailable:type-${Number.isSafeInteger(patternType) ? patternType : "unknown"}`
+}
+
+/**
+ * Daily, collect, and weekly partitions are derived from the requirement
+ * provider itself: a mission is automated when the provider routes it to a
+ * computed mapping or an atomic producer, and fallback otherwise. The
+ * provider is the single authority for these categories' wiring, so the
+ * partition can never drift from the actual settlement routing.
+ */
+function requirementBackedPartition(
+    category: number,
+    reason: (definition: MissionMasterDefinition) => string,
+): MissionCoveragePartition {
+    const catalog = getMissionCatalog()
+    const definitions = catalog.getDefinitions(category)
+    const automated = new Set<string>()
+    for (const definition of definitions) {
+        if (getMissionRequirementDraft(definition, catalog).mode !== "unsupported") {
+            automated.add(`${category}:${definition.missionId}`)
+        }
+    }
+    return createPartition([{ category, definitions }], automated, (_category, definition) => (
+        reason(definition)
+    ))
+}
+
 function regularPartition(): MissionCoveragePartition {
+    // 62/63/64/87/88/89（patternType 20 救援通关）由多人 finish 的救援计数
+    // 生产者直接递增（见 rescue-battle-counters），属生产者支持而非 regular
+    // computer 的 computed 集。
+    const producerBacked = missionKeys(1, [62, 63, 64, 87, 88, 89, 100])
+    const automated = missionKeys(1, getRegularComputedMissionIds())
+    for (const key of producerBacked) automated.add(key)
     return createPartition(
         [{ category: 1, definitions: getMissionCatalog().getDefinitions(1) }],
-        missionKeys(1, getRegularComputedMissionIds()),
+        automated,
         (_category, definition) => REGULAR_FALLBACK_REASON_BY_MISSION_ID.get(definition.missionId)
             ?? "authoritative-regular-fact-unavailable",
     )
@@ -160,18 +199,20 @@ function degreePartition(): MissionCoveragePartition {
 }
 
 function passPartition(): MissionCoveragePartition {
+    // Provider-backed, same as the daily/collect/weekly partitions: the
+    // requirement provider is the single routing authority for the pass
+    // categories, so the partition cannot drift from settlement routing.
+    const catalog = getMissionCatalog()
     const definitions = [6, 7, 8].map(category => ({
         category,
-        definitions: getMissionCatalog().getDefinitions(category),
+        definitions: catalog.getDefinitions(category),
     }))
     const automated = new Set<string>()
     for (const { category, definitions: entries } of definitions) {
         for (const definition of entries) {
-            const type = definition.patternType
-            const supported = category === 6 && [14, 16, 28, 39].includes(type ?? -1)
-                || category === 7 && [16, 39, 85].includes(type ?? -1)
-                || category === 8 && [0, 16, 23].includes(type ?? -1)
-            if (supported) automated.add(`${category}:${definition.missionId}`)
+            if (getMissionRequirementDraft(definition, catalog).mode !== "unsupported") {
+                automated.add(`${category}:${definition.missionId}`)
+            }
         }
     }
     return createPartition(definitions, automated, (_category, definition) => (
@@ -210,11 +251,17 @@ function awakeCoverage(): MissionCoverageAudit["awake"] {
 
 export function getMissionCoverageAudit(): MissionCoverageAudit {
     return Object.freeze({
-        schemaVersion: 1,
+        schemaVersion: 2,
         regular: regularPartition(),
+        daily: requirementBackedPartition(2, dailyFallbackReason),
         event: eventPartition(),
+        collect: requirementBackedPartition(4, collectFallbackReason),
         degree: degreePartition(),
         awake: awakeCoverage(),
         pass: passPartition(),
+        weekly: requirementBackedPartition(
+            10,
+            () => "authoritative-weekly-fact-unavailable",
+        ),
     })
 }

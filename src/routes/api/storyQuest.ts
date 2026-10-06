@@ -20,7 +20,8 @@ import {
 } from "../../lib/common-response/entities";
 import { mergeCommonResponseFragments } from "../../lib/common-response/merge";
 import type { CommonResponseFragment } from "../../lib/common-response/model";
-import { settleCharacterStoryFactMissions } from "../../lib/mission/story-fact-settlement";
+import { settleCharacterStoryFactMissions, settleMainStoryFactMissions } from "../../lib/mission/story-fact-settlement";
+import { isQuestOutOfPeriodAt, QUEST_OUT_OF_PERIOD_RESULT_CODE } from "../../lib/quest/open-period";
 import { publishCharacterGrowthOwnerStateBestEffort } from "../../lib/character-growth/owner-publication";
 import { getQuestJoinCharacterIds } from "../../lib/story-join-character";
 import { generateDataHeaders, getServerTime } from "../../utils";
@@ -45,7 +46,31 @@ interface FinishWithSkipBody {
 }
 
 function isStoryFinishCategory(category: number): boolean {
-    return category === QuestCategory.MAIN || category === QuestCategory.CHARACTER
+    return category === QuestCategory.MAIN
+        || category === QuestCategory.CHARACTER
+        || category === QuestCategory.ADVENT_EVENT_SINGLE
+        || category === QuestCategory.STORY_EVENT_SINGLE
+        || category === QuestCategory.WORLD_STORY_EVENT
+}
+
+type StoryFinishResult =
+    | { ok: true, data: Record<string, unknown> }
+    | { ok: false, reason: "unsupported-category" | "quest-not-found" | "battle-quest" | "out-of-period" }
+
+type StoryFinishFailureReason = Exclude<StoryFinishResult, { ok: true }>["reason"]
+
+const storyFinishFailureMessages: Record<StoryFinishFailureReason, string> = {
+    "unsupported-category": "Unsupported story quest category.",
+    "quest-not-found": "Story quest not found.",
+    "battle-quest": "Battle quest cannot be finished through story endpoint.",
+    "out-of-period": "Story quest is out of its open period.",
+}
+
+function storyFinishFailureBody(reason: StoryFinishFailureReason): { error: string, message: string } {
+    return {
+        "error": "Bad Request",
+        "message": storyFinishFailureMessages[reason],
+    }
 }
 
 function processStoryQuestFinish(
@@ -53,22 +78,29 @@ function processStoryQuestFinish(
     viewerId: number,
     questSection: number,
     questId: number,
-) {
+): StoryFinishResult {
     if (!isStoryFinishCategory(questSection)) {
-        console.log(`[STORY] category is not supported by story finish: category=${questSection}`)
-        return null
+        console.log(`[STORY] category is not supported by story finish: category=${questSection} questId=${questId}`)
+        return { ok: false, reason: "unsupported-category" }
     }
     const questData = getQuestFromCategorySync(questSection, questId)
     if (questData === null) {
         console.log(`[STORY] quest not found: category=${questSection} questId=${questId}`)
-        return null
+        return { ok: false, reason: "quest-not-found" }
     }
     if (questData.sPlusReward !== undefined) {
         console.log(`[STORY] battle quest rejected: category=${questSection} questId=${questId}`)
-        return null
+        return { ok: false, reason: "battle-quest" }
+    }
+    // The CN 1.8.1 client maps result code 4050 on story finish to a
+    // dedicated OutOfPeriodError that backs out of the quest; quests whose
+    // window columns are absent stay open, matching the battle-start gates.
+    if (isQuestOutOfPeriodAt(questData, getServerTime() * 1000)) {
+        console.log(`[STORY] finish out of period: category=${questSection} questId=${questId}`)
+        return { ok: false, reason: "out-of-period" }
     }
 
-    return getDb().transaction(() => {
+    const transactionResult = getDb().transaction(() => {
         const playerBefore = getPlayerSync(playerId)
         if (playerBefore === null) return null
 
@@ -112,9 +144,12 @@ function processStoryQuestFinish(
         }
 
         const evaluationTime = new Date(getServerTime() * 1000)
-        const missionSettlement = firstClear && questSection === QuestCategory.CHARACTER
-            ? settleCharacterStoryFactMissions(playerId, evaluationTime)
-            : null
+        const missionSettlement = !firstClear ? null
+            : questSection === QuestCategory.CHARACTER
+                ? settleCharacterStoryFactMissions(playerId, evaluationTime)
+                : questSection === QuestCategory.MAIN
+                    ? settleMainStoryFactMissions(playerId, evaluationTime)
+                    : null
         const playerAfter = getPlayerSync(playerId)
         if (playerAfter === null) throw new Error(`Player ${playerId} disappeared during story settlement.`)
         const existingCharacterList = [
@@ -176,6 +211,29 @@ function processStoryQuestFinish(
         }
         return responseData
     })()
+    if (transactionResult === null) {
+        console.log(`[STORY] story finish transaction returned null: category=${questSection} questId=${questId}`)
+        return { ok: false, reason: "quest-not-found" }
+    }
+    return { ok: true, data: transactionResult }
+}
+
+function sendStoryFinishFailure(
+    reply: FastifyReply,
+    viewerId: number,
+    result: Extract<StoryFinishResult, { ok: false }>,
+) {
+    if (result.reason === "out-of-period") {
+        reply.header("content-type", "application/x-msgpack")
+        return reply.status(200).send({
+            "data_headers": generateDataHeaders({
+                viewer_id: viewerId,
+                result_code: QUEST_OUT_OF_PERIOD_RESULT_CODE,
+            }),
+            "data": {},
+        })
+    }
+    return reply.status(400).send(storyFinishFailureBody(result.reason))
 }
 
 const routes = async (fastify: FastifyInstance) => {
@@ -201,15 +259,12 @@ const routes = async (fastify: FastifyInstance) => {
         })
 
         const result = processStoryQuestFinish(playerId, viewerId, body.category, body.quest_id)
-        if (result === null) return reply.status(400).send({
-            "error": "Bad Request",
-            "message": "Invalid quest ID provided."
-        })
+        if (!result.ok) return sendStoryFinishFailure(reply, viewerId, result)
 
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send({
             "data_headers": generateDataHeaders({ viewer_id: viewerId }),
-            "data": result
+            "data": result.data
         })
     })
 
@@ -236,15 +291,12 @@ const routes = async (fastify: FastifyInstance) => {
         })
 
         const result = processStoryQuestFinish(playerId, viewerId, body.category, body.quest_id)
-        if (result === null) return reply.status(400).send({
-            "error": "Bad Request",
-            "message": "Invalid quest ID provided."
-        })
+        if (!result.ok) return sendStoryFinishFailure(reply, viewerId, result)
 
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send({
             "data_headers": generateDataHeaders({ viewer_id: viewerId }),
-            "data": result
+            "data": result.data
         })
     })
 }

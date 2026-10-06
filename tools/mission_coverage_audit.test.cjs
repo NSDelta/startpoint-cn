@@ -27,22 +27,16 @@ function assertPartition(section) {
 
 test("mission coverage audit reproduces current authoritative partitions", () => {
     const report = getMissionCoverageAudit()
-    assert.equal(report.schemaVersion, 1)
+    assert.equal(report.schemaVersion, 2)
 
     assertPartition(report.regular)
     assert.deepEqual(
         { total: report.regular.total, automated: report.regular.automated, fallback: report.regular.fallback },
-        { total: 120, automated: 112, fallback: 8 },
+        { total: 120, automated: 118, fallback: 2 },
     )
     assert.deepEqual(
         report.regular.fallbackMissions.map(entry => [entry.missionId, entry.reason]),
         [
-            [62, "rescue-source-unavailable"],
-            [63, "rescue-source-unavailable"],
-            [64, "rescue-source-unavailable"],
-            [87, "rescue-source-unavailable"],
-            [88, "rescue-source-unavailable"],
-            [89, "rescue-source-unavailable"],
             [100, "rescue-source-unavailable"],
             [107, "external-social-check-not-supported"],
         ],
@@ -115,7 +109,7 @@ test("mission coverage audit reproduces current authoritative partitions", () =>
     assertPartition(report.degree)
     assert.deepEqual(
         { total: report.degree.total, automated: report.degree.automated, fallback: report.degree.fallback },
-        { total: 1288, automated: 1282, fallback: 6 },
+        { total: 1288, automated: 1288, fallback: 0 },
     )
     assert.deepEqual(
         report.degree.automatedMissions
@@ -132,30 +126,6 @@ test("mission coverage audit reproduces current authoritative partitions", () =>
         "四条 Degree 客户端进度必须全部进入权威自动覆盖",
     )
     assert.equal(report.degree.fallbackMissions.some(entry => [3000, 3010, 3020].includes(entry.missionId)), false)
-    assert.deepEqual(
-        report.degree.fallbackMissions.reduce((counts, entry) => {
-            counts[entry.reason] = (counts[entry.reason] ?? 0) + 1
-            return counts
-        }, {}),
-        {
-            "attention-source-unavailable": 3,
-            "newbie-classification-unavailable": 3,
-        },
-        "称号 fallback 必须按真实外部阻塞原因分类",
-    )
-    assert.deepEqual(
-        report.degree.fallbackMissions.map(entry => [entry.missionId, entry.reason]),
-        [
-            [25000, "attention-source-unavailable"],
-            [25010, "attention-source-unavailable"],
-            [25020, "attention-source-unavailable"],
-            [70004, "newbie-classification-unavailable"],
-            [70005, "newbie-classification-unavailable"],
-            [70006, "newbie-classification-unavailable"],
-        ],
-        "6 条延期称号必须按精确 ID 固定，不能因文案相似被误归类",
-    )
-
     assert.equal(report.awake.total, 144)
     assert.equal(report.awake.routed, 144)
     assert.equal(report.awake.resolved, 144)
@@ -187,11 +157,66 @@ test("mission coverage audit reproduces current authoritative partitions", () =>
         }, {}),
         { "rescue-source-unavailable": 19 },
     )
+
+    assertPartition(report.daily)
+    assert.deepEqual(
+        { total: report.daily.total, automated: report.daily.automated, fallback: report.daily.fallback },
+        { total: 656, automated: 651, fallback: 5 },
+    )
+    assert.deepEqual(
+        report.daily.automatedMissions
+            .filter(entry => [
+                2, 7, 12, 10075, 800115, 800116, 800117, 800124, 800125, 800126, 800392,
+            ].includes(entry.missionId))
+            .map(entry => entry.missionId),
+            [2, 7, 12, 10075, 800115, 800116, 800117, 800124, 800125, 800126, 800392],
+        "每日战斗生产者名单与 all-clear 依赖批次必须全部进入自动覆盖",
+    )
+    assert.deepEqual(
+        report.daily.fallbackMissions.reduce((counts, entry) => {
+            counts[entry.reason] = (counts[entry.reason] ?? 0) + 1
+            return counts
+        }, {}),
+        {
+            "rescue-source-unavailable": 5,
+        },
+    )
+
+    assertPartition(report.collect)
+    assert.equal(
+        report.collect.automatedMissions.filter(entry => entry.missionId === 1660).length,
+        1,
+        "收集表全清依赖任务(如 1660)必须进入依赖结算覆盖",
+    )
+    assert.deepEqual(
+        report.collect.fallbackMissions.map(entry => [entry.missionId, entry.reason]),
+        [],
+        "收集表 2089(窗口登录日,1225 机制按事件泛化)与 10166(个人资料查看,get_my_profile 事实)补全后零回落",
+    )
+    assert.deepEqual(
+        { total: report.collect.total, automated: report.collect.automated, fallback: report.collect.fallback },
+        { total: 997, automated: 997, fallback: 0 },
+    )
+
+
+    assertPartition(report.weekly)
+    assert.deepEqual(
+        { total: report.weekly.total, automated: report.weekly.automated, fallback: report.weekly.fallback },
+        { total: 2, automated: 2, fallback: 0 },
+    )
 })
 
 test("mission coverage audit leaves no ID in both sides of a partition", () => {
     const report = getMissionCoverageAudit()
-    for (const section of [report.regular, report.event, report.degree, report.pass]) {
+    for (const section of [
+        report.regular,
+        report.daily,
+        report.event,
+        report.collect,
+        report.degree,
+        report.pass,
+        report.weekly,
+    ]) {
         const automated = new Set(section.automatedMissions.map(entry => (
             `${entry.category}:${entry.missionId}`
         )))

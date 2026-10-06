@@ -1,9 +1,12 @@
 import { deepFreeze } from "../../content/deep-freeze"
+import { incrementActiveMissionGachaCharacterCountSync } from "../../data/domains/active_mission_counters"
+import { recordDailyGachaDrawFacts } from "../mission/gacha-draw-facts"
 import { getDb } from "../../data/db"
 import { getPlayerGachaInfoSync, updatePlayerGachaInfoSync } from "../../data/domains/gacha"
 import { insertReceiveHistoryBatchSync, MailType } from "../../data/domains/mail"
 import { getPlayerSync } from "../../data/domains/player"
 import { getMailArrivedSync } from "../mail-notification"
+import { publishActiveMissionOwnerStateWithinTransaction } from "../mission/active-publication-owner"
 import { withDeferredInventoryBatchContextWithinTransactionSync } from "../inventory"
 import { createRewardGrantExecutionPlan } from "../reward-grant"
 import { RewardType } from "../types/rewards"
@@ -146,11 +149,18 @@ export function executeGachaExchangeSync(
             type_id: command.targetId,
             number: 1,
         }])
+        const activeMission = publishActiveMissionOwnerStateWithinTransaction({
+            playerId: command.playerId,
+            now: new Date(command.nowMs),
+            source: "gacha/exchange_character",
+        })
         const rewardItems: Record<number, number> = {}
         const postCommitEffects: GachaPostCommitEffect[] = []
         let characters: Readonly<Record<string, unknown>>[] = []
         let equipment: Readonly<Record<string, unknown>>[] = []
         if (outcome.kind === "character") {
+            incrementActiveMissionGachaCharacterCountSync(command.playerId, 1)
+            recordDailyGachaDrawFacts(command.playerId, 1, new Date(command.nowMs))
             characters = records([outcome.after], "Character")
             if (outcome.compensationItem !== null) {
                 rewardItems[outcome.compensationItem.itemId] = outcome.compensationItem.afterAmount
@@ -180,6 +190,8 @@ export function executeGachaExchangeSync(
                 : { playerAfter: grant.playerAfter }),
             itemOverflowDispositions: collectRewardGrantItemOverflowDispositions(grant),
             postCommitEffects,
+            missionSettlement: grant.missionSettlement ?? null,
+            activeMissionList: activeMission.activeMissionList,
         }
         return command.kind === "character"
             ? deepFreeze({ ...common, kind: "character" as const, characters })

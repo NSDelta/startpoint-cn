@@ -10,9 +10,11 @@ import newsApiPlugin from "./news"
 import giftApiPlugin from "./gift"
 import bindingApiPlugin from "./binding"
 import botApiPlugin from "./bot"
+import contentApiPlugin from "./content"
 import { ADMIN_UPLOAD_FILE_SIZE_LIMIT } from "./upload-limits"
 import type { ServerRoutesOptions } from "./server"
 import type { MultiManagementRoutesOptions } from "./multi-management"
+import type { ContentRoutesOptions } from "./content"
 
 export { ADMIN_UPLOAD_FILE_SIZE_LIMIT } from "./upload-limits"
 
@@ -23,6 +25,7 @@ export interface WebApiRoutesOptions extends ServerRoutesOptions {
      * following the CC-4 injectable-env rule. Defaults to `process.env`.
      */
     readonly botApiEnv?: NodeJS.ProcessEnv
+    readonly getAvatarCdnRoot?: ContentRoutesOptions["getCdnRoot"]
 }
 
 const routes = async (fastify: FastifyInstance, options: WebApiRoutesOptions) => {
@@ -53,6 +56,10 @@ const routes = async (fastify: FastifyInstance, options: WebApiRoutesOptions) =>
     fastify.register(botApiPlugin, { prefix: "/bot", env: options.botApiEnv })
     fastify.register(scheduledResourceApiPlugin, { prefix: "/scheduled-resource" })
     fastify.register(lookupApiPlugin, { prefix: "/lookup" })
+    fastify.register(contentApiPlugin, {
+        prefix: "/content",
+        getCdnRoot: options.getAvatarCdnRoot,
+    })
     fastify.register(settingsApiPlugin, { prefix: "/server/settings" })
     fastify.register(multiManagementApiPlugin, {
         prefix: "/server/multiplayer",

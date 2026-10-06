@@ -470,6 +470,7 @@ test("default release builder closes all registry tables and runs each CDN conve
         characterManaAdmission: 0,
         gacha: 0,
         gameplay: 0,
+        eventFamily: 0,
         itemEquipment: 0,
         loginBonus: 0,
         manaNode: 0,
@@ -515,6 +516,10 @@ test("default release builder closes all registry tables and runs each CDN conve
         convertGameplayTables: async () => {
             converterCalls.gameplay++
             return converterOutput("gameplay")
+        },
+        convertEventFamilies: async () => {
+            converterCalls.eventFamily++
+            return converterOutput("event-family")
         },
         convertItemEquipmentTables: async () => {
             converterCalls.itemEquipment++
@@ -573,6 +578,7 @@ test("default release builder closes all registry tables and runs each CDN conve
         characterManaAdmission: 1,
         gacha: 1,
         gameplay: 1,
+        eventFamily: 1,
         itemEquipment: 1,
         loginBonus: 1,
         manaNode: 1,
@@ -669,6 +675,7 @@ test("default release builder rejects an incomplete converter output", async () 
         convertCharacterManaAdmissionTables: async () => converterOutput("character-mana-admission"),
         convertGachas: async () => converterOutput("gacha"),
         convertGameplayTables: async () => converterOutput("gameplay"),
+        convertEventFamilies: async () => converterOutput("event-family"),
         convertItemEquipmentTables: async () => converterOutput("item-equipment"),
         convertLoginBonuses: async () => converterOutput("login-bonus"),
         convertManaNodes: async () => converterOutput("mana-node"),
@@ -749,6 +756,7 @@ test("default release builder bounds parallel reads and imports while preserving
         convertCharacterManaAdmissionTables: async () => converterOutput("character-mana-admission"),
         convertGachas: async () => converterOutput("gacha"),
         convertGameplayTables: async () => converterOutput("gameplay"),
+        convertEventFamilies: async () => converterOutput("event-family"),
         convertItemEquipmentTables: async () => converterOutput("item-equipment"),
         convertLoginBonuses: async () => converterOutput("login-bonus"),
         convertManaNodes: async () => converterOutput("mana-node"),

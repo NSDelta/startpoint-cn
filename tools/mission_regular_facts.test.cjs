@@ -135,6 +135,7 @@ for (let index = 0; index < 14; index++) {
     })
 }
 
+// cond14 = 单人通关计数:摇曳的迷宫计数器只收单人通关,多人通关不入计数
 assert.deepEqual(getMissionBattleCountersSync(playerId), {
     singlePlayCount: 4,
     singleClearCount: 3,
@@ -147,7 +148,7 @@ assert.deepEqual(getMissionBattleCountersSync(playerId), {
     rankSCount: 2,
     rankACount: 0,
     rankBCount: 0,
-    challengeDungeonClearCount: 18,
+    challengeDungeonClearCount: 3,
     singleScoreMax: 0,
     singleClearTimeMin: 0,
     bossBattleClearCount: 0,
@@ -166,8 +167,46 @@ assert.throws(() => {
 }, /rollback challenge dungeon fact/)
 assert.equal(
     getMissionBattleCountersSync(playerId).challengeDungeonClearCount,
-    18,
+    3,
     "结算事务回滚后不得留下挑战副本累计次数",
+)
+
+// 通关摇曳的迷宫口径 = 四类日常地下城联合(range kind 12):培育道具(6)/
+// 经验玛纳(14)/深层域+宝物域(13)/层叠迷宫(20);无关类别与世界剧情BOSS(19)不入计数。
+const unionAccountId = insertAccountSync({
+    appId: "wf_cn",
+    idpAlias: "",
+    idpCode: "test",
+    idpId: `mission-regular-facts-union-${randomUUID()}`,
+    status: "normal",
+})
+const unionPlayerId = insertDefaultPlayerSync(unionAccountId.id).id
+for (const questCategory of [13, 6, 14, 20]) {
+    recordMissionBattleResultSync(unionPlayerId, {
+        isMulti: false,
+        questCategory,
+        accomplished: true,
+    })
+}
+recordMissionBattleResultSync(unionPlayerId, {
+    isMulti: false,
+    questCategory: 19,
+    accomplished: true,
+})
+recordMissionBattleResultSync(unionPlayerId, {
+    isMulti: false,
+    accomplished: true,
+})
+recordMissionBattleResultSync(unionPlayerId, {
+    isMulti: true,
+    questCategory: 6,
+    isHost: true,
+    accomplished: true,
+})
+assert.equal(
+    getMissionBattleCountersSync(unionPlayerId).challengeDungeonClearCount,
+    4,
+    "摇曳的迷宫计数必须覆盖培育道具/经验玛纳/深层域宝物域/层叠迷宫四类",
 )
 
 insertPlayerQuestProgressSync(playerId, 1, {
@@ -288,9 +327,20 @@ for (let index = 0; index < 2; index++) {
     })
 }
 
+// 首次标记写入只落标记不触发日切(新玩家/导入档/迁移同语义),再验边界精度
 assert.equal(
     dailyResetPlayerDataSync(
         getPlayerSync(boundaryPlayerId),
+        new Date("2024-08-18T12:00:00.000Z"),
+        new Date("2024-08-18T12:00:00.000Z"),
+    ),
+    false,
+    "首次标记写入不得触发日切",
+)
+assert.equal(
+    dailyResetPlayerDataSync(
+        getPlayerSync(boundaryPlayerId),
+        new Date("2024-08-18T20:59:59.999Z"),
         new Date("2024-08-18T20:59:59.999Z"),
     ),
     false,
@@ -300,6 +350,7 @@ assert.equal(getSnapshot(boundaryPlayerId, "weekly").multiClearCount, 0)
 assert.equal(
     dailyResetPlayerDataSync(
         getPlayerSync(boundaryPlayerId),
+        new Date("2024-08-18T21:00:00.000Z"),
         new Date("2024-08-18T21:00:00.000Z"),
     ),
     true,
@@ -320,6 +371,7 @@ assert.equal(
     dailyResetPlayerDataSync(
         getPlayerSync(boundaryPlayerId),
         new Date("2024-08-18T21:00:01.000Z"),
+        new Date("2024-08-18T21:00:01.000Z"),
     ),
     false,
     "同一周重复 load 不得再次重置",
@@ -338,7 +390,7 @@ recordMissionBattleResultSync(playerId, {
 })
 assert.equal(
     getMissionBattleCountersSync(playerId).challengeDungeonClearCount,
-    18,
+    3,
     "普通关卡成功不得污染挑战副本累计次数",
 )
 
@@ -612,10 +664,15 @@ const abilitySoulSettlement = settleAbilitySoulEquipFactsSync(
     evaluationTime,
 )
 assert.equal(abilitySoulSettlement.amount, 2, "新增和替换魂珠各计一次")
-assert.deepEqual(
-    abilitySoulSettlement.settlement?.missionInfo.map(entry => [entry.mission_category_id, entry.mission_id]),
-    [[1, 65]],
-    "魂珠装配达到条件时必须在本次操作中结算普通任务奖励",
+// 魂珠装配结算任务 65;其奖励(星导石)使 player 族任务(22/24/108)在
+// 级联轮当场达标——官方依次结算语义的正确输出
+const abilitySoulMissionIds = abilitySoulSettlement.settlement?.missionInfo
+    .map(entry => [entry.mission_category_id, entry.mission_id]) ?? []
+assert.deepEqual(abilitySoulMissionIds[0], [1, 65], "魂珠装配必须在本次操作中结算普通任务 65")
+assert.ok(
+    abilitySoulMissionIds.length > 1
+        && abilitySoulMissionIds.slice(1).every(([category]) => category === 1),
+    "奖励连锁轮必须当场结算 player 族任务",
 )
 const battleOperationProgress = getPlayerCategoryMissionsSync(playerId, 1)
 assert.equal(battleOperationProgress[4].progress, 100, "战斗获得玛纳按真实到账值累计")

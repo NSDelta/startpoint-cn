@@ -1,0 +1,254 @@
+/* mail page: type group + deep polish (审查稿 five-pages-review #p-mail) */
+.admin-mail-type-group {
+  display: grid;
+  /* min(120px, 100%) 防止单列下 radio 组溢出视口(360px 实测) */
+  grid-template-columns: repeat(auto-fit, minmax(min(120px, 100%), 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.admin-mail-type-group .admin-mail-type-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 38px;
+  height: auto;
+  padding: 6px 10px;
+  border-inline-start-width: 1px;
+  border-radius: 6px;
+  line-height: 1.25;
+  text-align: center;
+  white-space: normal;
+}
+
+.admin-mail-type-group .admin-mail-type-option::before {
+  display: none !important;
+}
+
+/* ── mail deep polish ───────────────────────────────────────────────────────
+   attachment summary chip: 所见即所发 — the same quiet chip voice as the
+   approved review mockup (star square + 类型·对象·数量). The two-column
+   mail grid is mobile-first: form above history on narrow screens, form
+   left / history right at ≥768px (审查稿 five-pages-review #p-mail). */
+.admin-attach-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.admin-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--th-bg);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+
+.admin-attach-chip-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--star);
+  opacity: .85;
+}
+
+.admin-attach-summary-hint {
+  font-size: 12px;
+}
+
+/* 维护者 2026-09-30: 群发记录不与发送表单并列, 保持上下结构 (仅保留纵向 stack) */
+.admin-mail-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.admin-mail-grid-col {
+  min-width: 0;
+}
+
+/* mail history expanded row: quiet snapshot panel + 复制重发 (prefill only,
+   never auto-send) */
+.admin-mail-history-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.admin-mail-history-detail .ant-descriptions {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.admin-mail-history-detail .ant-btn {
+  flex: none;
+}
+
+/* ── 发送卡精简重构: 行内标签 + 紧凑排布(维护者 2026-10-04 UX 稿) ── */
+.mail-inline-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.mail-inline-row .ant-form-item {
+  margin-bottom: 0;
+  min-width: 0;
+}
+
+.mail-inlbl {
+  flex: none;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.mail-cover-note {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--stat-bg);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.mail-send-preview {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--stat-bg);
+}
+
+/* ── 发送卡 v2 调整(维护者 2026-10-05): 目标分段居中、数量靠右、发送与预览同行 ── */
+.mail-target-center .ant-form-item-control-input-content {
+  display: flex;
+  justify-content: center;
+}
+
+@media (min-width: 768px) {
+  /* 桌面端居左(维护者 2026-10-05); 移动端保持居中 */
+  .mail-target-center .ant-form-item-control-input-content {
+    justify-content: flex-start;
+  }
+}
+
+.mail-send-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.mail-send-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.mail-send-preview::-webkit-scrollbar {
+  display: none;
+}
+
+.mail-send-preview .admin-attach-chip {
+  flex: none;
+}
+
+/* 移动优先: 标题+有效期窄屏整组折行(有效期对齐到下一行行首);
+   stretch 让标题输入框占满整行(维护者 2026-10-05: 不要缺口) */
+.mail-title-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.mail-title-row .mail-inlbl {
+  flex: none;
+}
+
+/* 附件类型桌面端一行最多 4 项(8 类折两行) */
+@media (min-width: 768px) {
+  .admin-mail-type-group {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .mail-title-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .mail-title-row .mail-inlbl {
+    flex: none;
+  }
+}
+
+/* ── 发送卡 v3 调整(维护者 2026-10-05): 附件搜索常显(无需对象置灰),
+   数量窄屏折到搜索下一行居右, 标题占满一行, 有效期行居右 ── */
+.mail-attach-row {
+  flex-wrap: wrap;
+}
+
+.mail-quantity-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 数量组靠右: 桌面在搜索框右侧, 移动端折行后同样居右(维护者指定) */
+  margin-left: auto;
+}
+
+@media (min-width: 768px) {
+  .mail-quantity-group {
+    margin-left: auto;
+  }
+}
+
+.mail-expiry-row {
+  justify-content: flex-end;
+}
+
+/* 发送行内: 有效期紧凑组(标签+数字框)。
+   移动端独占一整行、内容居右 = 正文下方/发送按钮上方; flex-basis 100% 是确定性
+   换行, 不随内容宽度变化——预览区(唯一可收缩元素)不再被固定宽的有效期+发送钮
+   挤压成竖条。768px+ 恢复行内 预览|有效期|发送(2026-10-05 五轮跷跷板修复) */
+.mail-send-expiry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 100%;
+  justify-content: flex-end;
+  order: -1;
+}
+
+@media (min-width: 768px) {
+  .mail-send-expiry {
+    flex: 0 0 auto;
+    justify-content: flex-start;
+    margin-left: 12px;
+    order: 0;
+  }
+}
+
+/* 数量/有效期: 标签+输入框打包为不可拆整体(窄屏折行不拆散, 维护者 2026-10-05) */
+.mail-fixed-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}

@@ -7,12 +7,10 @@ import {
     Clock3,
     Mail as MailIcon,
     Menu as MenuIcon,
-    Moon,
     Megaphone,
     Gift,
     Settings2,
     Sparkles,
-    Sun,
     Users,
 } from "lucide-react"
 import { Routes, Route, useNavigate, useLocation, Navigate } from "react-router-dom"
@@ -27,6 +25,7 @@ import Seeds from "./pages/Seeds"
 import TimeControl from "./pages/TimeControl"
 import GameplaySettings from "./pages/GameplaySettings"
 import logoUrl from "./assets/logo.png"
+import { ThemeToggle } from "./theme"
 
 const { Sider, Content, Header } = Layout
 const { useBreakpoint } = Grid
@@ -55,12 +54,7 @@ const pageTitles: Record<string, string> = {
     "/settings": "游戏设置",
 }
 
-interface AppProps {
-    dark: boolean
-    onToggleDark: () => void
-}
-
-export default function App({ dark, onToggleDark }: AppProps) {
+export default function App() {
     const navigate = useNavigate()
     const location = useLocation()
     const screens = useBreakpoint()
@@ -114,13 +108,7 @@ export default function App({ dark, onToggleDark }: AppProps) {
                     )}
                     <span className="admin-topbar-title">{currentTitle}</span>
                     <Space>
-                        <Button
-                            type="text"
-                            icon={dark ? <Sun size={18} /> : <Moon size={18} />}
-                            onClick={onToggleDark}
-                            aria-label="切换明暗模式"
-                            title={dark ? "切换到浅色" : "切换到深色"}
-                        />
+                        <ThemeToggle />
                     </Space>
                 </Header>
                 <Content className="admin-content">
@@ -151,7 +139,7 @@ export default function App({ dark, onToggleDark }: AppProps) {
                             <span>Starpoint CN</span>
                         </Space>
                     )}
-                    styles={{ body: { padding: 0 }, header: { borderBottom: "1px solid var(--admin-border)" } }}
+                    styles={{ body: { padding: 0 }, header: { borderBottom: "1px solid var(--line-strong)" } }}
                 >
                     {menu}
                 </Drawer>

@@ -53,6 +53,7 @@ export const PLAYER_SAVE_TABLES: readonly PlayerSaveTableDefinition[] = [
     table("players_degrees", "missions", 5),
     table("players_periodic_snapshots", "missions", 3),
     table("players_event_mission_login_days", "missions", 8),
+    table("players_collect_mission_login_days", "missions", 28),
 
     table("players_box_gacha", "events"),
     table("players_box_gacha_drawn_rewards", "events"),
@@ -69,6 +70,7 @@ export const PLAYER_SAVE_TABLES: readonly PlayerSaveTableDefinition[] = [
     table("players_pass_cards", "events", 7),
     table("players_pass_card_rewards", "events", 7),
     table("players_login_bonus_progress", "events", 18),
+    table("players_ranking_reward_claims", "events", 29),
     table("players_score_attack_battle_history", "events", 11, ["id"]),
     table("players_practice_battle_history", "events", 13, ["id"]),
 

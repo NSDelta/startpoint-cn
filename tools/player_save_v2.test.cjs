@@ -553,7 +553,7 @@ test("v2 validation rejects future schemas and missing tables that existed in th
     const snapshot = exportPlayerSaveV2Sync(playerId)
 
     const future = cloneJson(snapshot)
-    future.producer.dbSchemaVersion = 29
+    future.producer.dbSchemaVersion = 30
     assert.throws(() => restorePlayerSaveV2Sync(future, playerId), /newer.*schema|future.*schema/i)
 
     const starsState = (gachaId = 80000) => ({
@@ -972,6 +972,7 @@ test("default save metadata reads player identity from v2 snapshots", () => {
     const snapshot = exportPlayerSaveV2Sync(playerId)
 
     saveDefaultSaveTemplate(snapshot)
+    const { getPlayerRankLevel } = require("../src/lib/player-rank-content")
     assert.deepEqual(getDefaultSaveMeta(), {
         exists: true,
         playerName: "v2-template",
@@ -979,6 +980,11 @@ test("default save metadata reads player identity from v2 snapshots", () => {
         sourcePlayerId: playerId,
         formatVersion: 2,
         legacyPartial: false,
+        stats: {
+            rank: getPlayerRankLevel(snapshot.domains.core.tables.players[0].rank_point),
+            characterCount: snapshot.domains.core.tables.players_characters.length,
+            equipmentCount: snapshot.domains.core.tables.players_equipment.length,
+        },
     })
     assert.equal(loadDefaultSaveTemplate().formatVersion, 2)
     assert.equal(clearDefaultSaveTemplate(), true)

@@ -11,6 +11,7 @@ import getDatabase, {
 } from "./data";
 import { ServerTimeService } from "./runtime/server-time/service";
 import { getContentSnapshot, initializeContentSnapshot } from "./content/runtime/content-snapshot";
+import { resolveCnCdnRoot } from "./content/paths";
 import { createContentLifecycleDependencies } from "./modes/cn-lifecycle";
 import { listLoadedModeIdentities } from "./modes/registry";
 import { configureSerializedAssetVersionProvider } from "./data/utils/serialized-asset-version";
@@ -44,6 +45,8 @@ import spAuthPlugin from "./routes/sp-auth";
 import seedsWebApiPlugin from "./routes/web_api/seeds";
 import { resolveBotApiToken } from "./routes/web_api/bot";
 import { getDefaultGachaSeedQuarantine } from "./lib/gacha-seed-quarantine";
+import { getMissionCatalog } from "./lib/mission/mission-catalog";
+import { assertMissionConditionRouting } from "./lib/mission/requirements/routing-validation";
 import reproduceApiPlugin from "./routes/api/reproduce";
 import tutorialApiPlugin from "./routes/api/tutorial";
 import gachaApiPlugin from "./routes/api/gacha";
@@ -316,6 +319,15 @@ fastify.register(indexWebApiPlugin, {
     getMultiManagementService: () => multiManagementService,
     getRuntimeConfig: () => startupRuntimeConfig,
     serverTimeService,
+    // Lazy: CDN_DIR may resolve to a directory that only exists under the
+    // local asset mode; avatar requests degrade to 404 when it is absent.
+    getAvatarCdnRoot: () => {
+        try {
+            return resolveCnCdnRoot(process.env.CDN_DIR ?? ".cdn", projectRoot);
+        } catch {
+            return null;
+        }
+    },
 });
 fastify.register(seedsWebApiPlugin, { prefix: "/api/seeds" });
 
@@ -455,6 +467,10 @@ runtimeCoordinator = createRuntimeCoordinator({
         }),
     }),
     readyHttp: async () => {
+        // Startup data-validity gate: content that moves an audited mission
+        // pattern off its condition-number capability must fail startup
+        // instead of silently re-routing settlement facts.
+        assertMissionConditionRouting(getMissionCatalog());
         await fastify.ready();
         accountCleanupService.start();
         receiveHistoryRetentionService.start();
