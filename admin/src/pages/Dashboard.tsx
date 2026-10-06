@@ -226,6 +226,16 @@ export default function Dashboard() {
             refreshing={accountsFetching || statusFetching}
         >
             <Space direction="vertical" size="large" className="admin-stack">
+                {/* 运维文案契约（tools/runtime_admin.test.cjs:210「operator copy and embedded
+                    docs describe one required built-in admin」）：必须出现「唯一内置管理后台」。
+                    上游 2026-10-05 重写本页时把这句删了（他们自己的测试仍在断言它），
+                    本 fork 保留 —— 基线以我方为准。 */}
+                <Alert
+                    type="info"
+                    showIcon
+                    message="唯一内置管理后台"
+                    description="此管理后台随服务端一同构建，用于统一查看运行状态并执行日常管理操作。"
+                />
                 <div className="admin-hero">
                     <div className="admin-hero-in">
                         <div className="admin-hero-clock">

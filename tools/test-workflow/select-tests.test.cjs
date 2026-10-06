@@ -1472,6 +1472,7 @@ test("registers focused runtime state and socket smoke groups", () => {
             "tools/runtime_pack.test.cjs",
             "tools/runtime_bundle_metadata.test.cjs",
             "tools/runtime_config.test.cjs",
+            "tools/log_level.test.cjs",
             "tools/ios_runtime_config.test.cjs",
             "tools/multi_hub_credentials.test.cjs",
             "tools/multi_hub_authentication.test.cjs",
@@ -2273,6 +2274,7 @@ test("splits isolated integration tests into focused domains", () => {
         "tools/single_finish_awake_reward_owner.test.cjs",
         "tools/single_finish_response_projector.test.cjs",
         "tools/single_finish_request_validation.test.cjs",
+        "tools/single_finish_stale_play.test.cjs",
         "tools/story_quest_finish.test.cjs",
         "tools/tutorial_update_step.test.cjs",
     ])
@@ -2284,6 +2286,7 @@ test("splits isolated integration tests into focused domains", () => {
         "tools/multi_response_projection.test.cjs",
         "tools/multi_settlement_active_mission.test.cjs",
         "tools/rescue_fragment_reward.test.cjs",
+        "tools/rescue_counters.test.cjs",
         "tools/special_quest_party.test.cjs",
     ])
 })

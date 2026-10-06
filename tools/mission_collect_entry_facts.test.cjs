@@ -16,7 +16,7 @@ const previousDatabaseDirectory = process.env.WDFP_DATABASE_DIR
 process.env.DATA_DIR = dataDirectory
 delete process.env.WDFP_DATABASE_DIR
 
-const { initializeDatabase } = require("../src/data")
+const { closeDatabase, initializeDatabase } = require("../src/data")
 const { getDb } = require("../src/data/db")
 const { insertAccountSync } = require("../src/data/domains/account")
 const { insertDefaultPlayerSync } = require("../src/data/domains/player")
@@ -39,6 +39,10 @@ test.after(() => {
     else process.env.DATA_DIR = previousDataDirectory
     if (previousDatabaseDirectory === undefined) delete process.env.WDFP_DATABASE_DIR
     else process.env.WDFP_DATABASE_DIR = previousDatabaseDirectory
+    // WAL 模式下 sqlite 连接仍持有 wdfp_data.db / -wal / -shm 句柄, Windows 上
+    // 直接 rmSync 会 EPERM (maxRetries 也救不了: 句柄活到进程结束)。
+    // 必须先关库再删目录。
+    try { closeDatabase() } catch { /* 清理不得改变测试结论 */ }
     fs.rmSync(dataDirectory, { recursive: true, force: true })
 })
 process.once("exit", () => {
@@ -46,6 +50,8 @@ process.once("exit", () => {
     else process.env.DATA_DIR = previousDataDirectory
     if (previousDatabaseDirectory === undefined) delete process.env.WDFP_DATABASE_DIR
     else process.env.WDFP_DATABASE_DIR = previousDatabaseDirectory
+    // after 钩子已关库时这里是 no-op (closeDatabase 返回 false); 兜底同款顺序。
+    try { closeDatabase() } catch { /* 退出清理不得改变退出码 */ }
     fs.rmSync(dataDirectory, { recursive: true, force: true })
 })
 

@@ -240,12 +240,18 @@ export function serverSourceDigest(
         .filter(definition => definition.scope === "server")
         .map(definition => definition.bundledPath)
         .sort()
-        .map(bundledPath => ({
-            path: bundledPath,
-            sha256: crypto.createHash("sha256")
-                .update(fs.readFileSync(path.join(projectRoot, bundledPath)))
-                .digest("hex"),
-        }))
+        .map(bundledPath => {
+            const absolutePath = path.join(projectRoot, bundledPath)
+            // 源文件缺失(测试沙箱、未铺开的检出)按 null 记账而不是抛 ENOENT:
+            // 出现或消失都会改变摘要 ⇒ 仍会触发一次重同步, 但不会让 sync 直接崩。
+            const bytes = fs.existsSync(absolutePath) ? fs.readFileSync(absolutePath) : null
+            return {
+                path: bundledPath,
+                sha256: bytes === null
+                    ? null
+                    : crypto.createHash("sha256").update(bytes).digest("hex"),
+            }
+        })
     return `sha256:${crypto.createHash("sha256")
         .update(canonicalJsonBuffer(entries))
         .digest("hex")}`

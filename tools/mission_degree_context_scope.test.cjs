@@ -221,8 +221,15 @@ const fallbackContext = buildMissionComputerContext(playerId, 5, [25000, 70004, 
 for (const missionId of [25000, 70004, 999999]) {
     assert.equal(DegreeComputer.compute(missionId, fallbackContext, 7), 7)
 }
+// 上游(b2e40c3f)把 Degree 事实需求从 pattern 前缀路由改成按 condition 号路由
+// (src/lib/mission/requirements/condition-routing.ts:122-123)：新增的 cond20
+// 救援战 / cond92 新手多人 (= Degree 家族 attentionBattleClear / multiBattleNewbie)
+// 都归到 missionBattleCounters。本上下文里的 25000
+// (degree_attention_battle_clear_1, cond20) 与 70004
+// (degree_multi_battle_newbie_1, cond92) 正是这两条新路由，读 battleCounters
+// 是上游有意的，故从"不得读取"白名单移除。
 assertUntouched([
-    "character", "mana", "battleCounters", "degreeBattleStats", "shop", "selectedItems",
+    "character", "mana", "degreeBattleStats", "shop", "selectedItems",
     "questProgress", "equipment",
 ])
 

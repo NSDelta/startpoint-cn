@@ -1,3 +1,4 @@
+import { getDatabaseStatus } from "../../data"
 import type { DegreeBattleStats } from "../../data/domains/degree_battle_stats"
 import type { MissionBattleCounters } from "../../data/domains/mission_battle_facts"
 import type {
@@ -187,6 +188,11 @@ export function deriveDegreeStats(
     tables: DegreeContentTables,
     playerId?: number,
 ): NonNullable<CategoryContext["degreeStats"]> {
+    // players_mission_counters 是 DB 表：纯目录 / 无库场景（Degree 目录单测、
+    // 尚未 initializeDatabase 的调用）读不到计数器，按与上游 playerId === undefined
+    // 相同的语义取 0，不因缺库让整段推导抛错（上游 2026-10-03 引入计数器时，
+    // 这批无库的 Degree 测试没跟着改）
+    const counterPlayerId = playerId === undefined || !getDatabaseStatus().ready ? undefined : playerId
     const characters = facts.characters ?? {}
     const manaNodes = facts.characterManaNodes ?? {}
     const battle = facts.missionBattleCounters ?? EMPTY_BATTLE_COUNTERS
@@ -268,12 +274,12 @@ export function deriveDegreeStats(
         hardMultiFinishedQuestIds: finishedBySection[26] ?? readonlySet(),
         finishedQuestIdsBySection: finishedBySection,
         challengeDungeonClearCount: battle.challengeDungeonClearCount,
-        rescueBattleClearCount: playerId === undefined
+        rescueBattleClearCount: counterPlayerId === undefined
             ? 0
-            : getMissionCounterValueSync(playerId, rescueClearQuery()),
-        newbieRescueBattleClearCount: playerId === undefined
+            : getMissionCounterValueSync(counterPlayerId, rescueClearQuery()),
+        newbieRescueBattleClearCount: counterPlayerId === undefined
             ? 0
-            : getMissionCounterValueSync(playerId, newbieRescueClearQuery()),
+            : getMissionCounterValueSync(counterPlayerId, newbieRescueClearQuery()),
         singleScoreMax: battle.singleScoreMax,
         singleClearTimeMin: battle.singleClearTimeMin,
         bossBattleClearCount: battle.bossBattleClearCount,

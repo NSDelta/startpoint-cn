@@ -45,7 +45,10 @@ const TABLES = Object.freeze([
 function createObservedDatabase(databasePath, state) {
     const database = new BetterSqlite3(databasePath, {
         verbose(sql) {
-            if (state.active !== null) state.active.sql.observe(sql)
+            if (state.active !== null) {
+                state.active.sql.observe(sql)
+                state.active.statements.push(sql)
+            }
         },
     })
     return new Proxy(database, {
@@ -82,6 +85,7 @@ function createMeasureState() {
         allCalls: 0,
         getCalls: 0,
         runCalls: 0,
+        statements: [],
         sql: createSqlCounter(),
     }
 }
@@ -168,12 +172,19 @@ function measure(state, operation) {
         sqlReads: sql.selectStatements,
         sqlWrites: sql.writeStatements,
         sqlByTable: sql.byTable,
+        statements: measured.statements,
     }
 }
 
 function reportScenario(measured, behavior) {
     return {
-        ...measured,
+        prepareCalls: measured.prepareCalls,
+        allCalls: measured.allCalls,
+        getCalls: measured.getCalls,
+        runCalls: measured.runCalls,
+        sqlReads: measured.sqlReads,
+        sqlWrites: measured.sqlWrites,
+        sqlByTable: measured.sqlByTable,
         behavior,
         behaviorSha256: crypto.createHash("sha256")
             .update(JSON.stringify(behavior))
@@ -326,14 +337,65 @@ function measureBulkGrowthCommand(commandName, characterCount) {
     }
 }
 
-test("bulk Growth commands read characters once, skip bonds, and keep constant one/twenty SQL", () => {
+function characterReadShape(statement) {
+    const normalized = statement.replace(/\s+/g, " ").trim()
+    if (!/^SELECT\b/.test(normalized) || !/FROM players_characters\b/.test(normalized)) return null
+    return / ORDER BY id$/.test(normalized) ? "growth" : "mission"
+}
+
+function countCharacterReads(statements) {
+    const counts = { growth: 0, mission: 0 }
+    for (const statement of statements) {
+        const shape = characterReadShape(statement)
+        if (shape !== null) counts[shape]++
+    }
+    return counts
+}
+
+// 一次/二十次场景的 SQL 面必须一致；唯一允许的差异是 20 个角色突破时进度跨过 cat5 称号阈值
+// 而多出的 1 条 players_degrees 解锁写入（内容阈值造成，不是随角色数增长的 SQL）。
+function normalizedSqlSurface(measured) {
+    const { players_degrees: degrees, ...sqlByTable } = measured.sqlByTable
+    const degreeUnlockWrites = degrees?.writes ?? 0
+    return {
+        prepareCalls: measured.prepareCalls - degreeUnlockWrites,
+        allCalls: measured.allCalls,
+        getCalls: measured.getCalls,
+        runCalls: measured.runCalls - degreeUnlockWrites,
+        sqlReads: measured.sqlReads,
+        sqlWrites: measured.sqlWrites - degreeUnlockWrites,
+        sqlByTable,
+    }
+}
+
+test("bulk Growth commands keep growth reads at one and constant one/twenty SQL", () => {
     for (const commandName of ["bulk_over_limit", "bulk_stack_to_exp"]) {
         const one = measureBulkGrowthCommand(commandName, 1)
         const twenty = measureBulkGrowthCommand(commandName, 20)
+        // 上游 35a340a4 / 90839b66 / e6f42538 起，bulk_over_limit 在同一个事务里结算突破任务
+        // （mission 38 家族）与 cat5 称号家族，并发布 Active Mission 事实。这两个消费方都需要
+        // 带羁绊的完整 PlayerCharacter 映射（getPlayerCharactersSync），所以 players_characters
+        // 被读 3 次、羁绊表被读 2 次；成长侧自己的 bond-free 读取
+        // （getPlayerCharacterGrowthSeedsSync，ORDER BY id）仍然只有 1 次。
+        // bulk_stack_to_exp 没有接这条链路，依旧满足原来的 1 读 0 羁绊契约。
+        const expectedMissionReads = commandName === "bulk_over_limit" ? 2 : 0
         for (const scenario of [one, twenty]) {
-            assert.equal(scenario.measured.sqlByTable.players_characters.reads, 1)
+            const characterReads = countCharacterReads(scenario.measured.statements)
+            assert.equal(characterReads.growth, 1)
+            assert.equal(characterReads.mission, expectedMissionReads)
+            assert.equal(
+                scenario.measured.sqlByTable.players_characters.reads,
+                1 + expectedMissionReads,
+            )
             assert.equal(scenario.measured.sqlByTable.players_characters.writes, 1)
-            assert.equal(scenario.measured.sqlByTable.players_characters_bond_tokens, undefined)
+            if (expectedMissionReads === 0) {
+                assert.equal(scenario.measured.sqlByTable.players_characters_bond_tokens, undefined)
+            } else {
+                assert.equal(
+                    scenario.measured.sqlByTable.players_characters_bond_tokens.reads,
+                    expectedMissionReads,
+                )
+            }
             assert.equal(scenario.result.characters.length, scenario.ids.length)
             assert.deepEqual(
                 scenario.result.characters.map(character => character.characterId),
@@ -348,23 +410,13 @@ test("bulk Growth commands read characters once, skip bonds, and keep constant o
                 assert.equal(scenario.result.characters.every(character => character.overLimitStep === 1), true)
             }
         }
-        assert.deepEqual({
-            prepareCalls: twenty.measured.prepareCalls,
-            allCalls: twenty.measured.allCalls,
-            getCalls: twenty.measured.getCalls,
-            runCalls: twenty.measured.runCalls,
-            sqlReads: twenty.measured.sqlReads,
-            sqlWrites: twenty.measured.sqlWrites,
-            sqlByTable: twenty.measured.sqlByTable,
-        }, {
-            prepareCalls: one.measured.prepareCalls,
-            allCalls: one.measured.allCalls,
-            getCalls: one.measured.getCalls,
-            runCalls: one.measured.runCalls,
-            sqlReads: one.measured.sqlReads,
-            sqlWrites: one.measured.sqlWrites,
-            sqlByTable: one.measured.sqlByTable,
-        })
+        if (commandName === "bulk_over_limit") {
+            assert.equal(one.measured.sqlByTable.players_degrees, undefined)
+            assert.equal(twenty.measured.sqlByTable.players_degrees?.writes, 1)
+        } else {
+            assert.equal(twenty.measured.sqlByTable.players_degrees, undefined)
+        }
+        assert.deepEqual(normalizedSqlSurface(twenty.measured), normalizedSqlSurface(one.measured))
     }
 })
 

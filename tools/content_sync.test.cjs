@@ -36,6 +36,9 @@ const {
 const {
     ContentSyncCleanupError,
     runContentSync,
+    // 上游 c5135348 起 check 的决策还折叠了 server 作用域源文件的 sha256
+    // （summary.serverSourceDigest）——见本文件「check reuses current release objects」。
+    serverSourceDigest,
 } = require("../src/content/sync/engine")
 const {
     parseContentSyncArguments,
@@ -918,7 +921,15 @@ test("check reuses current release objects without rereading its summary", async
                     current,
                     manifest,
                     objects: {
-                        [manifest.summary.object]: { patchSourceDigest: null },
+                        // summary 来自 objects[manifest.summary.object]（见 engine.ts
+                        // readCurrentRelease），不是 manifest 的内联 summary。上游 c5135348
+                        // 起 decideReason 还会把这里的 serverSourceDigest 与现场算出的
+                        // server 作用域源文件摘要比对：缺字段/不一致 ⇒ 判 server-source 并
+                        // 触发一次重同步。本测试仍只验「复用、不回读」，按真实算法补上即可。
+                        [manifest.summary.object]: {
+                            patchSourceDigest: null,
+                            serverSourceDigest: serverSourceDigest(projectRoot, TEST_TABLE_SOURCES),
+                        },
                     },
                 }
             },

@@ -199,7 +199,9 @@ test("validates required fields, enum ranges, and UTF-16 lengths", () => {
     assert.throws(() => validateNewsDraft(null), error => {
         assert.ok(error instanceof NewsValidationError)
         assert.ok(error instanceof TypeError)
-        assert.equal(error.message, "News validation failed")
+        // 上游(b2e40c3f)起 validateNewsDraft 透传具体字段原因(管理路由 400 文案要用),
+        // 非对象入参透传的就是 requireObject 的原因,不再是笼统的 "News validation failed"。
+        assert.equal(error.message, "News draft must be an object")
         return true
     })
     assert.throws(() => validateNewsDraft(null), TypeError)

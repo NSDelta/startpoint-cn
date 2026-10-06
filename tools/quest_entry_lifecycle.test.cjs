@@ -530,6 +530,17 @@ assert.ok(
     legacyDb.prepare("PRAGMA table_info(players_active_quests)").all()
         .some(column => column.name === "rescue_fragment_eligible"),
 )
+// newbie_rescue_eligible 是救援计数器(cond20/92)配套的新列: 老库升级路径必须
+// 逐个补列, 否则 insertPlayerActiveQuestSync 会因缺列失败(SqliteError)。
+assert.equal(
+    typeof activeQuestStorage.ensureActiveQuestNewbieRescueEligibilityStorageSync,
+    "function",
+)
+activeQuestStorage.ensureActiveQuestNewbieRescueEligibilityStorageSync(legacyDb)
+assert.ok(
+    legacyDb.prepare("PRAGMA table_info(players_active_quests)").all()
+        .some(column => column.name === "newbie_rescue_eligible"),
+)
 
 const dbModulePath = require.resolve("../src/data/db")
 require.cache[dbModulePath] = {

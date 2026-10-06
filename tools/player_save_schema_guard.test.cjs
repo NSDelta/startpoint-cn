@@ -48,18 +48,24 @@ const {
 // 非玩家存档的服务端基础设施表(账号/设备/会话/审计/服务端运营内容/共享状态)。
 // 新增基础设施表时在此显式登记;新增玩家域表时必须登记进
 // PLAYER_SAVE_TABLES(随存档)或 PLAYER_SAVE_EXCLUDED_TABLES(明确排除)。
+// account_bindings / bind_audit / device_grants / signup_codes 是本 fork 的
+// QQ·设备绑定登录门(登录闸门)四张表, 属服务端身份域, 不随玩家存档导出。
 const SERVER_INFRASTRUCTURE_TABLES = new Set([
+    "account_bindings",
     "account_cleanup_audit",
     "account_cleanup_settings",
     "account_transfer_audit",
     "accounts",
+    "bind_audit",
     "device_bindings",
+    "device_grants",
     "raid_event_boss_states",
     "server_gameplay_settings",
     "server_gift_codes",
     "server_gift_rewards",
     "server_news",
     "sessions",
+    "signup_codes",
 ])
 
 initializeDatabase()

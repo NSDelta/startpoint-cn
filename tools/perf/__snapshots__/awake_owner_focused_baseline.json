@@ -894,7 +894,7 @@
       "snapshotSource": "none",
       "rereadReason": "earlier awake settlement precedes later authoritative reward, active-mission, response-state and active-quest writes",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 60,
+      "sqlReads": 64,
       "sqlWrites": 35,
       "sqlByTable": {
         "players": {
@@ -996,6 +996,11 @@
           "reads": 1,
           "statements": 2,
           "writes": 1
+        },
+        "players_mission_counters": {
+          "reads": 4,
+          "statements": 4,
+          "writes": 0
         },
         "players_party_race_clears": {
           "reads": 0,
@@ -1219,7 +1224,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 62,
+      "sqlReads": 66,
       "sqlWrites": 33,
       "sqlByTable": {
         "players": {
@@ -1316,6 +1321,11 @@
           "reads": 1,
           "statements": 2,
           "writes": 1
+        },
+        "players_mission_counters": {
+          "reads": 4,
+          "statements": 4,
+          "writes": 0
         },
         "players_party_race_clears": {
           "reads": 0,
@@ -2420,7 +2430,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 42,
+      "sqlReads": 46,
       "sqlWrites": 15,
       "sqlByTable": {
         "players": {
@@ -2491,6 +2501,11 @@
         "players_mails": {
           "reads": 1,
           "statements": 1,
+          "writes": 0
+        },
+        "players_mission_counters": {
+          "reads": 4,
+          "statements": 4,
           "writes": 0
         },
         "players_quest_progress": {
@@ -2739,7 +2754,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 26,
+      "sqlReads": 28,
       "sqlWrites": 9,
       "sqlByTable": {
         "players": {
@@ -2805,6 +2820,11 @@
         "players_mails": {
           "reads": 1,
           "statements": 1,
+          "writes": 0
+        },
+        "players_mission_counters": {
+          "reads": 2,
+          "statements": 2,
           "writes": 0
         },
         "players_player_history_milestones": {
@@ -2938,7 +2958,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 26,
+      "sqlReads": 28,
       "sqlWrites": 10,
       "sqlByTable": {
         "players": {
@@ -3004,6 +3024,11 @@
         "players_mails": {
           "reads": 1,
           "statements": 1,
+          "writes": 0
+        },
+        "players_mission_counters": {
+          "reads": 2,
+          "statements": 2,
           "writes": 0
         },
         "players_player_history_milestones": {
@@ -3151,7 +3176,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 32,
+      "sqlReads": 34,
       "sqlWrites": 11,
       "sqlByTable": {
         "players": {
@@ -3232,6 +3257,11 @@
         "players_mails": {
           "reads": 1,
           "statements": 1,
+          "writes": 0
+        },
+        "players_mission_counters": {
+          "reads": 2,
+          "statements": 2,
           "writes": 0
         },
         "players_player_history_milestones": {
@@ -5100,7 +5130,7 @@
       "snapshotSource": "none",
       "rereadReason": "no owner snapshot is injected; load the bounded post-write scope",
       "freshPostWriteEvaluationRequired": true,
-      "sqlReads": 34,
+      "sqlReads": 38,
       "sqlWrites": 14,
       "sqlByTable": {
         "players": {
@@ -5166,6 +5196,11 @@
         "players_mails": {
           "reads": 1,
           "statements": 1,
+          "writes": 0
+        },
+        "players_mission_counters": {
+          "reads": 4,
+          "statements": 4,
           "writes": 0
         },
         "players_party_member_co_clears": {

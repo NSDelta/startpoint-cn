@@ -110,6 +110,16 @@ export function registerAdminUi(
 
     fastify.get("/", (_request, reply) => reply.redirect("/admin/"))
     fastify.get("/admin", (_request, reply) => reply.redirect("/admin/"))
+    // 旧书签兼容跳转：上游 2026-10-05 删掉了这五条（他们自己的
+    // tools/runtime_admin.test.cjs:55 仍在断言它们），本 fork 保留 —— 基线以
+    // 我方为准，且这些跳转对现有部署是免费的行为兼容。
+    fastify.get("/player", (_request, reply) => reply.redirect("/admin/accounts"))
+    fastify.get("/player/", (_request, reply) => reply.redirect("/admin/accounts"))
+    fastify.get<{ Params: { playerId: string } }>("/player/:playerId", (request, reply) => (
+        reply.redirect(`/admin/players/${encodeURIComponent(request.params.playerId)}`)
+    ))
+    fastify.get("/mail", (_request, reply) => reply.redirect("/admin/mail"))
+    fastify.get("/seeds", (_request, reply) => reply.redirect("/admin/seeds"))
 
     fastify.setNotFoundHandler((request, reply) => {
         const pathname = request.url.split("?", 1)[0]

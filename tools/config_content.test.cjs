@@ -35,6 +35,11 @@ function rawConfig(overrides = {}) {
         continue_virtual_money: 50,
         common_reward_multiplier_by_multi_play_mode: 1,
         gacha_crazy_ten_max_count: 999,
+        // 上游 b2e40c3f 起 getCurrencyCapacityPolicySync 还读这两个字段
+        // （新手组队战斗的房主资格阈值：rank ≤ 值 或 建号 ≤ 值天，≤0 关闭判定），
+        // 必须是「非负安全整数」，缺字段会直接 invalid("newbie_rank")。
+        newbie_rank: 80,
+        newbie_days: 30,
         ...overrides,
     }
 }
@@ -61,7 +66,13 @@ test("narrow Config policies cache by repository identity and read raw Config on
     const first = countedRepository(rawConfig())
     const currency = getCurrencyCapacityPolicySync(first.repository)
     assert.strictEqual(getCurrencyCapacityPolicySync(first.repository), currency)
-    assert.deepEqual(currency, { maxVmoney: 999999, maxMana: 99999999, maxStarCrumb: 9999 })
+    assert.deepEqual(currency, {
+        maxVmoney: 999999,
+        maxMana: 99999999,
+        maxStarCrumb: 9999,
+        newbieRank: 80,
+        newbieDays: 30,
+    })
     assert.deepEqual(getStaminaPolicySync(first.repository), {
         recoveryVmoneyCost: 50,
         recoverySeconds: 300,
@@ -104,11 +115,16 @@ test("each policy validates only its consumed fields and preserves zero semantic
         continue_virtual_money: 0,
         common_reward_multiplier_by_multi_play_mode: 0,
         gacha_crazy_ten_max_count: 0,
+        // 新手阈值也按 0 覆盖（≤0 = 关闭判定），验证这两个新字段同样保留零语义
+        newbie_rank: 0,
+        newbie_days: 0,
     }))
     assert.deepEqual(getCurrencyCapacityPolicySync(zeros.repository), {
         maxVmoney: 0,
         maxMana: 0,
         maxStarCrumb: 0,
+        newbieRank: 0,
+        newbieDays: 0,
     })
     assert.deepEqual(getEquipmentCurrencyPolicySync(zeros.repository), {
         craftPointItemId: 100000,

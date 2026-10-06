@@ -17,13 +17,17 @@ delete process.env.WDFP_DATABASE_DIR
 
 function cleanup() {
     restoreContentSnapshot()
+    // WAL 模式下 sqlite 连接仍持有 wdfp_data.db / -wal / -shm 句柄, Windows 上
+    // 直接 rmSync 会 EPERM；因为它发生在 exit 事件里, node 只把退出码置 1 而
+    // 不再打印原因 ⇒ 表现为"stdout 打印 passed 但 exit=1"。先关库再删目录。
+    try { closeDatabase() } catch { /* 退出清理不得改变退出码 */ }
     fs.rmSync(databaseDirectory, { recursive: true, force: true })
     if (previousDataDirectory === undefined) delete process.env.DATA_DIR
     else process.env.DATA_DIR = previousDataDirectory
 }
 process.once("exit", cleanup)
 
-const { initializeDatabase } = require("../src/data")
+const { closeDatabase, initializeDatabase } = require("../src/data")
 const { insertAccountSync } = require("../src/data/domains/account")
 const {
     getPlayerCategoryMissionsSync,

@@ -22,6 +22,10 @@ const { getDb } = require("../src/data/db")
 const { ensureSchemaColumn } = require("../src/data/schema")
 const { insertAccountSync } = require("../src/data/domains/account")
 const binding = require("../src/data/domains/account-binding")
+// 数据 schema 版本不再写死: 它由 assets/server_release_contract.json 的
+// currentDataSchema 决定(src/data/index.ts:65 latestVersion = CURRENT_DATA_SCHEMA),
+// 上游 2026-10-05 把它从 28 提到 29, 写死会在每次合并后误红
+const { CURRENT_DATA_SCHEMA } = require("../src/runtime/release-contract")
 
 let sequence = 0
 
@@ -102,7 +106,7 @@ test("契约 C2：四张新表与 accounts 三个新列都在", () => {
     const bindingIndexes = indexNames("account_bindings")
     assert.ok(bindingIndexes.includes("uq_account_bindings_primary"))
     assert.ok(bindingIndexes.includes("uq_account_bindings_triple"))
-    assert.equal(userVersion(), 28)
+    assert.equal(userVersion(), CURRENT_DATA_SCHEMA)
 
     // 已存在的老账号默认 active，不会被闸门误伤
     const legacy = createAccount()
@@ -472,7 +476,7 @@ test("老库升级：新表新列都在，且重复初始化幂等", () => {
     console.log("[P2] 老库升级后 accounts 新列=%s", ["bind_state", "bind_platform", "bind_uid"]
         .filter(name => afterColumns.includes(name)).join(","))
 
-    assert.equal(userVersion(), 28)
+    assert.equal(userVersion(), CURRENT_DATA_SCHEMA)
     for (const table of ["signup_codes", "account_bindings", "device_grants", "bind_audit"]) {
         assert.ok(afterTables.includes(table), `升级后缺少表 ${table}`)
     }
@@ -495,7 +499,7 @@ test("老库升级：新表新列都在，且重复初始化幂等", () => {
     assert.equal(ensureSchemaColumn(getDb(), "accounts.bind_state"), false)
     assert.equal(ensureSchemaColumn(getDb(), "accounts.bind_platform"), false)
     assert.equal(ensureSchemaColumn(getDb(), "accounts.bind_uid"), false)
-    assert.equal(userVersion(), 28)
+    assert.equal(userVersion(), CURRENT_DATA_SCHEMA)
     assert.equal(binding.getBindingByPlatformUidSync("qq", "790000001").accountId, legacyAccount.id)
     assert.equal(binding.getAccountByDeviceSync(790000001), null)
 })
