@@ -3,8 +3,9 @@ chcp 65001 >nul
 cd /d "%~dp0"
 echo ============================================================
 echo  StarPoint CN server  (worktree "reset-bringup" = dev + 忘记密码三步)
-echo  game / phone URL : http://192.168.0.105:8001/
-echo  admin panel      : http://192.168.0.105:8001/admin/
+rem 这里原本写死本机局域网 IP；改成回环地址 + 提示（IP 是机器相关的，不入库）。
+echo  game / phone URL : http://127.0.0.1:8001/  (phone: use this PC's LAN IP, see ipconfig)
+echo  admin panel      : http://127.0.0.1:8001/admin/
 echo  data dir         : D:/wfcnmod/server/cn-data   (your save)
 echo  stop             : press Ctrl+C in this window
 echo ------------------------------------------------------------

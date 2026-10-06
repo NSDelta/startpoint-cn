@@ -148,7 +148,19 @@ jobs:
           CF="$CF -DAM_FFT_ACCELERATE=1"
           LD="-framework Accelerate"
           : > "$RUNNER_TEMP/build.log"
-          for t in test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine audit_caps; do
+          # ★ 夹具 ios/auto/matcher_golden_pkg 不入库：它整个目录（sample.auto + pkg/*.png +
+          #   script.json + golden_pkg*.{json,h}）都是 `python tools/make_package_golden.py
+          #   <.auto> matcher_golden_pkg` 从**真游戏包**（21 MB 素材）重建出来的，
+          #   按本仓库「游戏素材/大二进制不进 git」的规矩留在本机。
+          #   在 ⇒ 八套全编（含需要 golden_pkg_cases.h 的四套）；
+          #   不在 ⇒ 只编不依赖夹具的三套，并打 ::warning::（**不静默变成"全绿"**）。
+          if [ -f matcher_golden_pkg/golden_pkg_cases.h ]; then
+            TESTS="test_fft test_json test_script test_matcher test_matcher_neg test_package test_engine audit_caps"
+          else
+            TESTS="test_fft test_matcher test_matcher_neg"
+            echo "::warning::ios/auto/matcher_golden_pkg 不存在 ⇒ 只编 3 套不依赖夹具的用例；本机重建：python ios/auto/tools/make_package_golden.py <.auto> ios/auto/matcher_golden_pkg"
+          fi
+          for t in $TESTS; do
             extra=""
             [ "$t" = "test_engine" ] && extra="core/auto_engine.c"
             # audit_caps 要真的把脚本装进引擎（am_engine_*），所以也要 auto_engine.c。
@@ -189,12 +201,11 @@ jobs:
           # ★ 这里的数值是承重的：test_engine 少传 \pkg 会因为「夹具目录里没东西」
           #   静默跳过 24 个用例（36 passed），只看退出码是看不出来的。
           run test_fft          ""                    "125 passed" || true
+          # ★ 夹具缺席时（见上面 core 编译那步的说明）跳过夹具相关的四项检查，
+          #   并**在日志里点名**说清楚少跑了什么 —— 静默变成"全绿"才是真危险。
+          if [ -f matcher_golden_pkg/sample.auto ]; then
           run test_json         "matcher_golden_pkg"  "84 passed"  || true
           run test_script       "matcher_golden_pkg/pkg" "56 passed" || true
-          run test_matcher      "matcher_golden"      "13 passed" || true
-          run test_matcher_neg  "matcher_golden_neg"  "18 passed" || true
-          run test_package      "matcher_golden_pkg"  "21 passed" || true
-          run test_engine       "matcher_golden_pkg/pkg" "60 passed" || true
           # ── 能力上限审计（不是用例，是一条独立的断言）────────────────────
           # core/auto_script.h 里的 AM_MAX_* 是当初按最坏情况估的，**估小了会静默
           # 丢东西**（只置 s->overflow_* 计数，脚本照样"加载成功"）⇒ 现场表现是
@@ -210,7 +221,14 @@ jobs:
             bad "audit_caps 退出码 $audit_rc（脚本没装进引擎，或有维度溢出了）"
           fi
           printf '%s\n' "$audit_out" | grep -q "没有任何溢出" || bad "audit_caps 没说『没有任何溢出』"
-          if [ "$rc" -eq 0 ]; then echo "core 回归全部通过（377 例）+ 能力上限审计无溢出"; fi
+          run test_package      "matcher_golden_pkg"  "21 passed" || true
+          run test_engine       "matcher_golden_pkg/pkg" "60 passed" || true
+          else
+            echo "::warning::ios/auto/matcher_golden_pkg 不存在 ⇒ 跳过 test_json / test_script / test_package / test_engine 与 audit_caps（夹具相关的计数断言本轮未跑）；本机重建：python ios/auto/tools/make_package_golden.py <.auto> ios/auto/matcher_golden_pkg"
+          fi
+          run test_matcher      "matcher_golden"      "13 passed" || true
+          run test_matcher_neg  "matcher_golden_neg"  "18 passed" || true
+          if [ "$rc" -eq 0 ]; then echo "core 回归通过（计数硬校验 + 能力上限审计；夹具缺席时按上方 ::warning:: 少跑 4 套）"; fi
           exit $rc
           } 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
@@ -227,6 +245,13 @@ jobs:
         run: |
           set -euo pipefail
           cd ios/auto
+          # ★ 这个脚本要**真跑**测试二进制（拿真实输出核对模式 + 阴性对照），
+          #   所以夹具不在时它必然全 FAIL —— 那不是"模式写错了"，是没东西可跑。
+          #   缺席就跳过并点名，别让它把夹具缺失误报成模式回归。
+          if [ ! -f matcher_golden_pkg/sample.auto ]; then
+            echo "::warning::ios/auto/matcher_golden_pkg 不存在 ⇒ 跳过 grep 模式校验（它要真跑测试二进制）；本机重建夹具后再跑：node ios/auto/tools/check-test-patterns.mjs ios/auto ../../.github/workflows/ios-autoclick.yml --selftest"
+            exit 0
+          fi
           node tools/check-test-patterns.mjs . ../../.github/workflows/ios-autoclick.yml --selftest
 
       # ── 交付物 ①/②：Theos 编译 ──────────────────────────────────────────
@@ -553,7 +578,7 @@ jobs:
           #   所以 `::notice::` 后面的字节就是下一段 shell 的源码。build.log 里
           #   有二进制（deb 断言那段 cat 过 binary plist，含 NUL 与控制字节），
           #   第 15 次 CI 因此死在
-          #     /Users/runner/work/_temp/<uuid>.sh: line 43: Binary: unbound variable
+          #     /Users/<runner>/work/_temp/<uuid>.sh: line 43: Binary: unbound variable
           #   —— 那行二进制里恰好有 `$Binary`，在 `set -u` 下成了未定义变量，
           #   脚本带着 1 退出，而且发生在 `exit 0` 之前。教训：
           #   **注解通道 = 把日志当脚本喂给下游，必须先去控制字符与元字符。**

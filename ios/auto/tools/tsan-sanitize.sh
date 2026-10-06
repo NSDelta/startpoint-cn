@@ -4,7 +4,7 @@
 # 背景（第 15 次 CI 的真实失败）：`::notice::` 后面的文本会被 GitHub **原样回灌进
 # 下一步的临时脚本文件**，所以它**就是 shell 源码**。build.log 里有二进制
 # （deb 断言那段 cat 过 binary plist），于是
-#     /Users/runner/work/_temp/<uuid>.sh: line 43: Binary: unbound variable
+#     /Users/<runner>/work/_temp/<uuid>.sh: line 43: Binary: unbound variable
 # 而真正的构建其实是全绿的。
 #
 # 用法：sh ios/auto/tools/tsan-sanitize.sh   （退出码 0 = 净化仍然有效）

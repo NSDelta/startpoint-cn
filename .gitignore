@@ -45,6 +45,12 @@ _release/
 # ios/auto/decomp 是 自动化编辑器-v4.3.8.apk 的反编译产物（5558 个 .java + dex/jar）。
 # 它是**只读参考**，不是源码，也不该进仓库。重建方式见 ios/auto/README.md。
 ios/auto/decomp/
+# matcher_golden_pkg 是从**真 .auto 游戏包**（21 MB 素材）重建出来的夹具：
+#   python tools/make_package_golden.py <.auto> matcher_golden_pkg
+# 整个目录（sample.auto + pkg/*.png + script.json + golden_pkg*.{json,h}）都是那条
+# 命令的产物，按本仓库「游戏素材/大二进制不入库」的规矩不进 git。CI 遇到它缺席时
+# 只跑不依赖夹具的三套用例并打 ::warning::（见 .github/workflows/ios-autoclick.yml）。
+ios/auto/matcher_golden_pkg/
 # 反编译工具的中间产物
 ios/auto/*.dex
 ios/auto/*.jar

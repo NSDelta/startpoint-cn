@@ -66,6 +66,10 @@ tests/                七套测试（MSVC，见 §3）；build/ 与 decomp/ 都�
 matcher_golden/       9 个正样本夹具（golden_cases.h + raw/*.bin）
 matcher_golden_neg/   18 个负样本夹具（golden_neg_cases.h + raw/*.bin）
 matcher_golden_pkg/   sample.auto + pkg/（54 张平铺 PNG + script.json）+ 17 个真实匹配用例
+                      ★ **不入库**（真游戏素材，21 MB）：整目录由下面这条命令从真 .auto 重建 ——
+                        python tools/make_package_golden.py <你的.auto> matcher_golden_pkg
+                      重建后本机可跑全套；CI 上它缺席，只跑 test_fft / test_matcher /
+                      test_matcher_neg 三套并打 ::warning::（见 §3 与工作流里的夹具分支）。
 sample/               从「幻想连战.auto」解出的 script.json 与结构报告（人读用）
 tools/                CI 与夹具工具（python 用 cv2 做参考实现；node/mjs 做各种体检）
   make_*.py                 生成夹具（matcher golden / 负样本 / package golden / bench cases）
@@ -318,7 +322,7 @@ python coord_model.py                         # 复算点击点模型（cv2 参�
   可能非 0 的命令自带 `|| true`，末尾无条件 `exit 0`。
 - **注解文本会被 GitHub 回灌成下游的 shell 脚本**。`::notice::` / `::error::` 后面的内容
   不只是"显示"：GitHub 把它原样写进**下一步的临时脚本文件**
-  （`/Users/runner/work/_temp/<uuid>.sh`），于是它**就是 shell 源码**。第 15 次 CI 的
+  （`/Users/<runner>/work/_temp/<uuid>.sh`），于是它**就是 shell 源码**。第 15 次 CI 的
   `15.错误注解 = failure` 就是这么来的 —— deb 断言步骤 `cat` 过一个 binary plist 进
   `build.log`，注解通道把含 `$Binary` 的那一行原样发了出去 ⇒ `Binary: unbound variable`
   ⇒ 脚本带 1 退出，**而真正的构建其实是全绿的**（编译、打包、两条断言全部 success）。
