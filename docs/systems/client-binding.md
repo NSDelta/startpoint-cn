@@ -23,8 +23,16 @@
 
 `device_grants` 以 `device_id` 为主键并 `ON CONFLICT(device_id) DO UPDATE`
 （`src/data/domains/account-binding.ts:987-998`），这是「**一设备一账号**」的落地点：
-同一台设备再注册只会刷新授权行，不会产生第二个账号；登录名冲突时返回 `DEVICE_TAKEN`
-（错误码与话术见 `src/lib/sp-auth/contract.ts:20,43`）。
+同一台设备再注册只会刷新授权行，不会产生第二个账号。
+
+**2026-02 修订（业主口径「允许注册并改绑本机」）**：本机已经被一个 `active` 账号占着时，
+注册与登录都不再回 `DEVICE_TAKEN`，而是**接管**——新账号照建（pending + 新码），并把
+`device_grants` / `device_bindings` 的这台设备改绑到新账号；被顶掉的账号数据一律不动，
+它用自己的账号密码再登录一次即可把本机抢回去（「最后一次成功注册/登录者拥有本机」）。
+两次改绑都写 `bind_audit`（`detail.reason = "device_rebind"`）。旧行为（拒绝 + 只回
+`{username, viewer_id}`）在二手机上等于死路：没人知道前任机主的密码。`DEVICE_TAKEN`
+仍留在错误码表里供旧客户端识别，但服务端已不再产生它。
+（错误码与话术见 `src/lib/sp-auth/contract.ts:20,43`。）
 
 ### 授权的滑动有效期（契约 3.2，业主 2026-10-01 修订）
 

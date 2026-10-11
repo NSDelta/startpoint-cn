@@ -9,7 +9,10 @@
  *   - `disabled` → `ACCOUNT_DISABLED`
  *   - `pending`  → `BIND_REQUIRED` + `data:{code, code_expires_at}` so the page
  *                  can show (or re-issue) the pending verification code
- *   - `active`   → issue the device grant and answer `{bound:true}`
+ *   - `active`   → issue the device grant and answer `{bound:true}`; when the
+ *                  device is currently claimed by another account the credentials
+ *                  win and the device is re-pointed here (2026-02 device rebind,
+ *                  see `register.ts`'s header note)
  */
 
 import {
@@ -106,20 +109,29 @@ export async function spLogin(
         return fail("BIND_REQUIRED", view)
     }
 
-    // One device maps to one account (CC-1). The page token is the only
-    // credential that can re-point a device, so require it when the device is
-    // already claimed by somebody else.
+    // One device maps to one account (CC-1), and the newest register/login wins
+    // that mapping (2026-02,「允许注册并改绑本机」— see `register.ts`'s header note).
+    // A correct username + password is therefore enough to re-point a device that
+    // somebody else claimed: refusing here is what locked the real owner out after
+    // a device change, and there is no credential-free way to prove ownership
+    // anyway (the page token is device-scoped, so it survives a wipe as nothing).
     const deviceState = resolveDeviceState(deviceId)
     if (deviceState !== null && deviceState.accountId !== account.id) {
         const claimed = resolveGrantByToken(input.token, deviceId)
         const authorised = claimed !== null && claimed.accountId === account.id
         if (!authorised) {
-            auditReject(account.id, {
-                reason: "device_taken",
-                device_id: deviceId,
-                occupying_account_id: deviceState.accountId,
+            appendBindAuditSync({
+                action: "login",
+                accountId: account.id,
+                detail: {
+                    reason: "device_rebind",
+                    device_id: deviceId,
+                    previous_account_id: deviceState.accountId,
+                    login_name: loginName,
+                },
+                actor: SP_AUTH_AUDIT_ACTOR,
+                createdAt: getRealNow().toISOString(),
             })
-            return fail("DEVICE_TAKEN")
         }
     }
 

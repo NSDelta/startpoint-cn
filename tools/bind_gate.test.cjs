@@ -540,7 +540,7 @@ test("开闸：白名单 token 不匹配时仍然拦截（垃圾 token 不得变
 // ④ 闸门开着时 /sp-auth/* 的判定不受影响（P3 契约回归）
 // ---------------------------------------------------------------------------
 
-test("开闸：/sp-auth/register 的 RATE_LIMITED / DEVICE_TAKEN 路径不受闸门影响", async () => {
+test("开闸：/sp-auth/register 的 RATE_LIMITED / 改绑本机路径不受闸门影响", async () => {
     setGate("1")
     const { deviceId, accountId } = await registerViaSpAuth()
 
@@ -553,16 +553,19 @@ test("开闸：/sp-auth/register 的 RATE_LIMITED / DEVICE_TAKEN 路径不受闸
     assert.equal(repeat.ok, false)
     assert.equal(repeat.code, "RATE_LIMITED")
 
-    // 绑定后设备已被占用 → DEVICE_TAKEN（且不返回可登录凭据）
+    // 绑定后设备已被占用 → 注册照常成功并改绑本机（2026-02 起不再回 DEVICE_TAKEN）
     bindPrimary(accountId)
-    const taken = JSON.parse((await app.inject({
+    const takeoverName = nextUsername()
+    const takeover = JSON.parse((await app.inject({
         method: "POST",
         url: "/sp-auth/register",
-        payload: { username: nextUsername(), password: "Passw0rdA1", device_id: deviceId },
+        payload: { username: takeoverName, password: "Passw0rdA1", device_id: deviceId },
     })).payload)
-    assert.equal(taken.ok, false)
-    assert.equal(taken.code, "DEVICE_TAKEN")
-    assert.equal(taken.data.username, accountRow(accountId).username)
+    assert.equal(takeover.ok, true, `改绑注册不该失败：${JSON.stringify(takeover)}`)
+    assert.equal(takeover.data.username, takeoverName)
+    const takeoverAccountId = deviceGrantRow(deviceId).account_id
+    assert.notEqual(takeoverAccountId, accountId, "本机必须改绑到新账号")
+    assert.equal(accountRow(accountId).bind_state, "active", "被顶掉的账号不得被降级")
 
     // 闸门只管 /tool/signup，/sp-auth/* 不写 gate_reject
     assert.equal(gateRejectAudits().length, 0)

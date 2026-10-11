@@ -9,9 +9,17 @@
  * | → pending, code alive   | reuse the SAME account, revoke old code, new  |
  * |                         | code, TTL reset, ≤1 per 60 s → RATE_LIMITED   |
  * | → pending, code dead    | reuse that `pending` account, new code        |
- * | → active                | DEVICE_TAKEN + `{username, viewer_id}`, never |
- * |                         | any credential                                |
+ * | → active                | create a NEW `pending` account for this device |
+ * |                         | and re-point the grant + binding at it         |
  * | → disabled              | ACCOUNT_DISABLED                              |
+ *
+ * 2026-02 change —「允许注册并改绑本机」(owner decision). The `active` row used to
+ * answer `DEVICE_TAKEN` + `{username, viewer_id}` and create nothing. On a
+ * second-hand phone nobody knows the previous owner's password, so that answer was
+ * a dead end ("本机已经注册过账号，请用账号密码登录") and the client could not fix it
+ * either — the decision lives here. The newest register on a device now takes it
+ * over; the previous account is untouched and still logs in with its own username
+ * + password (which re-points the device back —「最后一次成功注册/登录者拥有本机」).
  *
  * A conflicting `udid` header never wins: C1 fixes `body.device_id` as the
  * identity, because iOS reports the same synthetic UDID for every device.
@@ -142,22 +150,35 @@ export async function spRegister(
         return fail("ACCOUNT_DISABLED")
     }
 
+    // A device already claimed by an `active` account is no longer a refusal: the
+    // new registration takes the device over (see the header note). Only this
+    // device's grant + binding move; the previous account keeps its data.
+    let reboundFrom: { accountId: number; username: string | null } | null = null
     if (state !== null && state.bindState === "active") {
-        // CC-1: refuse and hand back only non-credential identifying data.
         const occupying = getAccountSync(state.accountId)
-        const viewerId = getViewerIdSync(state.accountId)
-        auditReject("register", state.accountId, { reason: "device_taken", version })
-        return fail("DEVICE_TAKEN", {
-            username: occupying?.username ?? null,
-            viewer_id: viewerId,
+        reboundFrom = { accountId: state.accountId, username: occupying?.username ?? null }
+        appendBindAuditSync({
+            action: "register",
+            accountId: state.accountId,
+            detail: {
+                reason: "device_rebind",
+                device_id: deviceId,
+                previous_viewer_id: getViewerIdSync(state.accountId),
+                new_username: username,
+                version,
+            },
+            actor: SP_AUTH_AUDIT_ACTOR,
+            createdAt: getRealNow().toISOString(),
         })
     }
 
-    // --- CC-1 branch: no mapping, or an existing `pending` mapping ---------
+    // --- CC-1 branch: no mapping, a `pending` mapping, or a takeover --------
     let accountId: number
     let created = false
 
-    if (state === null) {
+    if (state === null || reboundFrom !== null) {
+        // A takeover must NOT reuse the occupying account, so it creates a fresh
+        // `pending` one exactly like the no-mapping branch.
         const passwordHash = hashPassword(password)
         const account = createPendingAccount(deviceId, username, passwordHash)
         accountId = account.id
@@ -200,7 +221,12 @@ export async function spRegister(
     // idempotent, otherwise the page that is polling with the stored token would
     // be logged out by its own retry. A fresh token is minted only when the
     // device had no grant or the grant already expired (CC-1 "已过期/被吊销").
-    const grant = state !== null && !state.grantExpired
+    //
+    // A takeover always mints a fresh token: the stored row (and its token)
+    // belongs to the account being replaced, so reusing it would hand the new
+    // page somebody else's credential.
+    const keepExistingGrant = state !== null && reboundFrom === null && !state.grantExpired
+    const grant = keepExistingGrant
         ? getDeviceGrantSync(deviceId) ?? issueGrantForDevice(deviceId, accountId)
         : issueGrantForDevice(deviceId, accountId)
     insertDeviceBindingSync(deviceId, accountId)
@@ -212,7 +238,9 @@ export async function spRegister(
         detail: {
             device_id: deviceId,
             created,
-            reused_pending: !created,
+            reused_pending: !created && reboundFrom === null,
+            rebound_from_account_id: reboundFrom?.accountId ?? null,
+            rebound_from_username: reboundFrom?.username ?? null,
             code_id: issued.code.id,
             version,
         },

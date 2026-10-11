@@ -339,35 +339,59 @@ test("CC-1：pending 且码与 grant 都过期 → 仍复用该账号并刷新�
     assert.equal(bcrypt.compareSync("Passw0rdA1", account.password_hash), false)
 })
 
-test("CC-1：active 已绑定 → 同设备再注册 DEVICE_TAKEN，只带 username/viewer_id，不带任何凭据", async () => {
+test("改绑本机：active 已绑定 → 同设备再注册即接管（新账号 pending，旧账号原样保留）", async () => {
     const owner = await registerDevice()
-    const accountId = deviceGrantRow(owner.deviceId).account_id
-    bindPrimary(accountId, "556677889")
+    const ownerAccountId = deviceGrantRow(owner.deviceId).account_id
+    bindPrimary(ownerAccountId, "556677889")
+    const ownerGrantBefore = deviceGrantRow(owner.deviceId)
 
     const accountsBefore = accountCount()
-    const grantBefore = deviceGrantRow(owner.deviceId)
+    const takeoverName = username("takeover")
 
-    // CC-1：映射已存在且为 active（即「本机已经注册过账号」）→ DEVICE_TAKEN。
+    // 旧行为：映射已存在且为 active（「本机已经注册过账号」）→ DEVICE_TAKEN，谁都进不去。
+    // 新行为（2026-02 业主口径「允许注册并改绑本机」）：照建新账号，并把本机改绑给它。
     const { body } = await post("/register", {
-        username: username("intruder"),
+        username: takeoverName,
         password: "Passw0rdA1",
         device_id: owner.deviceId,
     })
-    const failure = failBody(body, "DEVICE_TAKEN")
+    const payload = okBody(body)
 
-    const viewerId = getDb().prepare(
-        "SELECT token FROM sessions WHERE account_id = ? AND type = 2 LIMIT 1",
-    ).get(accountId)
-    assert.deepEqual(Object.keys(failure.data).sort(), ["username", "viewer_id"])
-    assert.equal(failure.data.username, owner.username)
-    assert.equal(failure.data.viewer_id, Number(viewerId.token))
+    assert.equal(payload.username, takeoverName)
+    assert.match(payload.token, /^[0-9a-f]{64}$/)
+    assert.equal(accountCount() - accountsBefore, 1, "必须新建账号")
 
-    // 不得回传任何可登录凭据，也不得改动库里的账号/凭据。
-    const serialised = JSON.stringify(failure)
-    assert.doesNotMatch(serialised, /[0-9a-f]{64}/, "不得出现 device token")
-    assert.doesNotMatch(serialised, /password/i)
-    assert.equal(accountCount() - accountsBefore, 0, "不得新建账号")
-    assert.deepEqual(deviceGrantRow(owner.deviceId), grantBefore, "不得换发 grant")
+    const takeoverAccountId = deviceGrantRow(owner.deviceId).account_id
+    assert.notEqual(takeoverAccountId, ownerAccountId, "本机必须改绑到新账号")
+    assert.notEqual(
+        deviceGrantRow(owner.deviceId).token,
+        ownerGrantBefore.token,
+        "改绑必须换发新 token（旧 token 属于被顶掉的账号）",
+    )
+    assert.equal(accountRow(takeoverAccountId).bind_state, "pending", "新账号仍要走群内绑定")
+    assert.equal(latestCodeRow(takeoverAccountId).status, "pending")
+
+    // 旧账号完全不动：用户名、凭据、active 状态都不变，只是不再占着这台机器。
+    const ownerAfter = accountRow(ownerAccountId)
+    assert.equal(ownerAfter.username, owner.username)
+    assert.equal(ownerAfter.bind_state, "active")
+    assert.equal(bcrypt.compareSync(owner.password, ownerAfter.password_hash), true)
+
+    // 旧账号用自己的账号密码登录 → 把本机抢回去（「最后一次成功注册/登录者拥有本机」）。
+    const { body: backBody } = await post("/login", {
+        login_name: owner.username,
+        password: owner.password,
+        device_id: owner.deviceId,
+    })
+    okBody(backBody)
+    assert.equal(deviceGrantRow(owner.deviceId).account_id, ownerAccountId)
+
+    // 场记：改绑留 device_rebind 审计，事后能查是谁把机器顶掉的。
+    const rebinds = getDb().prepare(
+        "SELECT account_id, detail FROM bind_audit WHERE detail LIKE '%device_rebind%' ORDER BY id",
+    ).all()
+    assert.ok(rebinds.length >= 1, "改绑必须写审计")
+    assert.match(rebinds[0].detail, /"previous_viewer_id"/)
 })
 
 test("CC-1：disabled → ACCOUNT_DISABLED（注册与登录一致）", async () => {
@@ -591,26 +615,63 @@ test("契约 C1：login_name 支持账号名与绑定后的 QQ 号两种口径",
     assert.equal(payload.username, name)
 })
 
-test("CC-1：设备已被别的账号占用 → 登录 DEVICE_TAKEN", async () => {
+test("改绑本机：设备已被别的账号占用 → 账号密码登录即接管该设备", async () => {
     const owner = await registerDevice()
-    const accountId = deviceGrantRow(owner.deviceId).account_id
-    bindPrimary(accountId, "112233445")
+    const ownerAccountId = deviceGrantRow(owner.deviceId).account_id
+    bindPrimary(ownerAccountId, "112233445")
 
     const second = await registerDevice()
     const secondAccountId = deviceGrantRow(second.deviceId).account_id
     bindPrimary(secondAccountId, "667788990")
 
+    // 旧行为：非占用者的登录一律 DEVICE_TAKEN（换机/共享设备的玩家自己登不回来）。
+    // 新行为：用户名 + 密码本身就是所有权证明 ⇒ 放行并改绑（审计记 device_rebind）。
+    const loginRebinds = () => getDb().prepare(
+        "SELECT detail FROM bind_audit WHERE action = 'login' AND detail LIKE '%device_rebind%'",
+    ).all().length
+    const rebindsBefore = loginRebinds()
     const { body } = await post("/login", {
         login_name: second.username,
         password: second.password,
         device_id: owner.deviceId,
     })
-    failBody(body, "DEVICE_TAKEN")
+    const payload = okBody(body)
+    assert.equal(payload.username, second.username)
+    assert.equal(payload.bound, true)
     assert.equal(
         deviceGrantRow(owner.deviceId).account_id,
-        accountId,
-        "被占用设备的归属不得被改变",
+        secondAccountId,
+        "凭据正确即可接管本机",
     )
+    assert.equal(deviceGrantRow(second.deviceId).account_id, secondAccountId, "原设备映射不受影响")
+    assert.equal(accountRow(ownerAccountId).bind_state, "active", "被顶掉的账号不得被降级")
+    assert.equal(loginRebinds() - rebindsBefore, 1, "登录改绑必须写审计")
+
+    // 同理，被顶掉的账号也能用自己的账号密码把本机抢回去。
+    const { body: backBody } = await post("/login", {
+        login_name: owner.username,
+        password: owner.password,
+        device_id: owner.deviceId,
+    })
+    okBody(backBody)
+    assert.equal(deviceGrantRow(owner.deviceId).account_id, ownerAccountId)
+})
+
+test("改绑本机：设备被占但密码错误 → 仍是 BAD_CREDENTIALS，不改绑", async () => {
+    const owner = await registerDevice()
+    const ownerAccountId = deviceGrantRow(owner.deviceId).account_id
+    bindPrimary(ownerAccountId, "445566778")
+
+    const second = await registerDevice()
+    bindPrimary(deviceGrantRow(second.deviceId).account_id, "889900112")
+
+    const { body } = await post("/login", {
+        login_name: second.username,
+        password: "WrongPassw0rd",
+        device_id: owner.deviceId,
+    })
+    failBody(body, "BAD_CREDENTIALS")
+    assert.equal(deviceGrantRow(owner.deviceId).account_id, ownerAccountId)
 })
 
 // ---------------------------------------------------------------------------
