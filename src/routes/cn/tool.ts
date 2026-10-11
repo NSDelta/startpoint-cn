@@ -3,6 +3,7 @@ import { generateDataHeaders, generateViewerId } from "../../utils";
 import { deleteAccountSessionsOfTypeSync, deleteDeviceBindingSync, getAccountSessionsOfTypeSync, getDeviceBindingSync, insertDeviceBindingSync, insertSessionWithToken } from "../../data/domains/session"
 import { getAccountSync, insertAccountSync, updateAccountSync } from "../../data/domains/account"
 import { getPlayerSync, insertDefaultPlayerSync } from "../../data/domains/player"
+import { appendBindAuditSync } from "../../data/domains/account-binding"
 import { SessionType } from "../../data/types";
 import { saveAccountDefaultPlayer } from "../../data/activeAccount";
 import { getAccountIdentityProvider } from "../../lib/account-identity-provider";
@@ -100,33 +101,33 @@ const routes = async (fastify: FastifyInstance) => {
             return reply.status(200).send(buildBindGateRejection(bindGate));
         }
 
-        if (binding) {
-            // Known device — verify account still exists
-            const accountExists = getAccountSync(binding.account_id)
-            if (accountExists) {
-                accountId = binding.account_id
-                newAccount = false
-                updateAccountSync({ id: accountId, lastLoginTime: getRealNow() })
-                // Clean all old sessions for this account, reuse first token
-                const sessions = getAccountSessionsOfTypeSync(accountId, SessionType.VIEWER)
-                if (sessions.length > 0) {
-                    viewerId = parseInt(sessions[0].token)
-                    deleteAccountSessionsOfTypeSync(accountId, SessionType.VIEWER)
-                }
-            } else {
-                // Account was deleted — clean up stale binding and create new account
-                deleteDeviceBindingSync(deviceId)
-                const identity = identityProvider.resolveCnSignup({ appId: "wf_cn" })
-                const account = insertAccountSync({
-                    appId: "wf_cn", ...identity, status: "normal"
-                })
-                accountId = account.id
-                const player = insertDefaultPlayerSync(accountId)
-                saveAccountDefaultPlayer(accountId, player.id)
+        // ★ 闸门认定的主体才是这台设备的账号。`resolveBindGateSubject` 的身份键是
+        //   `device_bindings` ∪ 未过期的 `device_grants`（bind-gate.ts:201/217），而这里原先只认
+        //   `device_bindings`。两者一旦不一致（只有 grant 的历史设备、binding 被清掉但 grant 还在），
+        //   闸门放行的是一张老账号，旧代码却会给这台设备新建一个空账号 —— 玩家的主号与游戏号
+        //   就此分裂（本机 account 8/9 就是这么来的）。放行 ≠ 可以另起炉灶。
+        const gateAccountId = bindGate.subject === null ? null : bindGate.subject.accountId
+        const boundAccountId = binding === null ? gateAccountId : binding.account_id
+
+        if (boundAccountId !== null && getAccountSync(boundAccountId)) {
+            accountId = boundAccountId
+            newAccount = false
+            updateAccountSync({ id: accountId, lastLoginTime: getRealNow() })
+            if (binding === null) {
+                // 只有 grant 作证：补写 binding，这台设备从此不再依赖会过期的 grant
+                // （闸门的 device_bindings 分支不判有效期）。
                 insertDeviceBindingSync(deviceId, accountId)
             }
+            // Clean all old sessions for this account, reuse first token
+            const sessions = getAccountSessionsOfTypeSync(accountId, SessionType.VIEWER)
+            if (sessions.length > 0) {
+                viewerId = parseInt(sessions[0].token)
+                deleteAccountSessionsOfTypeSync(accountId, SessionType.VIEWER)
+            }
         } else {
-            // New device → create account
+            // 建号：① 已知设备但账号已被删（binding 悬空；闸门此时必然已拒，这里是纵深防御）
+            // ② 闸门关着（本地/单机）③ 命中服主自测白名单。
+            if (binding !== null) deleteDeviceBindingSync(deviceId)
             const identity = identityProvider.resolveCnSignup({ appId: "wf_cn" })
             const account = insertAccountSync({
                 appId: "wf_cn", ...identity, status: "normal"
@@ -135,6 +136,24 @@ const routes = async (fastify: FastifyInstance) => {
             const player = insertDefaultPlayerSync(accountId)
             saveAccountDefaultPlayer(accountId, player.id)
             insertDeviceBindingSync(deviceId, accountId)
+            // 闸门开着却走到建号 = 这台设备没经过闸门作证（只可能是白名单）：留痕，便于回头
+            // 把它的设备号从白名单里捞出来。闸门关着属正常，不写审计也不打日志。
+            if (bindGate.reason === "udid_exempt") {
+                appendBindAuditSync({
+                    action: "register",
+                    accountId,
+                    detail: {
+                        reason: "gate_exempt_signup",
+                        device_id: deviceId,
+                        udid: bindGate.udid,
+                        exempt_token: bindGate.exemptToken,
+                    },
+                    actor: "cn-signup",
+                })
+                console.warn(
+                    `[SIGNUP] 白名单放行的设备建了新账号 device_id=${deviceId} account_id=${accountId}`,
+                )
+            }
         }
 
         if (!viewerId) {

@@ -507,11 +507,64 @@ test("开闸：只有未过期 grant、没有 device_bindings 的 active 设备 
     bindPrimary(accountId)
     getDb().prepare("DELETE FROM device_bindings WHERE device_id = ?").run(deviceId)
     setGate("1")
+    const accountsBefore = accountCount()
 
     const body = decodeMsgpack(await signupRequest(deviceId))
 
     assert.equal(body.data_headers.result_code, 1)
+    // 闸门认定的主体就是这台设备的账号（bind-gate.ts 的 device_bindings ∪ grant），
+    // /tool/signup 必须认同一件事 —— 否则玩家主号之外会多出一个空账号（主号/游戏号分裂）。
+    assert.equal(body.data.newAccount, 0, "闸门用 grant 作证时必须复用同一个账号")
+    assert.equal(body.data.roleName, `Player${accountId}`)
+    assert.equal(accountCount(), accountsBefore, "不得为这台设备另建空账号")
+    const healed = deviceBindingRow(deviceId)
+    assert.ok(healed, "放行时补写 device_bindings，此后不再依赖会过期的 grant")
+    assert.equal(healed.account_id, accountId)
     assert.equal(gateRejectAudits().length, 0)
+})
+
+test("开闸：白名单设备（无 binding 无 grant）→ 放行但仍建号，并留下可追查的审计", async () => {
+    setGate("1")
+    const deviceId = nextDeviceId()
+    setExempt(String(deviceId))
+
+    const body = decodeMsgpack(await signupRequest(deviceId))
+
+    assert.equal(body.data_headers.result_code, 1, "白名单设备必须放行")
+    assert.equal(body.data.newAccount, 1, "没有任何主体作证，只能建新账号")
+    const created = Number(body.data.roleName.slice("Player".length))
+    const audits = getDb()
+        .prepare("SELECT * FROM bind_audit WHERE action = 'register' ORDER BY id DESC")
+        .all()
+    const exemptAudit = audits
+        .map(row => ({ row, detail: JSON.parse(row.detail) }))
+        .find(item => item.detail.reason === "gate_exempt_signup")
+    assert.ok(exemptAudit, "白名单放行建号必须留审计（否则没人能回头把它从白名单里捞出来）")
+    assert.equal(exemptAudit.row.actor, "cn-signup")
+    assert.equal(exemptAudit.row.account_id, created)
+    assert.equal(exemptAudit.detail.device_id, deviceId)
+    assert.equal(String(exemptAudit.detail.exempt_token), String(deviceId))
+    assert.ok(deviceBindingRow(deviceId), "新账号同样要登记设备")
+})
+
+test("关闸：白名单变量即使配了也不生效（闸门关着就没有白名单这条路）", async () => {
+    // 闸门关着 = 本地/单机形态：任何设备都走隐式建号，且不得写「白名单放行」审计。
+    const deviceId = nextDeviceId()
+    setExempt(String(deviceId))
+
+    const body = decodeMsgpack(await signupRequest(deviceId))
+
+    assert.equal(body.data_headers.result_code, 1)
+    assert.equal(body.data.newAccount, 1)
+    const audits = getDb()
+        .prepare("SELECT * FROM bind_audit WHERE action = 'register' ORDER BY id DESC")
+        .all()
+        .map(row => JSON.parse(row.detail))
+    assert.equal(
+        audits.some(detail => detail.reason === "gate_exempt_signup"),
+        false,
+        "闸门关着的隐式建号是正常路径，不该记成白名单异常",
+    )
 })
 
 test("开闸：BIND_GATE_EXEMPT_UDIDS 白名单放行（服主自测口子）", async () => {
