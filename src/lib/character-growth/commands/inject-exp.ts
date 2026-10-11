@@ -1,5 +1,5 @@
 import { getDb } from "../../../data/db"
-import { getPlayerSync } from "../../../data/domains/player"
+import { collectPlayerDataPooledExpSync, getPlayerSync } from "../../../data/domains/player"
 import { updatePlayerCharacterSync } from "../../../data/domains/character"
 import { incrementActiveMissionInjectedExpCountSync } from "../../../data/domains/active_mission_counters"
 import { publishActiveMissionOwnerStateWithinTransaction } from "../../mission/active-publication-owner"
@@ -58,6 +58,12 @@ export function executeInjectCharacterExp(command: InjectCharacterExpCommand): I
         const before = context.character()
         const player = getPlayerSync(command.playerId)
         if (player === null) throw growthError("INVALID_GROWTH_STATE", "player is unavailable.")
+        // 经验池按真实时间每分钟累积,但累积只在登录/基础响应里落地
+        // (collectPlayerDataPooledExpSync),客户端则按 exp_pool + 已过分钟数自行渲染
+        // 池(ticker)。扣款前必须先结算这段累积,否则玩家点「全部」整额注入客户端
+        // 渲染值,必然大于库内值而被判超额、以未变更事实回滚——实测表现为「角色升级
+        // 时把经验值用光后,等级退回使用前状态」。
+        collectPlayerDataPooledExpSync(player)
         if (command.addExp > player.expPool) {
             throw growthError("INSUFFICIENT_EXP", "player does not have enough exp pool.")
         }

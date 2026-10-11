@@ -194,3 +194,79 @@ test("inject_exp leaves the save untouched when the pool is insufficient", () =>
         fixture.cleanup()
     }
 })
+
+// 回归(用户实测):「角色升级时,把经验值用光后,等级会重置为使用前状态」。
+// 经验池按真实时间每分钟累积,但累积只在登录/基础响应里落地;客户端按
+// exp_pool + 已过分钟数自行渲染池。扣款前不结算这段累积时,玩家点「全部」整额
+// 注入客户端渲染值必然大于库内值 ⇒ 被判超额 ⇒ 以未变更事实回滚,玩家看到等级
+// 退回使用前状态。修复:注入事务内先 collectPlayerDataPooledExpSync。
+test("inject_exp settles the real-time pool accrual before spending", () => {
+    const fixture = createCharacterGrowthC4Fixture()
+    try {
+        // 3 星角色 + 界限突破 4 档:经验帽 125223,本用例不触发溢出
+        const playerId = fixture.createPlayer()
+        fixture.setPlayer(playerId, {
+            expPool: 1000,
+            expPooledTime: new Date(Date.now() - 10 * 60 * 1000),
+        })
+        fixture.addCharacter(playerId, 341005, { exp: 10, overLimitStep: 4 })
+        const anchorBefore = fixture.setPlayer(playerId, {}).expPooledTime.getTime()
+
+        // 客户端渲染值 = 1000 + 10 分钟累积 = 1010:必须能整额注入并恰好花光
+        const settled = exp.executeInjectCharacterExp({
+            playerId,
+            characterId: 341005,
+            addExp: 1010,
+            evaluationTime: new Date("2026-08-31T00:00:00.000Z"),
+        })
+        assert.equal(settled.addExpList[0].add_exp, 1010, "客户端渲染值必须能整额注入")
+        assert.equal(settled.expPool, 0, "结算累积后必须恰好花光经验池")
+        const after = fixture.setPlayer(playerId, {})
+        assert.equal(after.expPool, 0, "库内经验池必须为 0,而不是负数")
+        assert.ok(
+            after.expPooledTime.getTime() > anchorBefore,
+            "结算后锚点必须推进到本次注入",
+        )
+        assert.equal(
+            fixture.db.prepare(
+                "SELECT exp FROM players_characters WHERE player_id = ? AND id = ?",
+            ).get(playerId, 341005).exp,
+            1020,
+            "角色经验必须整额加上 1010",
+        )
+
+        // 对照:锚点在当下时,超额注入仍旧整体拒绝(未变更事实的既有契约)
+        const strictPlayer = fixture.createPlayer()
+        fixture.setPlayer(strictPlayer, { expPool: 100, expPooledTime: new Date() })
+        fixture.addCharacter(strictPlayer, 341005, { exp: 50, overLimitStep: 4 })
+        assert.throws(
+            () => exp.executeInjectCharacterExp({
+                playerId: strictPlayer,
+                characterId: 341005,
+                addExp: 101,
+                evaluationTime: new Date("2026-08-31T00:00:00.000Z"),
+            }),
+            error => error.code === "INSUFFICIENT_EXP",
+        )
+        assert.equal(fixture.setPlayer(strictPlayer, {}).expPool, 100, "被拒时经验池不得被扣减")
+
+        // 实盘形态:池 105000 已越过上限 100000 ⇒ 累积恒为 0、锚点冻结,
+        // 客户端显示被自身上限夹在 100000 ⇒「用光」仍需可整额注入
+        const cappedPlayer = fixture.createPlayer()
+        fixture.setPlayer(cappedPlayer, {
+            expPool: 105000,
+            expPooledTime: new Date(Date.now() - 10 * 60 * 1000),
+        })
+        fixture.addCharacter(cappedPlayer, 341005, { exp: 10, overLimitStep: 4 })
+        const capped = exp.executeInjectCharacterExp({
+            playerId: cappedPlayer,
+            characterId: 341005,
+            addExp: 100000,
+            evaluationTime: new Date("2026-08-31T00:00:00.000Z"),
+        })
+        assert.equal(capped.overflowExp, 0, "上限内注入不得溢出")
+        assert.equal(capped.expPool, 5000, "超上限池注入后必须保留超出的 5000")
+    } finally {
+        fixture.cleanup()
+    }
+})

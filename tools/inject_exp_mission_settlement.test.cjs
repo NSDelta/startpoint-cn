@@ -238,6 +238,42 @@ async function main() {
             bondMissionInfo.some(entry => entry.mission_category_id === 1 && entry.mission_id === 39),
             "注入响应的 mission_info 必须包含任务 39",
         )
+
+        // 经验池累积结算(用户实测:「角色升级时,把经验值用光后,等级会重置为使用
+        // 前状态」):客户端按 exp_pool + 已过分钟数渲染池,若注入前不结算这段累积,
+        // 整额「用光」必然大于库内值 ⇒ 200 + 未变更事实回滚。此处锚点回拨 10 分钟,
+        // 注入客户端渲染值 1010 必须成功,且响应里的池/锚点必须是结算后的真值。
+        const accruePlayer = await createPlayer()
+        insertDefaultPlayerCharacterSync(accruePlayer.playerId, CHARACTER_ID)
+        updatePlayerSync({
+            id: accruePlayer.playerId,
+            expPool: 1000,
+            expPooledTime: new Date(Date.now() - 10 * 60 * 1000),
+        })
+        const anchorBefore = getPlayerSync(accruePlayer.playerId).expPooledTime.getTime()
+        const injectAccrued = await post(fastify, "/api/index.php/expod/inject_exp", {
+            viewer_id: accruePlayer.viewerId,
+            character_id: CHARACTER_ID,
+            exp: 1010, // 客户端显示值:库内 1000 + 10 分钟累积
+        })
+        assert.equal(injectAccrued.statusCode, 200, injectAccrued.body)
+        const accruedBody = decode(injectAccrued).data
+        assert.equal(
+            accruedBody.add_exp_list[0].add_exp,
+            1010,
+            "客户端渲染的整额注入必须被接受,而不是回未变更事实",
+        )
+        assert.equal(
+            accruedBody.user_info.exp_pool,
+            0,
+            "响应必须携带结算累积后的池(恰好花光)",
+        )
+        const accruedPlayer = getPlayerSync(accruePlayer.playerId)
+        assert.equal(accruedPlayer.expPool, 0, "库内经验池必须为 0,而不是负数")
+        assert.ok(
+            accruedPlayer.expPooledTime.getTime() > anchorBefore,
+            "结算后锚点必须推进,否则客户端会继续渲染幻影累积",
+        )
     } finally {
         await fastify.close()
         cleanup()
