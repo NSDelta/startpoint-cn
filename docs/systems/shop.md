@@ -90,6 +90,10 @@ GeneralShop 额外通过 `cdn_general_shop_whitelist.json` 过滤客户端主数
 
 新角色成功入库后仍经过觉醒解锁响应协调。该协调位于兑换事务提交后且为 fail-soft，不改变兑换扣款与奖励的原子结果。
 
+**拒绝一律走客户端 A-error 通道。** 可预期的业务拒绝——余额不足、角色或装备已持有、兑换条目未知——都是「客户端本地视图已过期」，因此以 HTTP 200、MsgPack 响应和 `data_headers.result_code=2053`（`ItemShopPeriodError`）表达，并只回传当前余额与空增量列表（未变更事实），不写任何存档。客户端把 2053 映射为 `item_buy_dialog_partly_outdated`（「内容已过期」）温和提示；`ExchangeStarCrumbRealRemote` 的 `errorHandler` 只识别 2053/3006/3010，其它结果码与**任意 HTTP 4xx** 都会落入 `defaultErrorHandler`，渲染成「发生意想不到的错误」硬错误弹窗并清空客户端请求队列（实测表现：同一角色连续兑换第 2 次即报错）。只有服务端自身故障（无绑定玩家、成本表缺失或非法、数据库异常）仍返回 HTTP 500 JSON。
+
+一次兑换请求只带 `exchange_id`，**没有数量字段**；玩家一次选择 N 个由客户端连续发送 N 次请求，因此这条拒绝语义直接决定「一次换多个」是否可用。
+
 ## Boss 币与活动商店
 
 Boss 币列表严格按客户端传入的 category ID 查询 `boss_coin_shop.json`。分类不存在时返回空集合，不猜测相邻分类，也不把其他活动商品混入。

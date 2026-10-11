@@ -261,10 +261,41 @@ test("star crumb character exchange commits typed grant and absolute response", 
     assert.equal(payload.data.over_max, null)
 })
 
-test("star crumb character exchange rejects an already owned character without writes", async () => {
+test("star crumb character exchange answers a duplicate with the stale-view result, never a hard error", async () => {
     const { playerId, viewerId } = await createPlayer("star-crumb-character-duplicate")
     updatePlayerSync({ id: playerId, starCrumb: 1000 })
     insertDefaultPlayerCharacterSync(playerId, 111001)
+
+    // 客户端一次兑换 = 一次请求：`ExchangeStarCrumbRealRemote` 的请求体只有
+    // exchange_id，没有数量字段，所以玩家「一次换 7 个」就是同一条 /star_crumb 连打
+    // 7 次。旧行为是第 2 次起 HTTP 400 "Character already owned."，CN 客户端把 4xx
+    // 渲染成硬错误弹窗（「发生意想不到的错误」）并 clearQueue；新行为是每一次拒绝都
+    // 回 HTTP 200 + result_code 2053（ItemShopPeriodError ⇒ 客户端
+    // item_buy_dialog_partly_outdated 温和提示）+ 未变更事实。
+    for (let attempt = 1; attempt <= 7; attempt += 1) {
+        const response = await app.inject({
+            method: "POST",
+            url: "/exchange/star_crumb",
+            payload: { viewer_id: viewerId, exchange_id: 1, api_count: attempt },
+        })
+
+        assert.equal(response.statusCode, 200, `第 ${attempt} 次：${response.body}`)
+        assert.match(response.headers["content-type"], /application\/x-msgpack/)
+        const payload = unpack(Buffer.from(response.body, "base64"))
+        assert.equal(payload.data_headers.result_code, 2053, `第 ${attempt} 次`)
+        assert.equal(payload.data.user_info.star_crumb, 1000, `第 ${attempt} 次`)
+        assert.deepEqual(payload.data.character_list, [], `第 ${attempt} 次`)
+        assert.deepEqual(payload.data.item_list, {}, `第 ${attempt} 次`)
+        assert.deepEqual(payload.data.equipment_list, [], `第 ${attempt} 次`)
+        assert.equal(payload.data.over_max, null, `第 ${attempt} 次`)
+        assert.equal(payload.data.mail_arrived, false, `第 ${attempt} 次`)
+        assert.equal(getPlayerSync(playerId).starCrumb, 1000, `第 ${attempt} 次`)
+    }
+})
+
+test("star crumb exchange answers a shortage with the stale-view result and no writes", async () => {
+    const { playerId, viewerId } = await createPlayer("star-crumb-shortage")
+    updatePlayerSync({ id: playerId, starCrumb: 100 })
 
     const response = await app.inject({
         method: "POST",
@@ -272,9 +303,14 @@ test("star crumb character exchange rejects an already owned character without w
         payload: { viewer_id: viewerId, exchange_id: 1, api_count: 1 },
     })
 
-    assert.equal(response.statusCode, 400)
-    assert.equal(JSON.parse(response.body).message, "Character already owned.")
-    assert.equal(getPlayerSync(playerId).starCrumb, 1000)
+    assert.equal(response.statusCode, 200, response.body)
+    assert.match(response.headers["content-type"], /application\/x-msgpack/)
+    const payload = unpack(Buffer.from(response.body, "base64"))
+    assert.equal(payload.data_headers.result_code, 2053)
+    assert.equal(payload.data.user_info.star_crumb, 100)
+    assert.deepEqual(payload.data.character_list, [])
+    assert.equal(getPlayerSync(playerId).starCrumb, 100)
+    assert.equal(getPlayerCharacterSync(playerId, 111001), null)
 })
 
 test("star crumb catalog is immutable per repository and resolves cost from typed rows", async () => {

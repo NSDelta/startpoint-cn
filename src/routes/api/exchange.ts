@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { getSession } from "../../data/domains/session";
+import { getPlayerSync } from "../../data/domains/player";
 import { resolvePlayerIdSync } from "../../data/activeAccount";
 import { generateDataHeaders } from "../../utils";
 import { publishCharacterGrowthOwnerStateBestEffort } from "../../lib/character-growth/owner-publication";
@@ -7,7 +8,9 @@ import { getMailArrivedSync } from "../../lib/mail-notification";
 import { getGameTimeContext } from "../../runtime/time/game-time";
 import {
     executeStarCrumbExchangeSync,
+    projectStarCrumbExchangeRefusalResponse,
     projectStarCrumbExchangeResponse,
+    STALE_CLIENT_VIEW_RESULT_CODE,
 } from "../../lib/star-crumb-exchange";
 import {
     executeBondTokenExchangeSync,
@@ -53,8 +56,26 @@ const routes = async (fastify: FastifyInstance) => {
 
         const result = executeStarCrumbExchangeSync({ playerId, exchangeId });
         if (!result.ok) {
-            return reply.status(result.kind === "badRequest" ? 400 : 500).send({
-                error: result.kind === "badRequest" ? "Bad Request" : "Internal Server Error",
+            if (result.kind === "badRequest") {
+                // 可预期的业务拒绝（余额不足 / 角色或装备已持有 / 条目未知）都是
+                // 「客户端本地视图已过期」，不是传输或服务端故障：必须以 HTTP 200 +
+                // 非成功 result_code 表达。CN 1.8.1 的 ExchangeStarCrumbRealRemote
+                // 只把 2053/3006/3010 当业务失败处理，其余（含任意 4xx）一律
+                // defaultErrorHandler ⇒ 硬错误弹窗 + clearQueue，玩家看到「发生
+                // 意想不到的错误」并被踢回标题。这里不写任何存档，只把当前余额原样
+                // 回传，让客户端刷新后自行重试。
+                reply.header("content-type", "application/x-msgpack");
+                return reply.status(200).send(projectStarCrumbExchangeRefusalResponse({
+                    dataHeaders: generateDataHeaders({
+                        viewer_id: viewerId,
+                        result_code: STALE_CLIENT_VIEW_RESULT_CODE,
+                    }),
+                    starCrumb: getPlayerSync(playerId)?.starCrumb ?? 0,
+                    mailArrived: getMailArrivedSync(playerId),
+                }));
+            }
+            return reply.status(500).send({
+                error: "Internal Server Error",
                 message: result.message,
             });
         }

@@ -12,6 +12,9 @@ export {
     type StarCrumbExchangeSuccess,
 } from "./owner"
 export {
+    projectStarCrumbExchangeRefusalResponse,
     projectStarCrumbExchangeResponse,
+    STALE_CLIENT_VIEW_RESULT_CODE,
+    type StarCrumbExchangeRefusalInput,
     type StarCrumbExchangeResponseInput,
 } from "./response-projector"

@@ -8,7 +8,9 @@ const path = require("node:path")
 const test = require("node:test")
 
 const {
+    projectStarCrumbExchangeRefusalResponse,
     projectStarCrumbExchangeResponse,
+    STALE_CLIENT_VIEW_RESULT_CODE,
 } = require("../src/lib/star-crumb-exchange/response-projector")
 const {
     projectBondTokenExchangeResponse,
@@ -61,6 +63,34 @@ test("star crumb projection keeps frozen nulls and applies entity whitelists", (
     assert.equal(response.fund_receive_list, null)
     assert.equal(response.monthly_charge_bonus_info, null)
     assert.equal(response.crazy_gacha_result_list, null)
+})
+
+test("star crumb refusal projection carries the stale-view result code and unchanged facts", () => {
+    // 2053 = ItemShopPeriodError：CN 1.8.1 客户端在 star crumb 兑换这条 remote 上
+    // 唯一能温和提示的结果码（见 ExchangeStarCrumbRealRemote.errorHandler 的 kind 8
+    // 分支），用于「余额不足 / 已持有 / 条目未知」这类本地视图过期。响应体必须与成功
+    // 响应同形，但不含任何增量，避免客户端误判为兑换成功。
+    assert.equal(STALE_CLIENT_VIEW_RESULT_CODE, 2053)
+    const response = projectStarCrumbExchangeRefusalResponse({
+        dataHeaders: { viewer_id: 900, result_code: STALE_CLIENT_VIEW_RESULT_CODE },
+        starCrumb: 1000,
+        mailArrived: false,
+    })
+    assert.equal(response.data_headers.result_code, 2053)
+    assert.deepEqual(response.data.user_info, { star_crumb: 1000 })
+    assert.deepEqual(response.data.character_list, [])
+    assert.deepEqual(response.data.item_list, {})
+    assert.deepEqual(response.data.equipment_list, [])
+    assert.equal(response.data.mission_info, null)
+    assert.equal(response.data.over_max, null)
+    assert.equal(response.data.mail_arrived, false)
+    assert.equal(response.data.active_mission_list, null)
+    assert.equal(response.data.config, null)
+    assert.equal(response.data.user_daily_challenge_point_list, null)
+    assert.equal(response.data.encyclopedia_info, null)
+    assert.equal(response.data.fund_receive_list, null)
+    assert.equal(response.data.monthly_charge_bonus_info, null)
+    assert.equal(response.data.crazy_gacha_result_list, null)
 })
 
 test("star crumb projection rejects non-canonical entity identity", () => {
