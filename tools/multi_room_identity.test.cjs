@@ -220,7 +220,14 @@ test("room routes derive raising state from the injected coordinator status", as
     ]
     for (const route of routes) {
         for (const [role, viewerId, expectedState] of [
-            ["guest", 202, 2],
+            // 已在房内的成员回房时不再被投影成「等待队长」的 2：战斗期间客户端会主动断开
+            // 房间 socket，队长必然 hostOnline=false，回房者拿 2 会在约 15 秒后判失败并上报
+            // create_room_failure（缺路由时就是 No.H404）。见 src/multi/http/join-result.ts 的
+            // projectRoomRaisingState；非成员的等待语义由下面的 stranger 覆盖。
+            ["guest", 202, 1],
+            // 非成员：select/prepare 走「等待队长」的 2（本次未改动的原语义），
+            // restore 对非成员本来就是不可用路径（13）。
+            ["stranger", 303, route.name === "restore" ? 13 : 2],
             ["host", 101, 1],
         ]) {
             await t.test(`${route.name}: ${role}`, async () => {

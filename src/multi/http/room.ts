@@ -9,6 +9,7 @@ import type { CoordinatorErrorCode } from "../coordinator/contracts";
 import { classifyRoomJoin } from "./join-result";
 import {
     prepareFailureRaisingState,
+    projectRoomRaisingState,
     restoreRoomUnavailableRaisingState,
 } from "./join-result";
 import { issueRoomAdmission } from "./room-admission";
@@ -115,11 +116,12 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
         }
 
         const data = serializeRoomStatusConnection(room.value, context.tcpEndpoint?.());
-        if (viewerId === room.value.host.viewerId) {
-            data.raising_state = 1
-        } else if (!room.value.hostOnline) {
-            data.raising_state = 2
+        const projection = projectRoomRaisingState(room.value, viewerId)
+        data.raising_state = projection.raisingState
+        if (projection.hostOffline) {
             console.log(`[MULTI] prepare: host offline, guest polls raising_state → 2`)
+        } else if (projection.returningMember) {
+            console.log(`[MULTI] prepare: returning member admitted, host offline`)
         }
 
         reply.header("content-type", "application/x-msgpack");
@@ -227,11 +229,12 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
             ...serializeRoomStatusConnection(room.value, context.tcpEndpoint?.()),
             is_same_room: true,
         };
-        if (viewerId === room.value.host.viewerId) {
-            data.raising_state = 1
-        } else if (!room.value.hostOnline) {
-            data.raising_state = 2
+        const projection = projectRoomRaisingState(room.value, viewerId)
+        data.raising_state = projection.raisingState
+        if (projection.hostOffline) {
             console.log(`[MULTI] restore_room: host offline, guest polls raising_state → 2`)
+        } else if (projection.returningMember) {
+            console.log(`[MULTI] restore_room: returning member admitted, host offline`)
         }
 
         reply.header("content-type", "application/x-msgpack");
@@ -326,6 +329,28 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
         if (!result.ok && result.error === "HUB_UNAVAILABLE") return hubUnavailable(reply);
         if (!result.ok && result.error !== "ROOM_NOT_FOUND") return forbidden(reply);
         console.log(result.ok ? "[MULTI] room disbanded" : "[MULTI] room already absent");
+
+        reply.header("content-type", "application/x-msgpack");
+        return reply.status(200).send({
+            "data_headers": generateDataHeaders({ viewer_id: viewerId }),
+            "data": {}
+        });
+    });
+
+    // ---- create_room_failure ----
+    // 客户端的「回到房间」失败时用 sendOnlyUserRequest 上报这条(不解析响应体,但错误仍走
+    // defaultErrorHandler)。缺这条路由就是 404 → 客户端 clearQueue + 「发生意想不到的错误
+    // 回到登录界面 (No.H404)」,把一次可恢复的失败升级成必须重登。
+    // 所以这里只做 ack:永不 4xx,连 viewer_id 非法也照回 200。
+    fastify.post("/create_room_failure", async (request: FastifyRequest, reply: FastifyReply) => {
+        const body = (request.body ?? {}) as { viewer_id?: unknown; type?: unknown };
+        const viewerId = typeof body.viewer_id === "number" && Number.isSafeInteger(body.viewer_id)
+            ? body.viewer_id
+            : 0;
+        // 诊断只记消毒后的局部量:多人日志不得直接序列化客户端身份或原始字段
+        // (tools/handshake_lifecycle.test.cjs 的 console 守卫会拦 body.* 与索引访问)。
+        const failureType = typeof body.type === "string" ? body.type.slice(0, 32).replace(/[^a-z_]/gi, "") : "";
+        console.log(`[MULTI] create_room_failure received type=${failureType}`);
 
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send({

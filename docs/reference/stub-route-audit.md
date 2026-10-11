@@ -43,6 +43,7 @@
 | `/shop/set_campaign_lineup_id` | 选择结果已按玩家、商店、活动持久化并检查冲突 |
 | `/character/set_illustration_settings` | 已校验六项数组与角色所有权后写入插画设置 |
 | 联机 `/disband_room` | 已广播解散消息并清理房间；空对象只是 HTTP 确认 |
+| 联机 `/create_room_failure` | 客户端「回到房间」失败时的 `sendOnlyUserRequest` 上报；服务端有意不记任何状态，只用 200 空 `data` 确认收到。缺它会让客户端把可恢复的回房失败升级为 (No.H404) 强制重登，所以它属于必须保留的确认路由，不是待补业务 |
 
 商店和自动连战的部分错误分支也会返回空 `data`，但同时通过 `data_headers.result_code` 传递客户端协议结果；
 审计时必须同时读取响应头对象，不能只搜索 `data: {}`。

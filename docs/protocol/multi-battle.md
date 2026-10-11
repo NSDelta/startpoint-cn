@@ -150,7 +150,7 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 
 ## 4. HTTP 路由族
 
-当前插件共注册 16 个多人 HTTP 路由，按职责分为四组。
+当前插件共注册 17 个多人 HTTP 路由，按职责分为四组。
 
 ### 4.1 房间发现与选择
 
@@ -170,6 +170,7 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 | `restore_room` | 已记录成员可恢复仍在进程内的房间；陌生玩家返回状态 13，缺失房间返回状态 9 |
 | `share_room` | 仅房主可提交，成功响应不含业务字段，也不提供真实分享或匹配队列 |
 | `disband_room` | 房间存在时仅房主可广播 Disbanded 并删除房间；房间已不存在时幂等成功 |
+| `create_room_failure` | 客户端「回到房间」失败时用 `sendOnlyUserRequest` fire-and-forget 上报的失败通知；服务端只回 200 ack、不读状态、不记为业务事实。这条路由必须存在且永不返回 4xx：客户端的 fire-and-forget 通道虽然不解析响应体，但任何 4xx 都会走 `defaultErrorHandler`，表现为「发生意想不到的错误 回到登录界面 (No.H404)」并清空请求队列，把一次可恢复的回房失败升级为必须重登 |
 
 ### 4.3 战斗生命周期
 
@@ -204,7 +205,7 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 | 值 | 当前语义 | 写入或返回时机 |
 |---:|---|---|
 | 1 | Ready | 房主进入 lobby；当局全部真人 Finalize 后由 coordinator 恢复为可重赛状态 |
-| 2 | Waiting | 新建房间初态；房主尚未进入时客人继续轮询 |
+| 2 | Waiting | 新建房间初态；房主尚未进入时客人继续轮询。只投影给尚未在房内的新加入者，见下文「回到房间」 |
 | 3 | Full | `select_room` 或 `prepare` 发现真人成员与待入场 admission 已达到 3 人 |
 | 4 | Battle | TCP lobby 收到房主 StartBattle 并固化当局成员后进入战斗 |
 | 9 | Missing | `select_room`、`prepare` 或 `restore_room` 找不到房间时返回 |
@@ -213,6 +214,12 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 状态 9 不会存入房间。客户端收到它时应把目标房间视为不存在或已经过期。
 
 `raising_state=3` 只表示本次加入请求没有获得真人席位；NPC 招募不会把房间改为 3，而是保持 1，直到开始战斗时直接进入 4。网络/Hub 故障不等同于房间不存在；只有 Coordinator 明确报告 `ROOM_NOT_FOUND` 时才投影为 9。
+
+### 5.1 「回到房间」的投影
+
+已经登记为该房成员（请求者 viewer 命中 `RoomStatus.members`）的请求者一律投影为 `raising_state=1`，即使房主此刻没有任何 lobby socket。客户端在离开房间场景进入战斗时会主动断开房间 socket（只有房间场景保活），房主因此必然被判 host offline；若回来的队友仍拿到 2，客户端会每 3 秒轮询一次、第 5 次（约 15 秒）判失败，并上报 `multi_battle_quest/create_room_failure`。
+
+`raising_state=2` 的等待语义只保留给尚未在房内的新加入者。这条投影不改写房间自身的 `raising_state`：战斗释放仍依赖 4 阻止新战斗与延迟释放重叠（[trusted-multi-hub](trusted-multi-hub.md) 的 Bye 语义不变）。三处投影统一由 `src/multi/http/join-result.ts` 的 `projectRoomRaisingState` 实现，`prepare`、`select_room` 和 `restore_room` 共用同一判断，避免某条路径漏改后再出现「回房等队长 15 秒」。回归见 `tools/multi_raising_state_mapping.test.cjs`。
 
 ## 6. TCP 握手与 lobby 流程
 

@@ -4,7 +4,7 @@ import { getQuestFromCategorySync } from "../../lib/quest-content"
 import { generateDataHeaders } from "../../utils"
 import { serializeRoomStatusConnection } from "../room/serializer"
 import { isValidMultiViewerId, type MultiHttpContext } from "./context"
-import { classifyRoomJoin, roomUnavailableRaisingState } from "./join-result"
+import { classifyRoomJoin, projectRoomRaisingState, roomUnavailableRaisingState } from "./join-result"
 import { resolveRoomEstablisherFollowStateSafeSync } from "../follow-policy"
 import { issueRoomAdmission } from "./room-admission"
 
@@ -205,11 +205,13 @@ export function registerLobbyRoutes(fastify: FastifyInstance, context: MultiHttp
         }
 
         const selectData = serializeRoomStatusConnection(room.value, context.tcpEndpoint?.())
+        const projection = projectRoomRaisingState(room.value, viewerId)
+        selectData.raising_state = projection.raisingState
         if (viewerId === room.value.host.viewerId) {
-            selectData.raising_state = 1
             console.log(`[MULTI] select_room: host override raising_state → 1`)
-        } else if (!room.value.hostOnline) {
-            selectData.raising_state = 2
+        } else if (projection.returningMember) {
+            console.log(`[MULTI] select_room: returning member admitted, host offline`)
+        } else if (projection.hostOffline) {
             console.log(`[MULTI] select_room: host offline, guest polls raising_state → 2`)
         }
 
