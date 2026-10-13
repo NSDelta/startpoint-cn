@@ -210,8 +210,20 @@ function replacePlatformArchives(
     }
 }
 
-// 冻结的 iOS 目录视图缓存：key = cdnRoot，扫描一次，之后不再重扫磁盘（含"不可用"状态）。
-const iosCompatCache = new Map<string, IosCompatState>()
+// 冻结的 iOS 目录视图缓存：一级键 = 快照实例（内容热重载换新快照后自动重扫），
+// 二级键 = cdnRoot + 补丁存在性指纹（双审 P1-4：仅按 cdnRoot 字符串键会让 reload 后的
+// iOS 视图永久滞留旧目录，Android/iOS 版本混用；本仓再叠一层补丁指纹，装包后免重启生效）。
+const iosCompatCache = new WeakMap<ContentSnapshot, Map<string, IosCompatState>>()
+
+/** 取（必要时新建）某个快照实例的二级缓存桶；快照实例回收后整桶随之回收。 */
+function iosCompatCacheBySnapshot(snapshot: ContentSnapshot): Map<string, IosCompatState> {
+    let byRoot = iosCompatCache.get(snapshot)
+    if (byRoot === undefined) {
+        byRoot = new Map()
+        iosCompatCache.set(snapshot, byRoot)
+    }
+    return byRoot
+}
 
 /**
  * 补丁来源的相对路径判定（`archive-ios-full/` 只可能来自官方基线）。
@@ -382,8 +394,12 @@ export function prepareIosCompat(
     cdnRoot: string,
     patchesRoot?: string | null,
 ): IosCompatState {
+    // 一级键 = 快照实例（上游修复：只按 cdnRoot 字符串做键，会让 provider.reload 换新快照后
+    // iOS 视图永久滞留旧目录、Android/iOS 版本混用）；二级键 = `cdnRoot` + 补丁存在性指纹
+    // （本仓加固：装包后无需重启即可重建视图）。
+    const byRoot = iosCompatCacheBySnapshot(snapshot)
     const cacheKey = iosCompatCacheKey(cdnRoot, patchesRoot)
-    const cached = iosCompatCache.get(cacheKey)
+    const cached = byRoot.get(cacheKey)
     if (cached !== undefined) return cached
     const resolvedPatchesRoot = patchesRoot ?? derivePatchesRoot(cdnRoot)
 
@@ -393,7 +409,7 @@ export function prepareIosCompat(
             kind: "unavailable",
             reason: "missing ios entity list",
         })
-        iosCompatCache.set(cacheKey, state)
+        byRoot.set(cacheKey, state)
         return state
     }
 
@@ -407,7 +423,7 @@ export function prepareIosCompat(
             kind: "unavailable",
             reason: "ios archive directory is unreadable",
         })
-        iosCompatCache.set(cacheKey, state)
+        byRoot.set(cacheKey, state)
         return state
     }
     // 补丁自带的 iOS 层：只取磁盘上确实存在、且大小与清单一致的 inner ZIP。
@@ -426,7 +442,7 @@ export function prepareIosCompat(
             kind: "unavailable",
             reason: "missing ios archive directories",
         })
-        iosCompatCache.set(cacheKey, state)
+        byRoot.set(cacheKey, state)
         return state
     }
     const mergedIosDiff: ReadonlyArray<CatalogArchive> = Object.freeze([
@@ -434,6 +450,8 @@ export function prepareIosCompat(
         ...patchArchives.map(candidate => candidate.archive),
     ])
 
+    // 本仓加固（保留）：单条 edge 缺 iOS platform 归档**不再**把整个 iOS 视图判为不可用；
+    // 上游的 `missing ios archive edge` 整体 503 分支刻意不吸收（真机 m06219：永久 503）。
     const replaced = snapshot.cdn.edges.map(edge => (
         replacePlatformArchives(edge, iosFull, mergedIosDiff, patchIosArchivePaths)
     ))
@@ -448,7 +466,7 @@ export function prepareIosCompat(
             kind: "unavailable",
             reason: "invalid ios entity list",
         })
-        iosCompatCache.set(cacheKey, state)
+        byRoot.set(cacheKey, state)
         return state
     }
     const state: IosCompatState = Object.freeze({
@@ -463,7 +481,7 @@ export function prepareIosCompat(
                 .sort((left, right) => left.localeCompare(right)),
         ]),
     })
-    iosCompatCache.set(cacheKey, state)
+    byRoot.set(cacheKey, state)
     return state
 }
 
@@ -524,7 +542,21 @@ function readEntityListInstalledBytes(cdnRoot: string, entityList: string): numb
     }
 }
 
-const iosAllowlistCache = new Map<string, ReadonlyMap<string, IosArchiveLocation>>()
+// 与视图缓存同构：一级键 = 快照实例（上游修复），二级键 = `cdnRoot` + 补丁存在性指纹。
+// 值类型仍是本仓的 IosArchiveLocation（含补丁落点/身份复核），不是上游的字节数映射。
+const iosAllowlistCache = new WeakMap<ContentSnapshot, Map<string, ReadonlyMap<string, IosArchiveLocation>>>()
+
+/** 同 iosCompatCacheBySnapshot：一级键 = 快照实例，二级键 = cdnRoot + 补丁指纹。 */
+function iosAllowlistCacheBySnapshot(
+    snapshot: ContentSnapshot,
+): Map<string, ReadonlyMap<string, IosArchiveLocation>> {
+    let byRoot = iosAllowlistCache.get(snapshot)
+    if (byRoot === undefined) {
+        byRoot = new Map()
+        iosAllowlistCache.set(snapshot, byRoot)
+    }
+    return byRoot
+}
 
 /**
  * `archive-ios-*` 独立 ZIP allowlist：仅包含冻结 iOS 目录视图中解析出的归档
@@ -540,8 +572,9 @@ export function getIosArchiveLocations(
 ): ReadonlyMap<string, IosArchiveLocation> {
     const state = prepareIosCompat(snapshot, cdnRoot, patchesRoot)
     if (state.kind !== "ready") return EMPTY_ARCHIVE_LOCATIONS
+    const byRoot = iosAllowlistCacheBySnapshot(snapshot)
     const cacheKey = iosCompatCacheKey(cdnRoot, patchesRoot)
-    const cached = iosAllowlistCache.get(cacheKey)
+    const cached = byRoot.get(cacheKey)
     if (cached !== undefined) return cached
 
     // 只有**补丁来源**的路径需要甄别：`snapshot.archiveSources` 不含 iOS 归档
@@ -602,7 +635,7 @@ export function getIosArchiveLocations(
         }
     }
     const frozen: ReadonlyMap<string, IosArchiveLocation> = Object.freeze(allowlist)
-    iosAllowlistCache.set(cacheKey, frozen)
+    byRoot.set(cacheKey, frozen)
     return frozen
 }
 

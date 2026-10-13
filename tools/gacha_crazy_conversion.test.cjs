@@ -16,6 +16,7 @@ const databaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gacha-crazy-c5-
 const previousDataDirectory = process.env.DATA_DIR
 process.env.DATA_DIR = databaseDirectory
 
+const { getCurrencyCapacityPolicySync } = require("../src/lib/config-content")
 const restoreContentSnapshot = require("./helpers/install-bundled-gameplay-snapshot.cjs")
     .installBundledGameplaySnapshot({
         additionalTableNames: [
@@ -49,7 +50,6 @@ const {
     projectPendingGachaConversionsSync,
     settleExpiredGachaPointsOnLoadSync,
 } = require("../src/lib/gacha-owner")
-const { getCurrencyCapacityPolicySync } = require("../src/lib/config-content")
 const gachaRoutes = require("../src/routes/api/gacha").default
 const cnLoadRoutes = require("../src/routes/cn/load").default
 const mailRoutes = require("../src/routes/api/mail").default
@@ -92,12 +92,6 @@ async function createPlayer(label) {
 
 function decode(response) {
     return unpack(Buffer.from(response.body, "base64"))
-}
-
-// 星屑上限以内容配置(assets/config.json 的 max_star_crumb)为准,不写死数值:
-// 上游已把它从 9999 调到 99999,写死会让"到达上限"的场景静默失效。
-function currentStarCrumbCap() {
-    return getCurrencyCapacityPolicySync().maxStarCrumb
 }
 
 function historyCount(playerId) {
@@ -275,9 +269,11 @@ test("Crazy select rolls rewards and slot clearing back on a late history failur
 
 test("expired points convert once, respect Star Crumb cap, mail overflow and ack once", async () => {
     const { playerId, viewerId } = await createPlayer("conversion")
-    // 按实际 cap 构造"还差 4 点到上限"的场景,配置以后再调也不脆。
-    const starCrumbCap = currentStarCrumbCap()
-    updatePlayerSync({ id: playerId, starCrumb: starCrumbCap - 4 })
+    // 上限绑定内容策略（生产 load 即传 currencyPolicy.maxStarCrumb；
+    // 10-06 assets/config.json 已将 max_star_crumb 调至 99999），
+    // 场景按「差 4 到上限」构造：兑换 10 点 → 收 4 溢 6
+    const maxStarCrumb = getCurrencyCapacityPolicySync().maxStarCrumb
+    updatePlayerSync({ id: playerId, starCrumb: maxStarCrumb - 4 })
     insertPlayerGachaInfoSync(playerId, {
         gachaId: EXPIRED_GACHA_ID,
         isDailyFirst: true,
@@ -288,7 +284,7 @@ test("expired points convert once, respect Star Crumb cap, mail overflow and ack
     const converted = settleExpiredGachaPointsOnLoadSync({
         playerId,
         nowMs: NOW_MS,
-        maxStarCrumb: starCrumbCap,
+        maxStarCrumb,
     })
     assert.equal(converted.status, "converted")
     assert.deepEqual(converted.entries.map(entry => ({
@@ -296,23 +292,24 @@ test("expired points convert once, respect Star Crumb cap, mail overflow and ack
         accepted: entry.acceptedStarCrumb,
         overflow: entry.overflowStarCrumb,
     })), [{ requested: 10, accepted: 4, overflow: 6 }])
-    assert.equal(getPlayerSync(playerId).starCrumb, starCrumbCap)
+    assert.equal(getPlayerSync(playerId).starCrumb, maxStarCrumb)
     assert.equal(getPlayerGachaInfoSync(playerId, EXPIRED_GACHA_ID).gachaExchangePoint, 0)
     const overflow = getPlayerMailsSync(playerId, 1, 100, true)
         .filter(mail => mail.type === MailType.STAR_CRUMB)
     assert.equal(overflow.length, 1)
     assert.equal(overflow[0].number, 6)
-    // 上游 596fce9b(超容量附件降级)+cca03807(上限 99999)后的语义:余额到上限时不再 400 阻塞,
-    // 而是跳过星屑附件(服务端告警)并把邮件标记为已领取。
-    const cappedClaim = await app.inject({
+    const blockedClaim = await app.inject({
         method: "POST",
         url: "/mail/receive",
         payload: { viewer_id: viewerId, mail_id: overflow[0].id, api_count: 1 },
     })
-    assert.equal(cappedClaim.statusCode, 200, cappedClaim.body)
-    assert.equal(getPlayerSync(playerId).starCrumb, starCrumbCap)
+    // 超容量领取以 400 容量错误呈现且邮件保留（花费后可再领）——
+    // 不消费邮件（否则溢出附件被静默丢失）
+    assert.equal(blockedClaim.statusCode, 400, blockedClaim.body)
+    assert.equal(getPlayerSync(playerId).starCrumb, maxStarCrumb)
     assert.equal(getPlayerMailsSync(playerId, 1, 100, true)
-        .some(mail => mail.id === overflow[0].id), false)
+        .some(mail => mail.id === overflow[0].id
+            && mail.receive_time === "0000-00-00 00:00:00"), true)
     assert.deepEqual(projectPendingGachaConversionsSync(playerId), [{
         gacha_id: EXPIRED_GACHA_ID,
         gacha_exchange_point: 10,
@@ -321,12 +318,11 @@ test("expired points convert once, respect Star Crumb cap, mail overflow and ack
     const repeatedSettlement = settleExpiredGachaPointsOnLoadSync({
         playerId,
         nowMs: NOW_MS,
-        maxStarCrumb: starCrumbCap,
+        maxStarCrumb,
     })
     assert.equal(repeatedSettlement.status, "none")
-    // 邮件已被上面那次领取消耗,重复结算不应再产生新的溢出邮件
     assert.equal(getPlayerMailsSync(playerId, 1, 100, true)
-        .filter(mail => mail.type === MailType.STAR_CRUMB).length, 0)
+        .filter(mail => mail.type === MailType.STAR_CRUMB).length, 1)
 
     const acknowledged = await app.inject({
         method: "POST",
@@ -341,7 +337,7 @@ test("expired points convert once, respect Star Crumb cap, mail overflow and ack
         payload: { viewer_id: viewerId, gacha_id: EXPIRED_GACHA_ID },
     })
     assert.equal(repeatedAck.statusCode, 200, repeatedAck.body)
-    assert.equal(getPlayerSync(playerId).starCrumb, starCrumbCap)
+    assert.equal(getPlayerSync(playerId).starCrumb, maxStarCrumb)
 })
 
 test("held extension ticket delays conversion until the last legal path disappears", async () => {
@@ -357,7 +353,7 @@ test("held extension ticket delays conversion until the last legal path disappea
     const delayed = settleExpiredGachaPointsOnLoadSync({
         playerId,
         nowMs: NOW_MS,
-        maxStarCrumb: currentStarCrumbCap(),
+        maxStarCrumb: 9999,
     })
     assert.equal(delayed.status, "none")
     assert.equal(getPlayerGachaInfoSync(playerId, EXTENDED_GACHA_ID).gachaExchangePoint, 7)
@@ -366,7 +362,7 @@ test("held extension ticket delays conversion until the last legal path disappea
     const converted = settleExpiredGachaPointsOnLoadSync({
         playerId,
         nowMs: NOW_MS,
-        maxStarCrumb: currentStarCrumbCap(),
+        maxStarCrumb: 9999,
     })
     assert.equal(converted.status, "converted")
     assert.equal(getPlayerGachaInfoSync(playerId, EXTENDED_GACHA_ID).gachaExchangePoint, 0)
@@ -639,7 +635,7 @@ test("points on a banner missing from the content snapshot convert and do not bl
     const converted = settleExpiredGachaPointsOnLoadSync({
         playerId,
         nowMs: NOW_MS,
-        maxStarCrumb: currentStarCrumbCap(),
+        maxStarCrumb: 9999,
     })
     assert.equal(converted.status, "converted")
     assert.equal(getPlayerSync(playerId).starCrumb, starCrumbBefore + 5)

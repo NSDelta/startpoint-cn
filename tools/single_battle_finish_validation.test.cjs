@@ -109,6 +109,7 @@ async function assertRejectedWithoutWrites(harness, {
     playerOverrides,
     messagePattern = /active quest|settlement identity|boost points/i,
     expectPersistedActive = true,
+    lateFinishTerminal = false,
 }) {
     resetSettlement(harness)
     if (playerOverrides) harness.updatePlayer(playerOverrides)
@@ -127,56 +128,13 @@ async function assertRejectedWithoutWrites(harness, {
     })
     const after = captureSettlementState(harness)
 
-    assert.equal(measured.value.statusCode, 400)
-    assert.match(measured.value.message, messagePattern)
+    // 迟到 finish（payload/内存中的 play_id 与当前局不一致）走幂等零奖励
+    // 终态（200）而非 400——与多人路径同型，不结算、不消费活跃任务
+    assert.equal(measured.value.statusCode, lateFinishTerminal ? 200 : 400)
+    if (!lateFinishTerminal) assert.match(measured.value.message, messagePattern)
     assert.equal(measured.sql.writeStatements, 0)
     assert.deepEqual(after, before)
     assert.equal(after.settlement.databaseActive !== null, expectPersistedActive)
-    assert.notEqual(after.settlement.memoryActive, null)
-}
-
-// 旧局迟到的 finish：活跃任务的 play_id 与请求不一致时，服务端按幂等零奖励终态
-// 应答（HTTP 200），不结算、不写库、不删除活跃任务 —— 见
-// src/routes/api/singleBattleQuest.ts:143-179（上游「单人路径补齐多人路径同型校验」）。
-async function assertStaleFinishIgnored(harness, {
-    name,
-    activeOverrides = {},
-    memoryMutation,
-    persistedMutation,
-    payloadOverrides = {},
-}) {
-    resetSettlement(harness)
-    const playId = `gate-task-19-${name}`
-    const activeQuest = {
-        ...harness.createActiveQuest({ playId }),
-        ...activeOverrides,
-    }
-    harness.insertActiveQuest(activeQuest)
-    memoryMutation?.(activeQuest)
-    persistedMutation?.(harness)
-    const before = captureSettlementState(harness)
-    const measured = await measureFinish(harness, {
-        ...harness.finishPayload({ playId }),
-        ...payloadOverrides,
-    })
-    const after = captureSettlementState(harness)
-
-    assert.equal(measured.value.statusCode, 200)
-    assert.equal(measured.value.data.category_id, activeQuest.category)
-    assert.equal(measured.value.data.is_multi, "single")
-    assert.equal(measured.value.data.clear_rank, 0)
-    assert.deepEqual(measured.value.data.character_list, [])
-    assert.deepEqual(measured.value.data.add_exp_list, [])
-    assert.deepEqual(measured.value.data.drop_score_reward_ids, [])
-    assert.deepEqual(measured.value.data.drop_rare_reward_ids, [])
-    assert.deepEqual(measured.value.data.drop_additional_reward_ids, [])
-    assert.deepEqual(measured.value.data.drop_periodic_reward_ids, [])
-    assert.equal(measured.value.data.rewards.reward_mana, 0)
-    assert.equal(measured.value.data.rewards.field_mana, 0)
-    assert.equal(measured.value.data.rewards.reward_pool_exp, 0)
-    assert.equal(measured.sql.writeStatements, 0)
-    assert.deepEqual(after, before)
-    assert.notEqual(after.settlement.databaseActive, null)
     assert.notEqual(after.settlement.memoryActive, null)
 }
 
@@ -245,10 +203,10 @@ test("single finish validates settlement authority before writing", async t => {
     await withSingleBattleHarness("finish-validation", async harness => {
         const rejectionCases = [
             {
-                title: "ignores a mismatched play_id as a stale finish",
+                title: "returns an idempotent terminal state for a mismatched play_id",
                 name: "play-id-mismatch",
                 payloadOverrides: { play_id: "different-play-id" },
-                stale: true,
+                lateFinishTerminal: true,
             },
             ...[
                 ["quest_id", MAIN_QUEST_ID + 1],
@@ -282,12 +240,12 @@ test("single finish validates settlement authority before writing", async t => {
                 `).run("persisted-different-play-id", current.playerId),
             },
             {
-                title: "ignores a memory-only identity mismatch as a stale finish",
+                title: "returns an idempotent terminal state for a memory-only identity mismatch",
                 name: "memory-identity-mismatch",
                 memoryMutation: activeQuest => {
                     activeQuest.playId = "memory-different-play-id"
                 },
-                stale: true,
+                lateFinishTerminal: true,
             },
             {
                 title: "rejects a missing persisted active quest",
@@ -354,12 +312,8 @@ test("single finish validates settlement authority before writing", async t => {
             },
         ]
 
-        for (const { title, stale, ...scenario } of rejectionCases) {
-            await t.test(title, () => (
-                stale
-                    ? assertStaleFinishIgnored(harness, scenario)
-                    : assertRejectedWithoutWrites(harness, scenario)
-            ))
+        for (const { title, ...scenario } of rejectionCases) {
+            await t.test(title, () => assertRejectedWithoutWrites(harness, scenario))
         }
 
         for (const boost of [

@@ -1,7 +1,8 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import { describeError } from "../describe-error";
 import { getRealNow } from "../../runtime/time/game-time";
 import { MultiStartBody, MultiFinishBody, MultiAbortBody, PlayContinueBody } from "../types";
-import { generateDataHeaders, realToVirtual } from "../../utils";
+import { generateDataHeaders, getServerTime, realToVirtual } from "../../utils";
 import { getRoom, disbandRoom } from "../room/manager";
 import { sessionManager } from "../state/SessionManager";
 import {
@@ -50,9 +51,16 @@ import { buildFinishFollowInfo } from "../../lib/quest/finish/follow-info";
 import { resolveRoomEstablisherFollowStateSync } from "../follow-policy";
 import { getLocalFollowRelationSync } from "../../data/domains/follow";
 import { getPlayerMailCountSync } from "../../data/domains/mail";
+import { cacheFinishResponse, getCachedFinishResponse } from "../finish-response-cache";
 import { mergeCommonResponseFragments } from "../../lib/common-response/merge";
 import { resolveLocalRescueFragmentEligibility } from "../rescue-fragment-reward";
 import { isNewbieHostSync } from "../../lib/newbie-host";
+import {
+    findOpenRecruitmentByKey,
+    hasActiveDelivery,
+    recordResponse,
+    type AttentionRecruitment,
+} from "../../data/domains/attention";
 import { withEntryItemInventoryWithinTransactionSync } from "../../lib/quest/entry-item-inventory";
 
 export function canAbortMultiBattle(
@@ -75,6 +83,31 @@ export function cleanupAbortedMultiBattle(
     }
     sessionManager.removeBattleParticipant(roomNumber, participant);
     return false;
+}
+
+/**
+ * 铃铛进房解析：key 指向的招募必须 open，且房间号/房主与当前战斗一致，且该
+ * viewer 持有有效投递行（T2 门票：delivered/accepted 持票，declined 无票——
+ * attention_key 只经 check 下发，无票即伪造）；任何失败（含 DB 异常）fail-open
+ * 为 null 退回实时 isNewbieHostSync 判定。导出供回归测试直接锁定语义。
+ */
+export function resolveBellRecruitmentForStart(
+    attentionKey: string | null,
+    roomNumber: string,
+    hostViewerId: number,
+    viewerId: number,
+): AttentionRecruitment | null {
+    if (attentionKey === null) return null;
+    try {
+        const recruitment = findOpenRecruitmentByKey(attentionKey, getServerTime() * 1000);
+        if (recruitment === null) return null;
+        if (recruitment.roomNumber !== roomNumber || recruitment.hostViewerId !== hostViewerId) {
+            return null;
+        }
+        return hasActiveDelivery(recruitment.id, viewerId) ? recruitment : null;
+    } catch {
+        return null;
+    }
 }
 
 export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHttpContext): void {
@@ -227,10 +260,32 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
         });
         // 新手组队计数资格（cond92）：guest 参与新冒险者（房主）发起的战斗。
         // 发起者本人不计数（官方口径）；总开关关闭时一律不计。
-        const newbieRescueEligible = gameplaySettings.multiRescueFragmentRewardsEnabled
-            && !isRoomHost
-            && hostContext?.playerId !== undefined
-            && isNewbieHostSync(hostContext.playerId);
+        // 铃铛进房（quest/start 携 attention_key）以招募行的 is_newbie_host 冻结
+        // 资格（房主开铃时的状态），并记录 accepted 响应；无 key/无效 key 走实时判定。
+        const bellRecruitment = resolveBellRecruitmentForStart(
+            typeof body.attention_key === "string" && body.attention_key.length > 0
+                ? body.attention_key
+                : null,
+            room_number,
+            room.value.host.viewerId,
+            viewer_id,
+        );
+        const newbieRescueEligible = bellRecruitment !== null
+            ? gameplaySettings.multiRescueFragmentRewardsEnabled
+                && !isRoomHost
+                && bellRecruitment.isNewbieHost
+            : gameplaySettings.multiRescueFragmentRewardsEnabled
+                && !isRoomHost
+                && hostContext?.playerId !== undefined
+                && isNewbieHostSync(hostContext.playerId);
+        if (bellRecruitment !== null && !isRoomHost) {
+            // 铃铛响应记账尽力而为：开战主流程不得被投递行 UPDATE 失败阻断
+            try {
+                recordResponse(bellRecruitment.id, viewer_id, "accepted", getServerTime() * 1000);
+            } catch (error) {
+                console.warn("[MULTI] bell accepted bookkeeping failed", describeError(error));
+            }
+        }
         const activeQuest = {
             questId: quest_id,
             category,
@@ -319,6 +374,12 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
         }
 
         const { playerId } = ctx;
+        // 缓存命中（TTL 内重复 finish）：直接回放首次响应
+        const cachedFinish = getCachedFinishResponse(viewerId, body.category, body.quest_id, body.play_id);
+        if (cachedFinish !== null) {
+            reply.header("content-type", "application/x-msgpack");
+            return reply.status(200).send(cachedFinish);
+        }
         const preparation = await prepareMultiplayerSettlement({
             body,
             context,
@@ -326,6 +387,7 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
             viewerId,
         });
         if (!preparation.ok) {
+            // 校验失败/状态缺失保持 400（幂等回放只属于缓存命中的同参重试）
             return reply.status(preparation.statusCode).send(preparation.response);
         }
         let settlementResult;
@@ -333,6 +395,8 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
             settlementResult = runMultiplayerSettlementOrchestration(preparation.value);
         } catch (error) {
             if (error instanceof ActiveQuestSettlementConflictError) {
+                // 并发重复 finish（双双通过 barrier 后的落败方）：400 明确失败。
+                // 同参重试的幂等由缓存回放承担（先行请求已写入响应缓存）。
                 return reply.status(400).send({
                     "error": "Bad Request", "message": error.message,
                 });
@@ -364,6 +428,7 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
                 },
             ),
         });
+        cacheFinishResponse(viewerId, body.category, body.quest_id, body.play_id, response);
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send(response);
     });
@@ -394,18 +459,31 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
         if (!activeQuestData
             || !storedQuest
             || !storedQuest.isMulti
-            || typeof storedQuest.roomNumber !== "string"
-            || storedQuest.playId !== body.play_id
-            || storedQuest.questId !== body.quest_id
-            || storedQuest.category !== body.category) {
-            return reply.status(400).send({
-                "error": "Bad Request", "message": "Active quest does not match abort request."
+            || typeof storedQuest.roomNumber !== "string") {
+        // 成功 abort 后的重复提交：400 明确失败（幂等由客户端按 play_id 自证）
+        return reply.status(400).send({
+            "error": "Bad Request", "message": "No matching active quest to abort."
+        })
+        }
+        // 宽容解析：CN 客户端的 abort 可能缺 category/quest_id（参考服同型事故），
+        // 以 storedQuest 为主键来源补全；仅显式冲突值才拒绝。
+        const abortQuestId = body.quest_id === undefined || body.quest_id === 0
+            ? storedQuest.questId : body.quest_id
+        const abortCategory = body.category === undefined || body.category === 0
+            ? storedQuest.category : body.category
+        if (storedQuest.playId !== body.play_id
+            || storedQuest.questId !== abortQuestId
+            || storedQuest.category !== abortCategory) {
+            // play_id 不匹配的迟到 abort：幂等无操作终态，不渲染 H400、不动当前局
+            return reply.header("content-type", "application/x-msgpack").status(200).send({
+                "data_headers": generateDataHeaders({ viewer_id: viewerId }),
+                "data": {},
             })
         }
         const abortResult = runAbortActiveQuestTransaction(playerId, {
             playId: body.play_id,
-            questId: body.quest_id,
-            category: body.category,
+            questId: abortQuestId,
+            category: abortCategory,
         });
         if (!abortResult.cancelled) return reply.status(400).send({
             "error": "Bad Request", "message": "Active quest was already changed."
@@ -470,21 +548,24 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
 
         const { playerId } = ctx;
 
-        if (activeQuests[playerId] === undefined) {
-            return reply.status(400).send({
-                "error": "Bad Request", "message": "No active quest to continue."
+        // 迟到/重复 continue：幂等终态（返回当前 continue_count，不写），不渲染 H400
+        const activeData = activeQuests[playerId];
+        if (activeData === undefined) {
+            return reply.header("content-type", "application/x-msgpack").status(200).send({
+                "data_headers": generateDataHeaders({ viewer_id: viewerId }),
+                "data": { continue_count: 0 },
             });
         }
 
-        const activeData = activeQuests[playerId];
         const continueCount = runContinueActiveQuestTransaction(playerId, activeData, {
             playId: body.play_id,
             questId: body.quest_id,
             category: body.category,
         });
         if (continueCount === null) {
-            return reply.status(400).send({
-                "error": "Bad Request", "message": "Active quest does not match continue request."
+            return reply.header("content-type", "application/x-msgpack").status(200).send({
+                "data_headers": generateDataHeaders({ viewer_id: viewerId }),
+                "data": { continue_count: activeData.continueCount },
             });
         }
 

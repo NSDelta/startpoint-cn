@@ -197,6 +197,10 @@ export function deriveDegreeStats(
     const manaNodes = facts.characterManaNodes ?? {}
     const battle = facts.missionBattleCounters ?? EMPTY_BATTLE_COUNTERS
     const questProgress = facts.questProgress ?? {}
+    const needsRescueCounters = [...rules.values()].some(rule => (
+        rule.kind === "metric"
+        && (rule.metric === "rescueBattleClearCount" || rule.metric === "newbieRescueBattleClearCount")
+    ))
     const finishedBySection = finishedQuestIds(questProgress)
     const characterTable = asTable(tables.character) as CharacterTable | undefined
     let maxCharacterLevel = 0
@@ -274,10 +278,13 @@ export function deriveDegreeStats(
         hardMultiFinishedQuestIds: finishedBySection[26] ?? readonlySet(),
         finishedQuestIdsBySection: finishedBySection,
         challengeDungeonClearCount: battle.challengeDungeonClearCount,
-        rescueBattleClearCount: counterPlayerId === undefined
+        // 范围收敛：rescue/newbie counters 只在规则集真的声明了对应 metric 时
+        // 才读（probe 测试锁定「不相关 family 不得发生读取」）；同时保留我们的
+        // 无库守卫（counterPlayerId，见函数头注释）。
+        rescueBattleClearCount: counterPlayerId === undefined || !needsRescueCounters
             ? 0
             : getMissionCounterValueSync(counterPlayerId, rescueClearQuery()),
-        newbieRescueBattleClearCount: counterPlayerId === undefined
+        newbieRescueBattleClearCount: counterPlayerId === undefined || !needsRescueCounters
             ? 0
             : getMissionCounterValueSync(counterPlayerId, newbieRescueClearQuery()),
         singleScoreMax: battle.singleScoreMax,

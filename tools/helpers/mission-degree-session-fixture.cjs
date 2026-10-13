@@ -2,6 +2,32 @@
 
 require("ts-node/register/transpile-only")
 
+const fs = require("node:fs")
+const os = require("node:os")
+const path = require("node:path")
+
+// Degree stat derivation reads rescue/newbie battle counters (cond20/cond92,
+// e6c8451f) through the shared database; every fixture consumer therefore
+// needs an initialized database before any Session is derived. Each suite
+// process gets its own throwaway data volume so concurrent `node --test`
+// workers never race migrations on the shared runtime database.
+const fixtureDataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "mission-degree-fixture-db-"))
+const previousFixtureDataDirectory = process.env.DATA_DIR
+process.env.DATA_DIR = fixtureDataDirectory
+process.once("exit", () => {
+    if (previousFixtureDataDirectory === undefined) delete process.env.DATA_DIR
+    else process.env.DATA_DIR = previousFixtureDataDirectory
+    try {
+        fs.rmSync(fixtureDataDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
+    } catch (error) {
+        // Windows 上退出钩子里删临时库会撞到仍被占用的 sqlite 句柄（EPERM/EBUSY），
+        // 清理失败不该把整套测试的退出码改成 1（上游 Linux CI 不暴露该差异）。
+        if (!["EPERM", "EBUSY", "ENOTEMPTY"].includes(error.code)) throw error
+    }
+})
+const { initializeDatabase } = require("../../src/data")
+initializeDatabase()
+
 const { productionContentSnapshotProvider } = require("../../src/content/runtime/content-snapshot")
 const { MissionEvaluationSession } = require("../../src/lib/mission/evaluation-session")
 const { MissionFactLoaderRegistry } = require("../../src/lib/mission/fact-loaders")

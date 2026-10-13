@@ -74,6 +74,7 @@ export const ADMIN_PROTECTED_API_PREFIXES: readonly string[] = [
     "/api/scheduled-resource",
     "/api/seeds",
     "/api/content",
+    "/api/content-management",
 ]
 
 /**

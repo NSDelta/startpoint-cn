@@ -1,4 +1,6 @@
 import { getDb } from "../../data/db"
+import { maybeSettleCraftPointMissions } from "./craft-point-settlement-gate"
+import type { MissionSettlementResult } from "../mission/settlement"
 import {
     InventoryTransactionError,
     InventoryValidationError,
@@ -158,7 +160,11 @@ export class InventorySqliteRepository {
         }
     }
 
-    recordPositiveObtainedSync(playerId: number, itemId: number, obtainedAmount: number): void {
+    recordPositiveObtainedSync(
+        playerId: number,
+        itemId: number,
+        obtainedAmount: number,
+    ): MissionSettlementResult | null {
         requireActiveTransaction()
         const ownerId = positiveId(playerId, "INVALID_PLAYER_ID", "playerId")
         const id = positiveId(itemId, "INVALID_ITEM_ID", "itemId")
@@ -198,6 +204,12 @@ export class InventorySqliteRepository {
                 `collected total for item ${id} is invalid or exceeds the safe integer range`,
             )
         }
+        // 锻块入账是「累计获得锻造石」事实（任务 66 族）的产生时点：当场窄域
+        // 结算。fragment 透出给调用方（与 flush 门批量路径同语义，响应投影
+        // 复用，避免二次结算拿到「阶段已领」空结果）；此前经字面 `.cjs`
+        // 惰性 require 调用——该后缀在编译产物中不可解析（潜在
+        // MODULE_NOT_FOUND），且顶层 import 已证明依赖环不存在。
+        return maybeSettleCraftPointMissions(ownerId, id)
     }
 
     /** Batch absolute write; per-row semantics identical to writeAbsoluteItemSync. */
@@ -267,7 +279,11 @@ export class InventorySqliteRepository {
                   AND players_collected_items.total_obtained >= 0
                   AND players_collected_items.total_obtained <= ? - excluded.total_obtained
             `).run(...values)
-            if (result.changes === chunk.length) continue
+            if (result.changes === chunk.length) {
+                // 锻块行的窄域结算上移到 batch-context.flush()（结算结果需透出
+                // 给响应投影）；此处只负责入账写入，避免双重结算。
+                continue
+            }
             // Diagnose the failing row without further writes; errors mirror the
             // single-row path verbatim and the caller's transaction rolls back.
             for (const row of chunk) {

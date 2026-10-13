@@ -1,4 +1,5 @@
 import * as net from "net"
+import { describeError } from "../describe-error"
 import { sessionManager, SessionClient, SessionMate } from "../state/SessionManager"
 import {
     disbandRoom,
@@ -9,6 +10,8 @@ import {
 } from "../room/manager"
 import { NpcMateProvider } from "../npc/controller"
 import { ensureNpcRoster, getActiveNpcRoster } from "../npc/nickname-pool"
+import { applyNpcPostFill } from "../npc/release"
+import { closeRecruitmentForRoom } from "../../data/domains/attention"
 import type { MultiRoom } from "../../lib/types"
 import { RoomState } from "../types"
 import {
@@ -69,6 +72,16 @@ export function cancelReconnectLease(participant: ParticipantIdentity): void {
     reconnectLeases.delete(key)
 }
 
+// 好友房间大厅注册行同步（惰性 require 规避循环；无注册行 no-op）
+function syncShareRow(roomNumber: string): void {
+    try {
+        const { syncRoomShareRow } = require("../room/share-sync") as typeof import("../room/share-sync")
+        syncRoomShareRow(roomNumber)
+    } catch (error) {
+        console.warn("[LOBBY] room share sync failed", roomNumber, describeError(error))
+    }
+}
+
 // 按连接身份清理 mate：同一 viewerId 重连会获得新 connectionId，
 // 裸 viewerId 清理会误删重连玩家（僵尸旧连接晚检测场景）。幂等。
 function removeDisconnectedMate(roomNumber: string, connectionId: string): void {
@@ -88,6 +101,8 @@ function removeDisconnectedMate(roomNumber: string, connectionId: string): void 
     }
     // 无 host 连接时 room.mates 由房间权威状态在下次 host 广播时重建；
     // 裸 viewer_id 过滤同样会误伤重连者，故不做按 id 的删除。
+    // 同步放在重建之后（双审 P1：先删后同步会把移除前的旧人数写进注册行）
+    syncShareRow(roomNumber)
 }
 
 function expireReconnectLease(key: string): void {
@@ -178,7 +193,7 @@ function commitRecruitmentRequest(room: MultiRoom, requestId: number): number | 
     return state.revision
 }
 
-function advanceRecruitmentGeneration(room: MultiRoom): number | null {
+export function advanceRecruitmentGeneration(room: MultiRoom): number | null {
     return commitRecruitmentRequest(room, beginRecruitmentRequest(room))
 }
 
@@ -242,9 +257,10 @@ function commitRoomMates(client: SessionClient, room: MultiRoom, mates: any[]): 
     const hostClient = findHostClient(client.roomNumber)
     if (hostClient) hostClient.mates = client.mates
     room.mates = client.mates.map(m => ({ viewer_id: m.viewerId ?? null, com_id: m.comId ?? 0 }))
+    syncShareRow(room.room_number)
 }
 
-function reconcileRematchSlots(client: SessionClient, room: MultiRoom): void {
+export function reconcileRematchSlots(client: SessionClient, room: MultiRoom): void {
     const revision = advanceRecruitmentGeneration(room)
     const realMates = getConnectedRealMates(client, room)
     commitRoomMates(client, room, realMates)
@@ -321,7 +337,7 @@ export function notifyRoomDisbanded(roomNumber: string): void {
     sessionManager.broadcastToRoom(roomNumber, [1, [6, "multibattle_room_dismissed"]])
 }
 
-async function handleEnterComs(
+export async function handleEnterComs(
     client: SessionClient,
     lifecycle: LobbyLifecycleGuard = getLobbyLifecycleGuard(),
 ): Promise<void> {
@@ -338,11 +354,14 @@ async function handleEnterComs(
     if (!hostMate) return
 
     const initialRealMates = getConnectedRealMates(client, room)
+    // 双检：请求已被更新的一代废弃（开战/一场一换清除 bump 过 revision）时
+    // 不做任何副作用写入（npc_count/roster），直接让位
+    if (requestId < getRoomRecruitmentState(room).committedRequestId) return
 
     // Assign the room roster synchronously so concurrent EnterComs calls share one binding.
-    if (room.npc_count <= 0) {
-        room.npc_count = Math.max(0, 3 - initialRealMates.length)
-    }
+    // 配额在每次招募激活时重算（3 − 当前真人）：上一轮成员变动（离开/加入）后的
+    // 缺口在重新开启招募/注入的这一次提交中补齐（用户定案语义，非离开瞬间补位）
+    room.npc_count = Math.max(0, 3 - initialRealMates.length)
     ensureNpcRoster(room, room.npc_count)
 
     const initialActiveCount = getAvailableNpcSlotCount(room, initialRealMates)
@@ -404,6 +423,10 @@ async function handleEnterComs(
     console.log(`[LOBBY] EnterComs: room=${client.roomNumber} real=${currentRealMates.length} npc=${npcMates.length} total=${client.mates.length}`)
 
     if (npcMates.length === 0) return
+
+    // postFill（设计 v2 §3）：NPC 进场提交后的招募行处置——close（官服）关招募 /
+    // keep-open（私服）服务端接管行寿命。挂 commit 点（双审定案，非 summon 响应）。
+    applyNpcPostFill(client.roomNumber)
 
     scheduleLobbyTask(() => {
         try {
@@ -510,7 +533,10 @@ function handleEnter(_socket: net.Socket, client: SessionClient, data: any[]): v
         } else {
             client.mates = [client.yourself!]
         }
-        if (room) room.mates = client.mates.map(m => ({ viewer_id: m.viewerId ?? null, com_id: m.comId ?? 0 }))
+        if (room) {
+            room.mates = client.mates.map(m => ({ viewer_id: m.viewerId ?? null, com_id: m.comId ?? 0 }))
+            syncShareRow(room.room_number)
+        }
     }
 
     const yourself = client.yourself
@@ -567,6 +593,9 @@ function disconnectRoomClient(client: SessionClient, reason: "network" | "explic
     if (getRoom(client.roomNumber) && hostClient && hostClient !== client) {
         sessionManager.broadcastMateListToRoom(client.roomNumber, hostClient.mates)
     }
+    // 显式离席（Bye）路径从不重写 room.mates（现存固有 staleness）——注册行
+    // 同步至少把 raising_state/expires_at 续上，mates 用当前内存值近似
+    if (getRoom(client.roomNumber)) syncShareRow(client.roomNumber)
     try { client.socket.destroy(); } catch (e) {}
     console.log(`[LOBBY] client left: role=${isHost ? "host" : "guest"} room=${client.roomNumber}`)
 }
@@ -646,6 +675,7 @@ function updateCurrentMateSettings(
             viewer_id: mate.viewerId ?? null,
             com_id: mate.comId ?? 0,
         }))
+        syncShareRow(room.room_number)
     }
     sessionManager.broadcastMateListToRoom(client.roomNumber, updatedMates)
 }
@@ -726,6 +756,12 @@ function beginBattle(client: SessionClient): boolean {
         console.warn(`[LOBBY] StartBattle rolled back: room=${client.roomNumber} refused Battle`)
         sessionManager.clearBattleExpectedCount(client.roomNumber)
         return false
+    }
+    // 开战关招募（设计 §9.e）：战斗中铃铛必须停止；T1 阶段门只是投递侧兜底
+    try {
+        closeRecruitmentForRoom(room.host_viewer_id, client.roomNumber)
+    } catch (error) {
+        console.warn(`[LOBBY] close recruitment on battle start failed: room=${client.roomNumber}`, describeError(error))
     }
     client.enterData = null
     return true

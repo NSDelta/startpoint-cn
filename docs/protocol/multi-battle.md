@@ -156,7 +156,7 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 
 | 路由 | 当前职责 |
 |---|---|
-| `get_rooms` | 真人随机匹配未实现时返回合法空列表，不把自己的房间伪装成匹配结果 |
+| `get_rooms` | 好友房间大厅：按 category 返回 `social_room_shares` 注册表中可见的招募房间（含 raising_state=2 满员/4 战斗中，客户端原生灰显）。可见性=房主 `share_room` 持久化的位掩码（bit1 双向关注房→仅互关；bit2 单向关注房→任一方向单向可见；纯 bit3 随机招募房不入表，只走铃铛）与请求者对房主的真实 follow 关系（`social_follows` 共享表，跨节点同权；fail-closed none）。条目 11 字段与客户端强校验一一对应，`establisher_follow` 徽章与过滤同源（mutual→1） |
 | `create_room` | 校验玩家与关卡，创建进程内房间、room number 和房间级随机 access token |
 | `search_room` | 按 room number 返回房间是否存在及基础房主信息 |
 | `select_room` | 校验兼容性并预留真人席位，返回 TCP 地址、端口和房间状态；满员返回状态 3，战斗已开始返回状态 4，房间缺失时返回状态 9 |
@@ -166,9 +166,9 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 | 路由 | 当前职责 |
 |---|---|
 | `prepare` | 校验 viewer session、房间和关卡并预留真人席位后返回 TCP 连接信息；这是首次加入前入口，不要求已有成员资格；满员返回状态 3 |
-| `summon` | 仅房主可请求静态 NPC mate 模板 |
+| `summon` | 仅房主可请求 NPC mate 候选（`mate1`/`mate2` 双候选，候选 ≤1 客户端判 Faild 并重开铃铛）。三模式语义（`游戏设置-联机招募模式`）：发布关（NPC 快速）或 W=0（官服还原）恒发双候选；W>0（私服混合）招募行缺失或窗口未到回空（省略 mate 字段），NPC 由服务端释放点在 W 到点注入。合法房主+活房间恒 200——任何 4xx 会把客户端 summon 状态机永久卡死在 WaitRemote |
 | `restore_room` | 已记录成员可恢复仍在进程内的房间；陌生玩家返回状态 13，缺失房间返回状态 9 |
-| `share_room` | 仅房主可提交，成功响应不含业务字段，也不提供真实分享或匹配队列 |
+| `share_room` | 仅房主可提交。双重门控：`share_type_list` 含 3（随机招募）**且** `游戏设置-联机招募模式` 的发布开关开启时，幂等创建/刷新铃铛招募行（房主客户端每 15s 重发、上限 20 次，同房间恒定 attention_key）并挂服务端 NPC 释放点（W>0 私服混合）；发布关闭（NPC 快速预设）时含 3 也不落行——按钮退化为纯 NPC 开关。投递经 `/attention/check` 下发（T1 房间态门：本节点未开战/房主在线/真人未满员，异节点放行）、guest 经 `start` 携 attention_key 进房（T2 门票：需持有效投递行，冻结 cond92 资格）；纯 1/2（互关/粉丝）分享不落招募行。成功响应不含业务字段（客户端忽略响应体），招募记账失败不影响 200。位 1/2 以 OR-merge 持久化到 `social_room_shares` 注册表（好友房间大厅数据源；勾选 [1,3]/[2,3] 时 [3] 的 15s 重发绝不触碰注册行，行回收只走 disband 钩子 + TTL 兜底），`raising_state`/mates 由房间权威节点生命周期钩子实时同步 |
 | `disband_room` | 房间存在时仅房主可广播 Disbanded 并删除房间；房间已不存在时幂等成功 |
 | `create_room_failure` | 客户端「回到房间」失败时用 `sendOnlyUserRequest` fire-and-forget 上报的失败通知；服务端只回 200 ack、不读状态、不记为业务事实。这条路由必须存在且永不返回 4xx：客户端的 fire-and-forget 通道虽然不解析响应体，但任何 4xx 都会走 `defaultErrorHandler`，表现为「发生意想不到的错误 回到登录界面 (No.H404)」并清空请求队列，把一次可恢复的回房失败升级为必须重登 |
 
@@ -176,7 +176,7 @@ Session TCP 在正常 `stop`、fatal teardown 和 startup failure 路径都会�
 
 | 路由 | 当前职责 |
 |---|---|
-| `start` | 重新校验请求节点与房间固定兼容性、玩家成员身份及关卡一致性；兼容性校验在任何本地扣费或 active quest 写入前完成。每位真人分别写入 active quest：房主预扣完整体力和 Always 门票，guest 按 Follow 关系计费（互关/可信跨服 0，其余折半后应用 Campaign，见 [同服 Follow 与跨服房间兼容](../systems/follow.md)）；`raising_state=4` 已由 TCP StartBattle 建立 |
+| `start` | 重新校验请求节点与房间固定兼容性、玩家成员身份及关卡一致性；兼容性校验在任何本地扣费或 active quest 写入前完成。铃铛进房（请求携 attention_key）经 T2 门票校验（open 且房间/房主匹配且持有效投递行）冻结 cond92 资格并记账 accepted，无 key/无效 key 走实时判定不影响开战。每位真人分别写入 active quest：房主预扣完整体力和 Always 门票，guest 按 Follow 关系计费（互关/可信跨服 0，其余折半后应用 Campaign，见 [同服 Follow 与跨服房间兼容](../systems/follow.md)）；`raising_state=4` 已由 TCP StartBattle 建立 |
 | `finish` | 由 Hub 授权 retained completion fact，再按 `play_id + category + quest_id` 校验多人 active quest，并拒绝负 Mana、非法分数/耗时、continue 次数或 Boost 余额不一致；各节点只结算自己的存档，全部剩余真人 Finalize 后由 coordinator 把房间恢复为状态 1 |
 | `abort` | 先在本地事务中退款并取消 active quest，提交后再 best-effort 通知 coordinator；房主放弃时解散房间，成员放弃时从权威当局参与者中移除并立即重判剩余成员是否全部 Finalize |
 | `play_continue` | 同时核对内存与 SQLite active quest；SQLite 提交成功后才更新内存 continue count。当前多人续关不扣星导石 |

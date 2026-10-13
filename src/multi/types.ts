@@ -14,6 +14,7 @@ export type {
 export interface GetRoomsBody {
     event_id?: number
     viewer_id: number
+    party_id?: number
     category_id: number
 }
 
@@ -171,17 +172,17 @@ export interface RestoreRoomBody {
 
 export interface ShareRoomBody {
     viewer_id: number
-    room_number: string
-    api_count: number
+    // 客户端会发送（MultiBattleQuestShareRoomRemote）；服务端以 RoomStatus 为权威，仅声明
+    category?: number
+    quest_id?: number
     /**
      * Share channels the host selected, e.g. `[3]` for random (bell)
      * recruitment. Absent on legacy requests, which are treated as a plain
      * share so old clients keep advertising their room.
      */
     share_type_list?: number[]
-    /** Present on the client's random-recruitment share; must match the room. */
-    category?: number
-    quest_id?: number
+    room_number: string
+    api_count: number
 }
 
 export interface VerifyAccessTokenBody {

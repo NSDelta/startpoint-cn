@@ -1,17 +1,18 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { getAccountPlayers } from "../../data/domains/account"
 import { getPlayerSync } from "../../data/domains/player"
 import { getSession } from "../../data/domains/session"
 import { resolvePlayerIdSync } from "../../data/activeAccount";
-import { generateDataHeaders } from "../../utils";
-import type { MultiHttpContext } from "../../multi/http/context";
-import { getPlayerRankLevel } from "../../lib/player-rank-content";
-import { resolveRoomEstablisherFollowStateSafeSync } from "../../multi/follow-policy";
 import {
-    collectAttentionRecruitments,
-    type RecruitmentHostFacts,
-} from "../../multi/recruitment/query";
-import type { AttentionMultiList } from "../../multi/recruitment/attention";
+    deliverOpenRecruitmentsToViewer,
+    parseEstablisherSnapshot,
+} from "../../data/domains/attention"
+import { getLocalFollowRelationSync } from "../../data/domains/follow"
+import { touchPresence } from "../../multi/presence"
+import { isBellDeliveryEligible } from "../../multi/bell-gate"
+import { generateDataHeaders, getServerTime } from "../../utils";
+
+// 与下方 config.return_attention_max_num 保持一致：单次 check 最多携带的铃铛数
+const RETURN_ATTENTION_MAX_NUM = 3
 
 interface CheckBody {
     viewer_id: number
@@ -32,80 +33,7 @@ interface LoggerBody {
     api_count: number
 }
 
-export interface AttentionApiOptions {
-    /**
-     * Resolves the multi-battle HTTP context lazily. The attention routes are
-     * registered before the multi runtime is guaranteed to be listening, and the
-     * check route must keep answering `config` even when it is not.
-     */
-    multiContext?: () => MultiHttpContext | null
-}
-
-/**
- * Bell notifications (`data.multi`) for this viewer.
- *
- * Recruiting is a same-node feature: rooms live in this process, the registry
- * that tracks them is process-local, and nothing is ever routed to a Hub. When
- * the multi runtime is unavailable we therefore return an empty list instead of
- * failing the poll — the client must still receive its `config` block.
- */
-async function collectAttentionMulti(
-    options: AttentionApiOptions,
-    viewerId: number,
-    requesterPlayerId: number,
-    body: CheckBody,
-): Promise<AttentionMultiList> {
-    let multi: MultiHttpContext | null = null
-    try {
-        multi = options.multiContext?.() ?? null
-    } catch (error) {
-        console.log(`[ATTENTION] multi context unavailable: ${String(error)}`)
-    }
-    if (!multi) return { multi: [] }
-
-    // One request can mention several rooms; resolve each host once.
-    const hostCache = new Map<number, Promise<RecruitmentHostFacts | null>>()
-    const resolveHost = (hostViewerId: number): Promise<RecruitmentHostFacts | null> => {
-        const cached = hostCache.get(hostViewerId)
-        if (cached) return cached
-        const pending = (async () => {
-            const context = await multi!.resolvePlayerContext(hostViewerId)
-            if (!context) return null
-            return {
-                hostPlayerId: context.playerId,
-                mainCharacterId: context.player.leaderCharacterId || 1,
-                rankLevel: getPlayerRankLevel(context.player.rankPoint),
-                // Same newbie proxy the TCP/snapshot path uses; a cleared
-                // tutorial sets tutorial_step to null.
-                isNewbie: !!context.player.tutorialStep,
-            }
-        })()
-        hostCache.set(hostViewerId, pending)
-        return pending
-    }
-
-    return collectAttentionRecruitments({
-        viewerId,
-        requesterPlayerId,
-        holdingNumber: body.holding_number,
-    }, {
-        registry: multi.recruitmentRegistry,
-        coordinator: multi.coordinator,
-        resolveHost,
-        participantFor: viewerId => multi!.snapshotProvider.getParticipant(viewerId),
-        resolveEstablisherFollow: input => resolveRoomEstablisherFollowStateSafeSync({
-            requester: input.requester,
-            host: multi!.snapshotProvider.getParticipant(input.hostViewerId),
-            requesterPlayerId: input.requesterPlayerId,
-            hostPlayerId: input.hostPlayerId,
-        }),
-        onResolveError: (roomNumber, error) => {
-            console.log(`[ATTENTION] dropping recruitment room=${roomNumber}: ${String(error)}`)
-        },
-    })
-}
-
-const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {}) => {
+const routes = async (fastify: FastifyInstance) => {
     fastify.post("/check", async (request: FastifyRequest, reply: FastifyReply) => {
         const body = request.body as CheckBody
 
@@ -130,7 +58,53 @@ const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {
             "message": "No players bound to account."
         })
 
-        const multi = await collectAttentionMulti(options, viewerId, playerId, body)
+        // 铃铛轮询即 presence 上报（原版客户端不加新请求，见 A1 计划书）。
+        // 共享库模式下二者都是 SQL 写（跨进程锁竞争/磁盘错误可能抛）——
+        // presence 是 advisory 数据、multi 空数组对客户端合法（ReceiveMulti([])），
+        // 降级容错：任一失败不拖垮这条最热轮询端点（每在线玩家每 ~10s 一次）
+        try {
+            touchPresence(viewerId)
+        } catch (error) {
+            console.warn("[ATTENTION] presence touch failed (degraded)", error)
+        }
+
+        // 读时惰性投递：guest 轮询时才写入投递行（对齐官方"房主 15s 重发 × guest 轮询"）
+        const nowMs = getServerTime() * 1000
+        let bells: ReturnType<typeof deliverOpenRecruitmentsToViewer> = []
+        try {
+            // T1 投递谓词（设计 §5）：本节点房间过房间态门（未开战/房主在线/真人未满员），
+            // 异节点房间放行；先过滤后下发，被滤房间的投递行已建（幂等无害）
+            // 取数放大 3 倍再过滤补满：T1 被滤房间不得挤占 return_attention_max_num 名额
+            bells = deliverOpenRecruitmentsToViewer(viewerId, nowMs, RETURN_ATTENTION_MAX_NUM * 3)
+                .filter(recruitment => isBellDeliveryEligible(recruitment.roomNumber))
+                .slice(0, RETURN_ATTENTION_MAX_NUM)
+        } catch (error) {
+            console.warn("[ATTENTION] delivery failed (empty multi)", error)
+        }
+        const multi = bells.map(recruitment => {
+            const snapshot = parseEstablisherSnapshot(recruitment.establisherJson)
+            // establisher_follow 按查看者实时计算（关注关系变化后铃铛图标跟随）
+            let establisherFollow = 0
+            try {
+                establisherFollow = getLocalFollowRelationSync(playerId, recruitment.hostPid).state
+            } catch {
+                establisherFollow = 0
+            }
+            return {
+                "attention_key": recruitment.attentionKey,
+                "quest_info": {
+                    "category_id": recruitment.category,
+                    "establisher_character": snapshot.character,
+                    "establisher_character_evolution_img_level": 0,
+                    "establisher_follow": establisherFollow,
+                    "establisher_rank": snapshot.rankLevel,
+                    "host_entry_time": snapshot.hostEntryTime,
+                    "is_newbie": recruitment.isNewbieHost,
+                    "quest_id": recruitment.questId,
+                    "room_number": recruitment.roomNumber,
+                }
+            }
+        })
 
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send({
@@ -138,7 +112,6 @@ const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {
                 viewer_id: viewerId
             }),
             "data": {
-                ...multi,
                 "config": {
                     "attention_recruitment_interval_seconds": 15,
                     "attention_recruitment_redeliver_limit": 20,
@@ -155,8 +128,10 @@ const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {
                     "disable_unintent_disconnect_duration_seconds": 5,
                     "disable_remote_error_duration_seconds": 300,
                     // All 23 fields below are strictly validated by the client's
-                    // shared early-success transformer; summon_com_seconds comes
-                    // from CDN attention_config column 23.
+                    // shared early-success transformer (RealRemoteService: null →
+                    // Option.None = CDN fallback; Int → Some = overrides CDN).
+                    // summon_com_seconds here therefore controls the client's
+                    // summon window directly — fully CDN-decoupled.
                     "summon_com_seconds": 20,
                     "attention_animation_time_seconds": 6,
                     "disable_expire_count_limit": 4,
@@ -166,7 +141,10 @@ const routes = async (fastify: FastifyInstance, options: AttentionApiOptions = {
                     "polling_delay_battle_seconds_range_min": 1,
                     "polling_delay_battle_seconds_range_max": 15,
                     "return_attention_max_num": 3
-                }
+                },
+                // 客户端强校验 multi[i]（AttentionCheckRealRemoteService）：
+                // multi 缺失/为 null = 无铃铛；空数组同样安全（ReceiveMulti([])）
+                "multi": multi
             }
         })
     })

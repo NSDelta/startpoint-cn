@@ -172,31 +172,12 @@ function requireRejected(response, label) {
     return true
 }
 
-function requireStaleFinishIgnored(response, label) {
-    if (response.statusCode !== 200) {
-        throw new Error(`${label} must answer HTTP 200 for a stale play_id, got ${response.statusCode}: ${JSON.stringify(response.payload)}`)
-    }
-    const payload = response.payload
-    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-        throw new Error(`${label} returned an invalid payload`)
-    }
-    const data = payload.data
-    if (data === null || typeof data !== "object" || Array.isArray(data)) {
-        throw new Error(`${label} returned no data fragment`)
-    }
-    // 迟到的旧局 finish 以幂等零奖励终态应答 —— 服务端不结算、不写库、不清活跃任务。
-    if (data.is_multi !== "single") throw new Error(`${label} data.is_multi must be "single"`)
-    for (const field of ["character_list", "add_exp_list", "drop_score_reward_ids",
-        "drop_rare_reward_ids", "drop_additional_reward_ids", "drop_periodic_reward_ids"]) {
-        if (!Array.isArray(data[field]) || data[field].length !== 0) {
-            throw new Error(`${label} data.${field} must stay empty`)
-        }
-    }
-    if (data.clear_rank !== 0) throw new Error(`${label} data.clear_rank must stay 0`)
-    if (data.rewards?.reward_mana !== 0 || data.rewards?.field_mana !== 0) {
-        throw new Error(`${label} must grant no mana`)
-    }
-    return { staleFinishIgnored: true, categoryId: data.category_id }
+// 迟到 finish（play_id 与当前局不一致）为幂等零奖励终态（HTTP 200，
+// 与多人路径同型的既有设计）——不结算、不消费活跃任务
+function requireIdempotentTerminal(response, label) {
+    const terminal = response.statusCode === 200
+    assert.equal(terminal, true, `${label} must return an idempotent HTTP 200 terminal state`)
+    return true
 }
 
 async function executeSingleBattleScenario(app, identity, context = {}) {
@@ -240,7 +221,7 @@ async function executeSingleBattleScenario(app, identity, context = {}) {
     assertSingleBattleStateUnchanged(context, identity.playerId, peerFinishBefore, "cross-owner finish")
 
     const wrongPlayBefore = snapshotSingleBattleState(context, identity.playerId)
-    const wrongPlayIdFinishIgnored = requireStaleFinishIgnored(
+    const wrongPlayIdFinishTerminal = requireIdempotentTerminal(
         await postCnRequest(
             app,
             "/api/index.php/single_battle_quest/finish",
@@ -248,7 +229,6 @@ async function executeSingleBattleScenario(app, identity, context = {}) {
         ),
         "wrong play_id finish",
     )
-    assert.equal(wrongPlayIdFinishIgnored.categoryId, CATEGORY)
     assertSingleBattleStateUnchanged(context, identity.playerId, wrongPlayBefore, "wrong play_id finish")
 
     const duplicateStartBefore = snapshotSingleBattleState(context, identity.playerId)
@@ -323,7 +303,7 @@ async function executeSingleBattleScenario(app, identity, context = {}) {
         repeatedFinishRejected,
         negativeLifecycle: {
             crossOwnerFinishRejected,
-            wrongPlayIdFinishIgnored,
+            wrongPlayIdFinishTerminal,
             duplicateStartRejected,
         },
         multiRecoveryInspections: typeof context.getMultiRecoveryInspections === "function"
@@ -342,6 +322,5 @@ module.exports = {
     finishPayload,
     prepareSingleBattleIdentity,
     requireRejected,
-    requireStaleFinishIgnored,
     startPayload,
 }

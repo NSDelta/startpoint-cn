@@ -1,4 +1,5 @@
 import { randomBytes, randomInt } from "crypto";
+import { describeError } from "../describe-error";
 import { MultiRoom, QuestCategory, RoomState } from "../types";
 import { getServerTime } from "../../utils";
 import { getRealNowMs } from "../../runtime/time/game-time";
@@ -324,6 +325,13 @@ export function updateRoomState(
     }
     console.log(`[MULTI] room state: ${roomNumber} → ${state}`);
     room.raising_state = state;
+    // 好友房间大厅注册行同步（未开放列表可见的房无行，no-op）
+    try {
+        const { syncRoomShareRow } = require("./share-sync") as typeof import("./share-sync")
+        syncRoomShareRow(roomNumber)
+    } catch (error) {
+        console.warn(`[MULTI] room share sync failed: ${roomNumber}`, describeError(error))
+    }
     return true;
 }
 

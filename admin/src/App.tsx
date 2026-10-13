@@ -9,6 +9,7 @@ import {
     Menu as MenuIcon,
     Megaphone,
     Gift,
+    RefreshCw,
     Settings2,
     Sparkles,
     Users,
@@ -24,6 +25,7 @@ import Gifts from "./pages/Gifts"
 import Seeds from "./pages/Seeds"
 import TimeControl from "./pages/TimeControl"
 import GameplaySettings from "./pages/GameplaySettings"
+import ContentManagement from "./pages/ContentManagement"
 import logoUrl from "./assets/logo.png"
 import { ThemeToggle } from "./theme"
 
@@ -40,6 +42,7 @@ const menuItems = [
     { key: "/gifts", icon: <Gift size={18} />, label: "礼包" },
     { key: "/seeds", icon: <Database size={18} />, label: "动画种子" },
     { key: "/settings", icon: <Settings2 size={18} />, label: "游戏设置" },
+    { key: "/content", icon: <RefreshCw size={18} />, label: "内容更新" },
 ]
 
 const pageTitles: Record<string, string> = {
@@ -52,6 +55,7 @@ const pageTitles: Record<string, string> = {
     "/gifts": "礼包",
     "/seeds": "动画种子",
     "/settings": "游戏设置",
+    "/content": "内容更新",
 }
 
 export default function App() {
@@ -123,6 +127,7 @@ export default function App() {
                         <Route path="/gifts" element={<Gifts />} />
                         <Route path="/seeds" element={<Seeds />} />
                         <Route path="/settings" element={<GameplaySettings />} />
+                        <Route path="/content" element={<ContentManagement />} />
                         <Route path="*" element={<Navigate to="/" replace />} />
                     </Routes>
                 </Content>

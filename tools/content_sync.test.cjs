@@ -1401,7 +1401,9 @@ test("lock waits, times out clearly, releases by token and identity, and leaves 
         pollIntervalMs: 5,
     })
     await assert.rejects(
-        acquireContentSyncLock(paths.contentStateDir, { timeoutMs: 20, pollIntervalMs: 5 }),
+        acquireContentSyncLock(paths.contentStateDir, {
+            timeoutMs: 20, pollIntervalMs: 5, staleThresholdMs: 150,
+        }),
         error => error instanceof ContentSyncLockError
             && error.code === "CONTENT_SYNC_LOCK_TIMEOUT"
             && /remove.*manually|人工删除/i.test(error.message),
@@ -1488,12 +1490,13 @@ test("lock waits through the owner's create/write window and diagnoses legacy fi
     await second.release()
 
     fs.writeFileSync(path.join(paths.contentStateDir, "sync.lock"), "old lock")
-    await assert.rejects(
-        acquireContentSyncLock(paths.contentStateDir, { timeoutMs: 10, pollIntervalMs: 2 }),
-        error => error instanceof ContentSyncLockError
-            && error.code === "CONTENT_SYNC_LOCK_LEGACY"
-            && /remove|人工删除/i.test(error.message),
-    )
+    // S2（stale-guard 自愈）：垃圾内容锁=崩溃残留，超时后接管而非 fail-closed
+    // stale 阈值取小值：只验证「须等锁龄过阈值才接管」的语义，不必真等 60 秒
+    const takeover = await acquireContentSyncLock(paths.contentStateDir, {
+        timeoutMs: 10, pollIntervalMs: 2, staleThresholdMs: 150,
+    })
+    await takeover.release()
+    assert.equal(fs.existsSync(path.join(paths.contentStateDir, "sync.lock")), false)
 })
 
 test("CLI parses mutually exclusive modes, returns exit codes, and never prints absolute paths", async () => {

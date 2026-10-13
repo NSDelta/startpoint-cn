@@ -23,7 +23,7 @@ const EXPECTED_SCENARIO_KEYS = [
     "multi-battle-finish",
 ]
 const APPROVED_SETTLEMENT_SHA256 =
-    "cd5d857fcf87d8e4a807de6218147b25cffcedb607e011cdd27cc48e305a3f7e"
+    "ddd5666caff5923d5c354f728f3078d658d0d7b1115d1546fb45cd6c11b23626"
 const snapshotPath = path.join(
     __dirname,
     "__snapshots__",
@@ -97,8 +97,10 @@ test("snapshot pins the completed mission engine structural performance values",
         getProgressNoInvalidation: { sqlReads: 14, sqlWrites: 1, missionComputes: 110 },
         // Battle finish: cat9 奖励仍由页拥有;持有数窄域结算 + 奖励连锁轮
         // + main_quest 数据修复(score ×4)构成现值(2026-10-03 批准语义)
-        singleBattleFinish: { sqlReads: 38, sqlWrites: 27, missionComputes: 471 },
-        multiBattleFinish: { sqlReads: 40, sqlWrites: 32, missionComputes: 475 },
+        // 2026-10-11 重认收（写入点结算语义）：任务 33/66/40 族的认领随
+        // 写入点结算前移，finish 边界的候选与计算量相应下降
+        singleBattleFinish: { sqlReads: 33, sqlWrites: 26, missionComputes: 452 },
+        multiBattleFinish: { sqlReads: 39, sqlWrites: 32, missionComputes: 460 },
     })
 })
 

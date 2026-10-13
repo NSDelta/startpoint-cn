@@ -5,6 +5,14 @@ import { getCharacterFacts } from "./character-content";
 import { getRealNow } from "../runtime/time/game-time";
 import { GivePlayerCharacterResult } from "./types";
 import { recordHundredCharactersMilestoneSync } from "./player-history-milestones";
+// 惰性引入（调用点函数体内 require）：character.ts 处于
+// character → gacha-acquisition-mission-settlement → mission/settlement →
+// … → reward-grant → character 的真实依赖环上，顶层 import 会被架构守护
+// 记为运行时环（architecture_dependencies）；与锻块结算门同一断环手法。
+function settleAcquisitionMissionsAtWritePoint(playerId: number): void {
+    const { settleAcquisitionMissionsAtWritePoint: settle } = require("./gacha-acquisition-mission-settlement") as typeof import("./gacha-acquisition-mission-settlement")
+    settle(playerId)
+}
 import {
     grantCharacterExp,
     grantCharacterExpWithinTransactionSync,
@@ -72,6 +80,10 @@ function givePlayerCharacterInCurrentScopeSync(
         }
         insertPlayerCharacterSync(playerId, characterId, character)
         recordHundredCharactersMilestoneSync(playerId, joinTime)
+        // 新角色入队是「持有角色数」事实的产生时点：当场结算 characters_count
+        // 族/伙伴数称号族（非扭蛋路径——扭蛋已在自身奖励流内结算）。与调用方
+        // 事务同连接；失败策略随结算门（WARN 降级不连坐获得，重入深度 1 封顶）。
+        settleAcquisitionMissionsAtWritePoint(playerId)
 
         return {
             isNew: true,

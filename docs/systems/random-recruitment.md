@@ -4,17 +4,20 @@
 
 本文定义多人房间的真人随机招募、NPC 回退和后台设置边界。目标是补齐国服客户端已经存在的随机招募服务端协议，同时保留当前服务端使用 NPC 保障单人体验的能力。
 
-已落地的部分：房主选择随机招募后 `share_room` 登记招募、`/attention/check` 下发 `data.multi` 铃铛、房间满员/解散/关闭招募即撤下。招募状态是进程内内存（`src/multi/recruitment/registry.ts`），不落盘。`npc_mode_enabled` 与 `summon_com_seconds` 后台入口尚未实施，现有 NPC 流程保持原样。
+已落地的部分：房主选择随机招募后 `share_room` 登记招募、`/attention/check` 下发 `data.multi` 铃铛、房间满员/解散/关闭招募即撤下。招募状态**落库**（`attention_recruitments` / `attention_deliveries`，见 `src/data/domains/attention.ts`），进程重启不丢；发布额外受后台开关 `multiRandomRecruitmentPublishEnabled`（发布门）约束。2026-10 的上游同步把本仓原先的进程内登记表（`src/multi/recruitment/*`，模块与其单元测试仍保留但路由已不再调用）退役，改采上游的库内实现。`npc_mode_enabled` 与 `summon_com_seconds` 后台入口尚未实施，现有 NPC 流程保持原样。
 
 实现位置：
 
 | 文件 | 职责 |
 |---|---|
-| `src/multi/recruitment/registry.ts` | 进程内招募登记表（幂等刷新、可见窗口、重投递上限、关闭） |
-| `src/multi/recruitment/attention.ts` | `data.multi` 契约构造（字段类型严格对齐客户端解析器） |
-| `src/multi/recruitment/query.ts` | 把登记表投影成某玩家可见的铃铛列表 |
-| `src/multi/http/room.ts` | `/share_room` 按 `share_type_list` 开/关/刷新招募 |
+| `src/data/domains/attention.ts` | 招募与投递落库：`getOrCreateRecruitmentForRoom`、`closeRecruitmentForRoom`、`deliverOpenRecruitmentsToViewer`、`pruneExpiredRecruitments`、`buildEstablisherSnapshot` |
+| `src/data/social/attention-schema.ts` | `attention_recruitments` / `attention_deliveries` 表结构 |
+| `src/multi/http/room.ts` | `/share_room`：bit3（受发布门约束）建/刷新招募、bit1/bit2 落好友房间大厅位、解散即关招募 |
+| `src/multi/room/share-sync.ts` | 好友房间大厅分享位（`social_room_shares`）的 OR-merge 持久化 |
+| `src/multi/bell-gate.ts` | 铃铛投递门（`isBellDeliveryEligible`） |
+| `src/multi/presence.ts` | 在线状态触达（`touchPresence`），跨房可见性判定的输入 |
 | `src/routes/api/attention.ts` | `/attention/check` 返回 `data.multi` |
+| `src/multi/recruitment/*`（退役） | 旧进程内登记表；模块仍在，路由已不再调用 |
 
 ## 1. 设计结论
 
@@ -186,8 +189,12 @@ Recruiting / NPC fallback
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/multi-attention-recruitment.test.js` | 登记表与查询层共 23 例：`share_type_list` 判定、幂等刷新保持 key、30 秒过期、20 次重投递上限、`close()`、契约字段类型、空列表、自己房间不出现、满员隐藏但给已进房成员保留、房间不存在/协调器失败、live quest 变更、换房主、房主解析失败、`holding_number` 上限与 0 饱和、requester 身份单次解析、同 quest 两房间互不污染、`establisher_follow` 逐房间计算、非法角色 id 兜底为 1 |
-| `tools/attention_recruitment_route.test.cjs` | 路由级端到端（真实 SQLite + 真实 `EmbeddedMultiCoordinator` + `fastify.inject`）共 9 例：无招募返回 `[]`、share 后对方收到完整契约、自己的房间不出现、`holding_number=0` 不发、满员隐藏且对已进房成员保留、不含 3 的 share 撤下、重复 share 保持 key、解散即撤下、quest 不符返回 400 且不发布 |
+| `tests/multi-attention-recruitment.test.js` | **已退役实现的特征化护栏**：我们 fork 的内存登记表与查询层（`src/multi/recruitment/*`）共 23 例（`share_type_list` 判定、幂等刷新保持 key、30 秒过期、20 次重投递上限、`close()`、契约字段类型、空列表、自己房间不出现、满员隐藏但给已进房成员保留、房间不存在/协调器失败、live quest 变更、换房主、房主解析失败、`holding_number` 上限与 0 饱和、requester 身份单次解析、同 quest 两房间互不污染、`establisher_follow` 逐房间计算、非法角色 id 兜底为 1）——线上路径自 2026-10 起已换成下面的落库实现，此套件只作为退役模块的回归护栏；我们原路由级套件 `tools/attention_recruitment_route.test.cjs` 已随切换删除 |
+| `tools/attention_lifecycle.test.cjs` | 域层生命周期：get-or-create 幂等与 key 稳定、读时惰性投递、accepted/declined 单向迁移、关闭与过期收敛、establisher 快照解析 |
+| `tools/attention_bell_start.test.cjs` | multi `/start` 铃铛进房解析（open 且 `(room_number, 房主)` 匹配；无票 fail-open） |
+| `tools/attention_routes.test.cjs` | 路由级（真实 SQLite + `fastify.inject`）：发布门、`share_type_list` 语义、建行幂等与 `attention_key` 稳定 |
+| `tools/multi_recruitment_modes.test.cjs` | 三种招募模式参数与 NPC 快速预设 |
+| `tools/attention_config_route.test.cjs` | `/attention/config` 契约 |
 
 尚未自动覆盖、需要人工或后续补充的部分：
 

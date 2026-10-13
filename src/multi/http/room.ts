@@ -1,9 +1,9 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import { describeError } from "../describe-error";
 import { PrepareBody, SummonBody, RestoreRoomBody, ShareRoomBody } from "../types";
-import { generateDataHeaders } from "../../utils";
+import { generateDataHeaders, getServerTime } from "../../utils";
 import { serializeRoomStatusConnection } from "../room/serializer";
 import { buildNpcMates } from "../npc/builder";
-import { requestsRandomRecruitment } from "../recruitment/attention";
 import { isValidMultiViewerId, type MultiHttpContext } from "./context";
 import type { CoordinatorErrorCode } from "../coordinator/contracts";
 import { classifyRoomJoin } from "./join-result";
@@ -13,6 +13,19 @@ import {
     restoreRoomUnavailableRaisingState,
 } from "./join-result";
 import { issueRoomAdmission } from "./room-admission";
+import {
+    buildEstablisherSnapshot,
+    closeRecruitmentForRoom,
+    findOpenRecruitmentForRoom,
+    getOrCreateRecruitmentForRoom,
+    pruneExpiredRecruitments,
+} from "../../data/domains/attention";
+import { getServerGameplaySettingsSync } from "../../data/domains/server-settings";
+import { getCharactersEvolutionImgLevels } from "../../lib/character";
+import { openRoomShareRow } from "../room/share-sync";
+import { isNewbieHostSync } from "../../lib/newbie-host";
+import { getPlayerRankLevel } from "../player-context";
+import { scheduleNpcRelease } from "../npc/release";
 
 async function hasValidViewer(context: MultiHttpContext, viewerId: number): Promise<boolean> {
     return isValidMultiViewerId(viewerId)
@@ -21,6 +34,23 @@ async function hasValidViewer(context: MultiHttpContext, viewerId: number): Prom
 
 function forbidden(reply: FastifyReply): FastifyReply {
     return reply.status(403).send({ "error": "Forbidden", "message": "Room permission denied." });
+}
+
+/**
+ * summon 是否直接发双候选（纯函数，导出供测试锁定三模式语义）：
+ * publishBell off（NPC 快速）或 W=0（官服原生时序）恒发；
+ * W>0（私服混合）仅当招募行存在且窗口已过才发——行缺失/未到点回空，
+ * NPC 由服务端注入在 W 到点时进场（批次三）。
+ */
+export function resolveSummonServeCandidates(input: {
+    publishEnabled: boolean
+    releaseSeconds: number
+    recruitment: { postedAtMs: number } | null
+    nowMs: number
+}): boolean {
+    if (!input.publishEnabled || input.releaseSeconds === 0) return true
+    if (input.recruitment === null) return false
+    return input.nowMs - input.recruitment.postedAtMs >= input.releaseSeconds * 1000
 }
 
 function hubUnavailable(reply: FastifyReply): FastifyReply {
@@ -162,15 +192,40 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
             });
         }
 
+        // 三模式 summon 语义（收官审查：合法房主 + 活房间恒 200，业务降级编码进
+        // mate 字段——任何 4xx 会把客户端状态机永久卡死在 WaitRemote）：
+        // - publishBell off（NPC 快速预设）：直接发双候选（机器人开关）
+        // - publishBell on 且 W=0（官服还原）：发候选（客户端 ~20s 原生时序）
+        // - publishBell on 且 W>0（私服混合）：窗口未到回空（省略 mate 字段，
+        //   客户端 Faild 重开铃），NPC 由服务端注入在 W 到点时进场（批次三）
+        // 双审修订：判定路径（settings 读 + 招募行读）整体 fail-open——共享库
+        // 抖动等 DB 异常时回退为直接发候选（提交前行为），恒 200 不变式优先。
+        const nowMs = getServerTime() * 1000;
+        let serveCandidates = true;
+        try {
+            const settings = getServerGameplaySettingsSync();
+            const recruitment = settings.multiRandomRecruitmentPublishEnabled && settings.multiNpcReleaseSeconds > 0
+                ? findOpenRecruitmentForRoom(viewerId, body.room_number, nowMs)
+                : null;
+            serveCandidates = resolveSummonServeCandidates({
+                publishEnabled: settings.multiRandomRecruitmentPublishEnabled,
+                releaseSeconds: settings.multiNpcReleaseSeconds,
+                recruitment: recruitment === null ? null : { postedAtMs: recruitment.postedAtMs },
+                nowMs,
+            });
+        } catch (error) {
+            console.warn("[MULTI] summon candidate decision failed; serving candidates", describeError(error));
+        }
+
         const mates = buildNpcMates(body.quest_id, room.value.category);
+        const data: Record<string, unknown> = serveCandidates
+            ? { "mate1": mates.mate1, "mate2": mates.mate2 }
+            : {};
 
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send({
             "data_headers": generateDataHeaders({ viewer_id: viewerId }),
-            "data": {
-                "mate1": mates.mate1,
-                "mate2": mates.mate2,
-            }
+            "data": data
         });
     });
 
@@ -245,12 +300,23 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
     });
 
     // ---- share_room ----
+    // 铃铛招募落点。客户端两种语义（RoomShareType 1=互关 2=粉丝 3=随机招募）：
+    // 仅 share_type_list 含 3 才创建/刷新招募行——含 3 时客户端把 3 移出列表走
+    // startRecruit 定时器（重发恒为 [3]），纯 [1]/[2] 一次性分享不广播铃铛。
+    // 房主每 15s 重发（上限 20 次），幂等 get-or-create（同房间恒定 attention_key）
+    // + 刷新过期时间与房主快照。客户端忽略响应体；招募记账尽力而为，失败不 500。
     fastify.post("/share_room", async (request: FastifyRequest, reply: FastifyReply) => {
         const body = request.body as ShareRoomBody;
         const viewerId = body.viewer_id;
         console.log("[MULTI] share_room received");
 
-        if (!await hasValidViewer(context, viewerId)) {
+        if (!isValidMultiViewerId(viewerId)) {
+            return reply.status(400).send({
+                "error": "Bad Request", "message": "Invalid request body."
+            });
+        }
+        const hostContext = await context.resolvePlayerContext(viewerId);
+        if (hostContext === null) {
             return reply.status(400).send({
                 "error": "Bad Request", "message": "Invalid request body."
             });
@@ -283,25 +349,70 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
             });
         }
 
-        // The share type list never reaches the log: only whether this call armed
-        // or disarmed the room's recruitment.
-        const recruited = body.share_type_list === undefined
-            ? true
-            : requestsRandomRecruitment(body.share_type_list);
-        const roomNumber = room.value.roomNumber;
-        const record = context.recruitmentRegistry.share({
-            recruited,
-            nowMs: Date.now(),
-            room: {
-                roomNumber,
-                category: room.value.category,
-                questId: room.value.questId,
-                hostViewerId: room.value.host.viewerId,
-            },
-        });
-        console.log(record
-            ? `[ATTENTION] recruitment open room=${roomNumber} category=${record.category} quest=${record.questId} share#=${record.shareCount}`
-            : `[ATTENTION] recruitment closed room=${roomNumber} recruited=${recruited}`);
+        const wantsRecruitment = Array.isArray(body.share_type_list)
+            && body.share_type_list.includes(3)
+            // 发布门（三模式参数）：publishBell off（NPC 快速预设）时按钮退化为
+            // 纯 NPC 开关——不落招募行，其他玩家收不到铃铛（客户端忽略响应体）
+            && getServerGameplaySettingsSync().multiRandomRecruitmentPublishEnabled;
+
+        // 好友房间大厅：bit1（互关）/bit2（单向）持久化到 social_room_shares。
+        // bit3 不进此表（随机招募只走全服铃铛）。合并语义是 OR-merge——客户端
+        // 对 [1,3]/[2,3] 的报文次序是 [3] 与 [1]/[2] 交错（[3] 每 15s 恒发），
+        // REPLACE 或按 bits=0 删行都会把已公开的位在铃铛重发间隙静默拆除；
+        // 行回收只走 disband 钩子 + TTL 兜底（客户端无取消分享 UI）。
+        const shareBits = (Array.isArray(body.share_type_list)
+            && body.share_type_list.includes(1) ? 1 : 0)
+            | (Array.isArray(body.share_type_list) && body.share_type_list.includes(2) ? 2 : 0);
+        if (shareBits > 0) {
+            // 尽力而为：注册表失败不影响铃铛分支与响应（15s 内的 [1]/[2] 一次性
+            // 报文没有重发自愈，失败由用户重新勾选恢复）
+            try {
+                openRoomShareRow({
+                    roomNumber: body.room_number,
+                    hostViewerId: viewerId,
+                    categoryId: room.value.category,
+                    questId: room.value.questId,
+                    shareBits,
+                    establisherJson: buildEstablisherSnapshot({
+                        character: room.value.hostMainCharacterId,
+                        rankLevel: getPlayerRankLevel(hostContext.player.rankPoint ?? 0),
+                        hostEntryTime: room.value.hostEntryTime,
+                        name: hostContext.player.name,
+                        evolutionImgLevel: getCharactersEvolutionImgLevels(
+                            hostContext.playerId,
+                            [room.value.hostMainCharacterId],
+                        )[0] ?? 0,
+                    }),
+                })
+            } catch (error) {
+                console.warn("[MULTI] room share lobby persist failed", describeError(error))
+            }
+        }
+        if (wantsRecruitment) {
+            // 尽力而为：招募落库/过期清理失败不得阻断分享主流程（15s 重发自愈）
+            try {
+                const recruitment = getOrCreateRecruitmentForRoom({
+                    hostPid: hostContext.playerId,
+                    hostViewerId: viewerId,
+                    category: room.value.category,
+                    questId: room.value.questId,
+                    roomNumber: body.room_number,
+                    isNewbieHost: isNewbieHostSync(hostContext.playerId),
+                    establisherJson: buildEstablisherSnapshot({
+                        character: room.value.hostMainCharacterId,
+                        rankLevel: getPlayerRankLevel(hostContext.player.rankPoint ?? 0),
+                        hostEntryTime: room.value.hostEntryTime,
+                    }),
+                    nowMs: getServerTime() * 1000,
+                });
+                console.log(`[MULTI] share_room ${recruitment.created ? "created" : "refreshed"} key=${recruitment.attentionKey}`);
+                pruneExpiredRecruitments(getServerTime() * 1000);
+                // 私服混合：发布后挂服务端 NPC 释放点（W>0 时启用；回调内惰性重读配置）
+                scheduleNpcRelease(body.room_number);
+            } catch (error) {
+                console.warn("[MULTI] share_room recruitment bookkeeping failed", describeError(error));
+            }
+        }
 
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send({
@@ -329,6 +440,14 @@ export function registerRoomRoutes(fastify: FastifyInstance, context: MultiHttpC
         if (!result.ok && result.error === "HUB_UNAVAILABLE") return hubUnavailable(reply);
         if (!result.ok && result.error !== "ROOM_NOT_FOUND") return forbidden(reply);
         console.log(result.ok ? "[MULTI] room disbanded" : "[MULTI] room already absent");
+        if (result.ok) {
+            // 尽力而为的铃铛卫生操作：绝不能让招募关闭失败破坏解散主流程
+            try {
+                closeRecruitmentForRoom(viewerId, body.room_number);
+            } catch (error) {
+                console.warn("[MULTI] close recruitment on disband failed", describeError(error));
+            }
+        }
 
         reply.header("content-type", "application/x-msgpack");
         return reply.status(200).send({

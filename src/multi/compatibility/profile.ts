@@ -75,12 +75,13 @@ function readVersionHeader(
 
 function resolveProfileSource(
     dependencies: CompatibilityProfileDependencies,
+    snapshot?: ContentSnapshot,
 ): CompatibilityProfileSource {
     if (dependencies.source) return Object.freeze({ ...dependencies.source })
-    const snapshot = (dependencies.getContentSnapshot ?? getContentSnapshot)()
+    const resolved = snapshot ?? (dependencies.getContentSnapshot ?? getContentSnapshot)()
     return Object.freeze({
-        cdnTargetVersion: snapshot.cdn.targetVersion,
-        contentDigest: snapshot.repository.info().multiBattleContentDigest,
+        cdnTargetVersion: resolved.cdn.targetVersion,
+        contentDigest: resolved.repository.info().multiBattleContentDigest,
         modeDigest: buildModeDigest(
             (dependencies.getLoadedModeIdentities ?? listLoadedModeIdentities)(),
         ),
@@ -90,6 +91,10 @@ function resolveProfileSource(
 export function createCompatibilityProfileFactory(
     dependencies: CompatibilityProfileDependencies = {},
 ): (headers: CompatibilityHeaders) => CoordinatorResult<MultiCompatibilityProfile> {
+    // 显式注入的 source 是调用方的固定选择，保持一次解析；
+    // 从快照派生的缓存按快照实例比较——内容热重载（provider.reload 换新
+    // 快照实例）后自动重算，避免对外宣告的 contentDigest 滞留旧值。
+    let cachedFor: ContentSnapshot | null = null
     let cachedSource = dependencies.source
         ? resolveProfileSource(dependencies)
         : null
@@ -103,20 +108,27 @@ export function createCompatibilityProfileFactory(
             })
             return { ok: false, error: "INCOMPATIBLE_ROOM" }
         }
-        if (cachedSource === null) {
-            try {
-                cachedSource = resolveProfileSource(dependencies)
-            } catch (error) {
-                if (error instanceof ContentSnapshotError
-                    && error.code === "CONTENT_SNAPSHOT_NOT_INITIALIZED") {
-                    dependencies.onCompatibilityRejection?.({
-                        code: "INCOMPATIBLE_ROOM",
-                        differences: [],
-                    })
-                    return { ok: false, error: "INCOMPATIBLE_ROOM" }
-                }
-                throw error
+        // 每请求取当前快照实例（内容热重载换实例后缓存自动重算，对外
+        // contentDigest 不滞留旧值）。取值在 try 内：快照未初始化期间保持
+        // 受控 INCOMPATIBLE_ROOM（不得向 multi 请求逸出 500）。
+        try {
+            const currentSnapshot = dependencies.source
+                ? cachedFor
+                : (dependencies.getContentSnapshot ?? getContentSnapshot)()
+            if (cachedSource === null || cachedFor !== currentSnapshot) {
+                cachedSource = resolveProfileSource(dependencies, currentSnapshot ?? undefined)
+                cachedFor = currentSnapshot
             }
+        } catch (error) {
+            if (error instanceof ContentSnapshotError
+                && error.code === "CONTENT_SNAPSHOT_NOT_INITIALIZED") {
+                dependencies.onCompatibilityRejection?.({
+                    code: "INCOMPATIBLE_ROOM",
+                    differences: [],
+                })
+                return { ok: false, error: "INCOMPATIBLE_ROOM" }
+            }
+            throw error
         }
         return {
             ok: true,

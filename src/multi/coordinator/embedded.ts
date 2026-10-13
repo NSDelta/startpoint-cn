@@ -1,4 +1,5 @@
 import type { MultiRoom, QuestCategory } from "../types"
+import { describeError } from "../describe-error"
 import {
     createRoom as createLocalRoom,
     disbandRoom as disbandLocalRoom,
@@ -49,6 +50,9 @@ const hostIdentityByRoom = new WeakMap<MultiRoom, ParticipantIdentity>()
 export interface EmbeddedMultiCoordinatorOptions {
     readonly allowRemoteParticipants?: boolean
     readonly onRoomDisband?: (roomNumber: string) => void
+    /** 战斗 release 回房（4→1 成功）后回调：一场一换在此撤除 NPC 编队（尽力而为）；
+     * battleSessionId 用于一代一闩（缺失 = 无战斗身份，闩为空串） */
+    readonly onBattleReleased?: (roomNumber: string, battleSessionId?: string) => void
     readonly onCompatibilityRejection?: (input: {
         readonly code: "INCOMPATIBLE_ROOM"
         readonly differences: readonly {
@@ -130,11 +134,13 @@ function resolveCompatibleRoom(input: CompatibleRoomInput): MultiRoom | undefine
 export class EmbeddedMultiCoordinator implements MultiCoordinator {
     private readonly allowRemoteParticipants: boolean
     private readonly onRoomDisband: EmbeddedMultiCoordinatorOptions["onRoomDisband"]
+    private readonly onBattleReleased: EmbeddedMultiCoordinatorOptions["onBattleReleased"]
     private readonly onCompatibilityRejection: EmbeddedMultiCoordinatorOptions["onCompatibilityRejection"]
 
     constructor(options: EmbeddedMultiCoordinatorOptions = {}) {
         this.allowRemoteParticipants = options.allowRemoteParticipants === true
         this.onRoomDisband = options.onRoomDisband
+        this.onBattleReleased = options.onBattleReleased
         this.onCompatibilityRejection = options.onCompatibilityRejection
     }
 
@@ -386,7 +392,7 @@ export class EmbeddedMultiCoordinator implements MultiCoordinator {
 
     private releaseIfFullyFinalized(status: BattleStatus): boolean {
         if (!sessionManager.isBattleFullyFinalized(status)) return false
-        return this.releaseBattle(status.roomNumber)
+        return this.releaseBattle(status.roomNumber, status.battleSessionId)
     }
 
     // Narrow release boundary: the room must return to Ready before any battle
@@ -396,12 +402,22 @@ export class EmbeddedMultiCoordinator implements MultiCoordinator {
     // re-attempt the release. The room meanwhile stays lobby-locked by
     // raising_state=4, which prevents a new battle from overlapping the
     // deferred release.
-    private releaseBattle(roomNumber: string): boolean {
+    private releaseBattle(roomNumber: string, battleSessionId?: string): boolean {
         if (!updateRoomState(roomNumber, 1)) {
             console.warn(`[MULTI] battle release deferred: room=${roomNumber} refused Ready`)
             return false
         }
         sessionManager.clearBattleExpectedCount(roomNumber)
+        // 一场一换挂点（设计 v2 §4）：release 是 finalize/abort 两路的唯一咽喉，
+        // 且先于 host re-enter——NPC 编队清除必须发生在客户端重建视图之前。
+        // battleSessionId 随行：一场一换的一代一闩靠它区分「同战重试」与「新一代释放」
+        if (this.onBattleReleased) {
+            try {
+                this.onBattleReleased(roomNumber, battleSessionId)
+            } catch (error) {
+                console.warn(`[MULTI] onBattleReleased callback failed: room=${roomNumber}`, describeError(error))
+            }
+        }
         return true
     }
 
@@ -431,6 +447,12 @@ export class EmbeddedMultiCoordinator implements MultiCoordinator {
         const hostClient = sessionManager.getRoomHostClient(room.room_number)
         if (hostClient) {
             sessionManager.broadcastToRoom(room.room_number, [1, [1, hostClient.mates]])
+        }
+        try {
+            const { syncRoomShareRow } = require("../room/share-sync") as typeof import("../room/share-sync")
+            syncRoomShareRow(room.room_number)
+        } catch (error) {
+            console.warn(`[MULTI] node cleanup share sync failed: room=${room.room_number}`, describeError(error))
         }
         return true
     }

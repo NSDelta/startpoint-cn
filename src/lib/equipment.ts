@@ -40,6 +40,14 @@ export function serializeFullEquipmentList(
     return list
 }
 
+// 惰性引入（调用点函数体内 require）：equipment → gacha-acquisition-mission-
+// settlement → mission/settlement → … → reward-grant → equipment 的运行时环
+// 在此断开（与 character.ts 同一手法，锻块结算门同款）
+function settleAcquisitionMissionsAtWritePoint(playerId: number): void {
+    const { settleAcquisitionMissionsAtWritePoint: settle } = require("./gacha-acquisition-mission-settlement") as typeof import("./gacha-acquisition-mission-settlement")
+    settle(playerId)
+}
+
 /**
  * Gives a player an amount of equipment.
  * 
@@ -66,6 +74,10 @@ export function givePlayerEquipmentSync(
             stack: amount - 1
         }
         insertPlayerEquipmentSync(playerId, equipmentId, owned)
+        // 新装备种类是 got_equip_kind_count 事实（任务 33 族）的产生时点：
+        // 当场窄域结算（同角色获得钩子；max 语义对未变化族幂等无害）。
+        // 失败策略随结算门（WARN 降级不连坐获得，重入深度 1 封顶）。
+        settleAcquisitionMissionsAtWritePoint(playerId)
     } else {
         // simply increase the stack
         const newStack = owned.stack + amount

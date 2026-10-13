@@ -63,17 +63,28 @@ test("admin UI owns root, compatibility redirects, assets, and client routes", a
     await app.ready()
     t.after(() => app.close())
 
+    // 根与 /admin 一律重定向进后台
     for (const [url, location] of [
         ["/", "/admin/"],
         ["/admin", "/admin/"],
+    ]) {
+        const response = await app.inject({ method: "GET", url })
+        assert.equal(response.statusCode, 302, url)
+        assert.equal(response.headers.location, location, url)
+    }
+
+    // 旧页面 URL：本 fork 按业主口径保留书签 shim（上游 0a115d13 已把它们退役成 404），
+    // 一律 302 进后台对应页，且响应体不得回落到 admin shell。
+    for (const [url, location] of [
         ["/player", "/admin/accounts"],
         ["/player/42", "/admin/players/42"],
         ["/mail", "/admin/mail"],
         ["/seeds", "/admin/seeds"],
     ]) {
-        const response = await app.inject({ method: "GET", url })
-        assert.equal(response.statusCode, 302, url)
-        assert.equal(response.headers.location, location, url)
+        const legacy = await app.inject({ method: "GET", url })
+        assert.equal(legacy.statusCode, 302, url)
+        assert.equal(legacy.headers.location, location, url)
+        assert.doesNotMatch(legacy.body, /admin shell/, url)
     }
 
     const clientRoute = await app.inject({ method: "GET", url: "/admin/accounts/active" })
@@ -207,6 +218,8 @@ test("legacy admin Tailwind build chain and assets are removed", () => {
 
 test("operator copy and embedded docs describe one required built-in admin", () => {
     const dashboard = fs.readFileSync(path.join(repositoryRoot, "admin/src/pages/Dashboard.tsx"), "utf8")
+    // 本 fork 保留 hero 里「唯一内置管理后台」一句（上游 095f0e6 删掉了它）；
+    // 双后台时期的措辞依然禁止回退。
     assert.match(dashboard, /唯一内置管理后台/)
     assert.doesNotMatch(dashboard, /新版 React 管理后台|旧后台页面保持冻结/)
 

@@ -9,6 +9,9 @@ import {
     ensureActiveQuestNewbieRescueEligibilityStorageSync,
 } from "../../lib/quest/active-quest-persistence";
 import { ensureSchemaColumn } from "../schema";
+import { ensureAttentionSchema } from "../social/attention-schema";
+import { ensureSocialFollowsSchema } from "../social/social-follows-schema";
+import { ensureSocialRoomSharesSchema } from "../social/social-room-shares-schema";
 import { initializeServerNewsSchemaSync } from "../schema/server-news";
 import { initializeServerGiftsSchemaSync } from "../schema/server-gifts";
 import { initializePlayerFollowsSchemaSync } from "../schema/player-follows";
@@ -43,11 +46,19 @@ export default function init(
         multi_rescue_fragment_rewards_enabled INTEGER NOT NULL DEFAULT 1,
         multi_rescue_host_rewards_enabled INTEGER NOT NULL DEFAULT 1,
         rush_700011_to_700017_compatibility_enabled INTEGER NOT NULL DEFAULT 1,
+        multi_random_recruitment_publish_enabled INTEGER NOT NULL DEFAULT 0,
+        multi_npc_release_seconds INTEGER NOT NULL DEFAULT 0,
+        multi_npc_close_recruitment_after_fill INTEGER NOT NULL DEFAULT 1,
+        multi_npc_one_shot_lifecycle INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     )`).run()
     ensureSchemaColumn(database, "server_gameplay_settings.multi_rescue_fragment_rewards_enabled")
     ensureSchemaColumn(database, "server_gameplay_settings.multi_rescue_host_rewards_enabled")
     ensureSchemaColumn(database, "server_gameplay_settings.rush_700011_to_700017_compatibility_enabled")
+    ensureSchemaColumn(database, "server_gameplay_settings.multi_random_recruitment_publish_enabled")
+    ensureSchemaColumn(database, "server_gameplay_settings.multi_npc_release_seconds")
+    ensureSchemaColumn(database, "server_gameplay_settings.multi_npc_close_recruitment_after_fill")
+    ensureSchemaColumn(database, "server_gameplay_settings.multi_npc_one_shot_lifecycle")
     const gameplaySettingsExist = database.prepare(
         "SELECT 1 FROM server_gameplay_settings WHERE id = 1",
     ).get() !== undefined
@@ -1289,6 +1300,13 @@ export default function init(
         PRIMARY KEY (player_id, equipment_id),
         FOREIGN KEY (player_id) REFERENCES players (id) ON DELETE CASCADE
     )`).run()
+
+
+    // 铃铛招募两表 + 索引：DDL 单一来源在 social/attention-schema.ts
+    //（与共享社交库 MULTI_SOCIAL_DB_PATH 同源，保证 schema 永远一致）
+    ensureAttentionSchema(database)
+    ensureSocialFollowsSchema(database)
+    ensureSocialRoomSharesSchema(database)
 
     database.prepare(`CREATE TABLE IF NOT EXISTS players_active_quests (
         player_id INTEGER PRIMARY KEY,

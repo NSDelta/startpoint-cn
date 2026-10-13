@@ -130,21 +130,32 @@ export async function prepareMultiplayerSettlement(
     }
 
     const participant = context.snapshotProvider.getParticipant(viewerId)
-    const verification = await context.settlementVerifier.verify({
-        nodeSessionId: participant.nodeSessionId,
-        viewerId,
-        roomNumber: activeQuest.roomNumber,
-        battleSessionId: activeQuest.battleSessionId,
-        coordinatorOrigin: activeQuest.coordinatorOrigin,
-    })
+    // finalize 瞬态竞态（TCP scene 上报与 finish HTTP 的时序差）：有界重试让
+    // finalize 落地后再结算——重试穷尽才 400（客户端回标题，活跃任务仍在，
+    // 重新 finish 可收敛；旧零奖励终态会让合法结算静默丢失，双审需修 2）
+    let verification: Awaited<ReturnType<typeof context.settlementVerifier.verify>> | null = null
+    let finalizedBattle: Awaited<ReturnType<typeof context.coordinator.finalizeBattle>> | null = null
+    for (let attempt = 0; ; attempt++) {
+        verification = await context.settlementVerifier.verify({
+            nodeSessionId: participant.nodeSessionId,
+            viewerId,
+            roomNumber: activeQuest.roomNumber,
+            battleSessionId: activeQuest.battleSessionId,
+            coordinatorOrigin: activeQuest.coordinatorOrigin,
+        })
+        if (verification.ok) {
+            finalizedBattle = await context.coordinator.finalizeBattle({
+                participant,
+                roomNumber: activeQuest.roomNumber,
+                battleSessionId: activeQuest.battleSessionId as BattleSessionId,
+            })
+            if (finalizedBattle.ok && finalizedBattle.value.finalized) break
+        }
+        if (attempt >= 3) break
+        await new Promise(resolve => setTimeout(resolve, 250))
+    }
     if (!verification.ok) return badRequest("Battle is not finalized.")
-
-    const finalizedBattle = await context.coordinator.finalizeBattle({
-        participant,
-        roomNumber: activeQuest.roomNumber,
-        battleSessionId: activeQuest.battleSessionId as BattleSessionId,
-    })
-    if (!finalizedBattle.ok || !finalizedBattle.value.finalized) {
+    if (finalizedBattle === null || !finalizedBattle.ok || !finalizedBattle.value.finalized) {
         return badRequest("Battle finalization is unavailable.")
     }
 
@@ -417,6 +428,8 @@ export function runMultiplayerSettlementOrchestration(input: MultiplayerSettleme
             incrementPlayerQuestMultiClearSync(input.playerId, questCategory, questId)
         }
         if (questAccomplished) {
+            // cond92（新手组队）已实现但未经真实条件测试：需新手房主
+            // （RANK≤80 ∨ 建号≤30天）开房 + 真人 guest 参与，待验证。
             recordRescueBattleMissionCountersSync(input.playerId, {
                 rescue: storedQuest.rescueFragmentEligible === true,
                 newbieRescue: storedQuest.newbieRescueEligible === true,

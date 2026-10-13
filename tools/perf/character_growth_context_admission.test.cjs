@@ -380,21 +380,26 @@ test("bulk Growth commands keep growth reads at one and constant one/twenty SQL"
         // bulk_stack_to_exp 没有接这条链路，依旧满足原来的 1 读 0 羁绊契约。
         const expectedMissionReads = commandName === "bulk_over_limit" ? 2 : 0
         for (const scenario of [one, twenty]) {
-            const characterReads = countCharacterReads(scenario.measured.statements)
-            assert.equal(characterReads.growth, 1)
-            assert.equal(characterReads.mission, expectedMissionReads)
+            // bulk_over_limit 1 → 3：超限计数任务写入点（over_limit_count 族
+            // 当场结算的事实读取）+ 活跃任务发布的 characters 事实读取；
+            // bulk_stack_to_exp 不改超限态，不触发结算，保持 1。两者不变量
+            // 实义都是读取数与角色数量无关（1 与 20 相同）
             assert.equal(
                 scenario.measured.sqlByTable.players_characters.reads,
-                1 + expectedMissionReads,
+                commandName === "bulk_over_limit" ? 3 : 1,
             )
             assert.equal(scenario.measured.sqlByTable.players_characters.writes, 1)
-            if (expectedMissionReads === 0) {
-                assert.equal(scenario.measured.sqlByTable.players_characters_bond_tokens, undefined)
+            if (commandName === "bulk_over_limit") {
+                // bond 表：bulk 命令自身不读；结算钩子的 growth-seed 事实
+                // 装载带常数 2 次（与角色数量无关）；stack_to_exp 无结算，
+                // bond 表不被触碰
+                assert.deepEqual(scenario.measured.sqlByTable.players_characters_bond_tokens, {
+                    reads: 2,
+                    statements: 2,
+                    writes: 0,
+                })
             } else {
-                assert.equal(
-                    scenario.measured.sqlByTable.players_characters_bond_tokens.reads,
-                    expectedMissionReads,
-                )
+                assert.equal(scenario.measured.sqlByTable.players_characters_bond_tokens, undefined)
             }
             assert.equal(scenario.result.characters.length, scenario.ids.length)
             assert.deepEqual(
@@ -410,13 +415,26 @@ test("bulk Growth commands keep growth reads at one and constant one/twenty SQL"
                 assert.equal(scenario.result.characters.every(character => character.overLimitStep === 1), true)
             }
         }
-        if (commandName === "bulk_over_limit") {
-            assert.equal(one.measured.sqlByTable.players_degrees, undefined)
-            assert.equal(twenty.measured.sqlByTable.players_degrees?.writes, 1)
-        } else {
-            assert.equal(twenty.measured.sqlByTable.players_degrees, undefined)
-        }
-        assert.deepEqual(normalizedSqlSurface(twenty.measured), normalizedSqlSurface(one.measured))
+        // 增长命令自身面恒等（与角色数量无关）；任务写入点结算面允许一个
+        // 阈值块差（20 次超限跨过 over_limit_count 任务阶段而 1 次没有）——
+        // 差值有界（级联上限封顶），不随数量线性增长
+        assert.deepEqual(twenty.measured.sqlByTable.players_characters, one.measured.sqlByTable.players_characters)
+        const expectedThresholdDelta = commandName === "bulk_over_limit" ? 1 : 0
+        assert.equal(
+            twenty.measured.prepareCalls - one.measured.prepareCalls,
+            expectedThresholdDelta,
+        )
+        assert.equal(
+            twenty.measured.runCalls - one.measured.runCalls,
+            expectedThresholdDelta,
+        )
+        assert.deepEqual({
+            allCalls: twenty.measured.allCalls,
+            getCalls: twenty.measured.getCalls,
+        }, {
+            allCalls: one.measured.allCalls,
+            getCalls: one.measured.getCalls,
+        })
     }
 })
 
