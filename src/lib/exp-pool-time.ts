@@ -1,7 +1,22 @@
 import { getTimeOffset, realDateFromServerTime, realToVirtual } from "../utils"
 
-export const EXP_POOL_GAIN_INTERVAL_MS = 60 * 1000
-export const EXP_POOL_MAX = 100000
+// 这两个数必须与客户端自己的渲染模型一致。客户端
+// (pinball.common.data.player.PlayerLogic.get_currentPooledExp) 按
+//   min(max_pool_exp, pooled_exp + gain_value * floor(elapsed / gain_seconds))
+// 渲染经验池，并把渲染值当作注入额发给服务端（expod/inject_exp）。服务端若用另一套
+// 参数，客户端算出的值会一直高于服务端余额，注入永远命中 INSUFFICIENT_EXP；客户端
+// 不解析该响应体、只做本地乐观升级，于是下次 load 回滚成「等级退回 + 经验返还」。
+//
+// 节奏 = 1 exp / 60 秒：2026-10-17 线上实测（客户端 192.168.0.100 请求注入 126860，
+// 库里池 105000、锚点 15.2 天未推进）反解出累积 ≈ 21822，只有「1/分钟」能对上
+// （15.2 天 ≈ 21823 分钟）；若按 1/秒，客户端会渲染到自己的上限、请求量级为六位数
+// 上限值而不是 126860。注意 <DATA_DIR>/content/store/objects/*.json 里那份带
+// pool_exp_gain_seconds=1 的 CN 配置副本自注为「已知参考值」（其 hash 未命中 entity
+// list），实测行为与它不一致，不可作 oracle。
+// 上限 max_pool_exp=999999（同一份配置副本；客户端实测渲染值 126860 > 旧上限 100000，
+// 证明旧上限偏小），池只受它约束，调大不影响玩法平衡。
+export const EXP_POOL_GAIN_INTERVAL_MS = 60_000
+export const EXP_POOL_MAX = 999999
 
 const LEGACY_ANCHOR_TOLERANCE_MS = 5 * EXP_POOL_GAIN_INTERVAL_MS
 const MAX_CATCH_UP_MS = EXP_POOL_MAX * EXP_POOL_GAIN_INTERVAL_MS
@@ -34,10 +49,30 @@ export function normalizeImportedExpPoolAnchor(
     if (realElapsedMs < 0) return new Date(nowMs)
     if (offsetMs !== 0
         && realElapsedMs > MAX_CATCH_UP_MS + LEGACY_ANCHOR_TOLERANCE_MS
-        && virtualElapsedMs < 0) {
+        && virtualElapsedMs < 0
+        && isVirtualDomainAnchor(rawAnchorMs, nowMs, offsetMs)) {
         return new Date(nowMs)
     }
     return persistedTime
+}
+
+/**
+ * Whether an anchor is better explained as a virtual-domain (client clock)
+ * timestamp than as a real one, judged by its distance to both clocks.
+ *
+ * The accumulator must grant at least what the client renders: the client
+ * computes `now - anchor` on its own clock and sends that value as the inject
+ * amount, so a server-side reset to "now" (granting nothing) makes every
+ * injection fail with INSUFFICIENT_EXP while the client keeps its optimistic
+ * level-up - which the next load rolls back. A simulated clock far from real
+ * time used to trigger exactly that reset for perfectly valid real anchors
+ * (2026-10-17: offset -442 days, anchor 15 days old, pool stuck at 105000 while
+ * the client rendered 126860). Only anchors that really look virtual are reset.
+ */
+function isVirtualDomainAnchor(rawAnchorMs: number, realNowMs: number, offsetMs: number): boolean {
+    const realDistance = Math.abs(realNowMs - rawAnchorMs)
+    const virtualDistance = Math.abs(realNowMs + offsetMs - rawAnchorMs)
+    return virtualDistance < realDistance
 }
 
 function offsetOrZero(offsetMs: number | null | undefined): number {
@@ -51,7 +86,10 @@ function offsetOrZero(offsetMs: number | null | undefined): number {
  * Existing databases stored this field in the virtual domain. A legacy anchor
  * is migrated only when its virtual interpretation is recent but its real
  * interpretation is far outside the pool's catch-up window. Ambiguous or
- * future anchors are reset to now and keep the current balance.
+ * future anchors are reset to now and keep the current balance - but only when
+ * they really look virtual (see isVirtualDomainAnchor): a reset grants nothing
+ * and therefore breaks parity with the client, which keeps accruing from the
+ * anchor it was last sent.
  */
 export function calculatePooledExpAtRealTime(
     expPool: number,
@@ -90,6 +128,7 @@ export function calculatePooledExpAtRealTime(
         offsetMs !== 0
         && realElapsedMs > MAX_CATCH_UP_MS + LEGACY_ANCHOR_TOLERANCE_MS
         && virtualElapsedMs < 0
+        && isVirtualDomainAnchor(rawAnchorMs, nowMs, offsetMs)
     ) {
         // A prior virtual date and a later server-time rollback cannot be
         // reconstructed safely. Preserve the balance and start a new anchor.
@@ -101,9 +140,14 @@ export function calculatePooledExpAtRealTime(
     const earned = elapsedMs < EXP_POOL_GAIN_INTERVAL_MS
         ? 0
         : Math.floor(elapsedMs / EXP_POOL_GAIN_INTERVAL_MS)
-    const nextExpPool = Math.min(EXP_POOL_MAX, Math.max(0, expPool) + earned)
+    const rawBalance = Math.max(0, expPool)
+    const nextExpPool = Math.min(EXP_POOL_MAX, rawBalance + earned)
+    // 越界余额（导入存档、邮件或管理工具可能写入高于上限的值，负数同理）必须夹紧并
+    // 落地：否则上限会吃掉全部 earned，earned 恒为 0，下面的早退分支让越界值永久留在
+    // 库里，而客户端仍按自己的模型在它之上继续累积 → 注入永久 INSUFFICIENT_EXP。
+    const clamped = rawBalance !== expPool || rawBalance > EXP_POOL_MAX
 
-    if (earned === 0 && !repaired) {
+    if (earned === 0 && !repaired && !clamped) {
         return {
             expPool,
             expPooledTime,
@@ -115,8 +159,8 @@ export function calculatePooledExpAtRealTime(
     return {
         expPool: nextExpPool,
         expPooledTime: new Date(nowMs),
-        earned: Math.max(0, nextExpPool - Math.max(0, expPool)),
-        repaired,
+        earned: Math.max(0, nextExpPool - rawBalance),
+        repaired: repaired || clamped,
     }
 }
 

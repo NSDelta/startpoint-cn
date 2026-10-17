@@ -250,12 +250,12 @@ test("inject_exp settles the real-time pool accrual before spending", () => {
         )
         assert.equal(fixture.setPlayer(strictPlayer, {}).expPool, 100, "被拒时经验池不得被扣减")
 
-        // 实盘形态:池 105000 已越过上限 100000 ⇒ 累积恒为 0、锚点冻结,
-        // 客户端显示被自身上限夹在 100000 ⇒「用光」仍需可整额注入
+        // 实盘形态:池 105000(线上事故值)+ 锚点在当下。上限已从 100000 提到 999999,
+        // 池不再被上限夹住、锚点不再冻结,注入 100000 后必须保留超出的 5000
         const cappedPlayer = fixture.createPlayer()
         fixture.setPlayer(cappedPlayer, {
             expPool: 105000,
-            expPooledTime: new Date(Date.now() - 10 * 60 * 1000),
+            expPooledTime: new Date(),
         })
         fixture.addCharacter(cappedPlayer, 341005, { exp: 10, overLimitStep: 4 })
         const capped = exp.executeInjectCharacterExp({
@@ -266,6 +266,23 @@ test("inject_exp settles the real-time pool accrual before spending", () => {
         })
         assert.equal(capped.overflowExp, 0, "上限内注入不得溢出")
         assert.equal(capped.expPool, 5000, "超上限池注入后必须保留超出的 5000")
+
+        // 2026-10-17 线上事故的最小复现:同一个 105000 的池带 10 分钟锚点时,累积必须
+        // 照常结算。旧实现(上限 100000)对越界池恒算得 earned=0、锚点永久冻结,而客户端
+        // 按 1/分钟继续渲染 ⇒ 注入额恒大于库内值 ⇒ 每次都被拒绝、等级退回使用前状态。
+        const accruingPlayer = fixture.createPlayer()
+        fixture.setPlayer(accruingPlayer, {
+            expPool: 105000,
+            expPooledTime: new Date(Date.now() - 10 * 60 * 1000),
+        })
+        fixture.addCharacter(accruingPlayer, 341005, { exp: 10, overLimitStep: 4 })
+        const accruing = exp.executeInjectCharacterExp({
+            playerId: accruingPlayer,
+            characterId: 341005,
+            addExp: 100000,
+            evaluationTime: new Date("2026-08-31T00:00:00.000Z"),
+        })
+        assert.equal(accruing.expPool, 5010, "超上限池也必须按 1/分钟照常累积(锚点不得冻结)")
     } finally {
         fixture.cleanup()
     }

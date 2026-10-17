@@ -257,6 +257,11 @@ const routes = async (fastify: FastifyInstance) => {
             // 写入前抛出，存档不受影响。其余错误保持 4xx/5xx。
             if (error instanceof CharacterGrowthError && error.code === "INSUFFICIENT_EXP") {
                 const player = getPlayerSync(resolved.playerId)
+                // 这里说明客户端的池模型与服务端不一致（见 src/lib/exp-pool-time.ts 顶部
+                // 的定标注释）。两个数都留痕，下一次可以直接对比。
+                console.warn(
+                    `[EXPOD] inject_exp rejected: character=${body.character_id} requested=${body.exp} pool=${player === null ? "unknown" : player.expPool}`,
+                )
                 if (player !== null) {
                     reply.header("content-type", "application/x-msgpack")
                     return reply.status(200).send({
