@@ -1,6 +1,7 @@
 import type { Database } from "better-sqlite3"
 import { getDb } from "../db"
 import { getSharedSocialDb } from "../social/shared-db"
+import { getServerTime } from "../../utils"
 
 export interface AttentionRecruitment {
     id: number
@@ -37,6 +38,23 @@ const DEFAULT_RECRUITMENT_LIFETIME_MS = 45_000
 const PRUNE_RETENTION_MS = 24 * 60 * 60 * 1000
 
 /**
+ * 停止招募（解散/停止随机招募/热切换关铃）后的宽限窗：已经收到铃铛的 guest
+ * 在窗口内仍可持票进房，窗口结束后该 key 彻底失效。
+ *
+ * 语义来自参考实现 Ku1o/startpoint-cn-kulo 的 stopped-notice
+ * （src/multi/recruitment.ts: `stopRandomRecruitment` 保留
+ * `stoppedNoticeViewers`，`STOPPED_NOTICE_GRACE_MS = max(30s, env)`）：
+ * 房主停铃与 guest 点击之间存在真实竞态，立即失效会让"点了却进不去"的
+ * 玩家看到的是通用失败而不是"该房间已解散"。取 max(30s, 单次授权寿命)，
+ * 因为一张已下发的铃铛本身就有 45s 的有效期。
+ */
+export const STOPPED_NOTICE_GRACE_MS = (() => {
+    const parsed = Number.parseInt(process.env.MULTI_ATTENTION_STOPPED_GRACE_MS ?? "", 10)
+    if (Number.isFinite(parsed) && parsed > 0) return Math.max(30_000, parsed)
+    return Math.max(30_000, DEFAULT_RECRUITMENT_LIFETIME_MS)
+})()
+
+/**
  * 社交域存储接口（A2）：多节点部署时社交状态的平等读写边界。
  * 默认实现为主库 SQLite；设置 MULTI_SOCIAL_DB_PATH 后由共享社交库承载
  * （见 src/data/social/shared-db.ts）。PG 后端属部署侧决策，接口即接入形态。
@@ -57,7 +75,20 @@ export interface AttentionStore {
         nowMs: number,
         limit: number,
     ): AttentionRecruitment[]
+    /** 只读候选（不写投递行）：投递资格门在写之前判定，被滤房间不得占名额 */
+    listOpenRecruitmentsForViewer(
+        viewerId: number,
+        nowMs: number,
+        limit: number,
+    ): AttentionRecruitment[]
+    /** 给通过资格门的候选补投递行（幂等） */
+    markRecruitmentsDelivered(recruitmentIds: readonly number[], viewerId: number): void
     findOpenRecruitmentByKey(attentionKey: string, nowMs: number): AttentionRecruitment | null
+    /**
+     * 停止招募后的宽限读：status='closed' 且尚未过期的行（已投递 guest 仍持票）。
+     * open 招募一律不走这里。
+     */
+    findStoppedRecruitmentByKey(attentionKey: string, nowMs: number): AttentionRecruitment | null
     /** summon 释放判定用：按 (房主, 房间) 读 open 招募；过期/关闭返回 null；
      * includeExpired=true 时不过滤过期（释放点服务端接管行寿命的兜底读） */
     findOpenRecruitmentForRoom(hostViewerId: number, roomNumber: string, nowMs: number, includeExpired?: boolean): AttentionRecruitment | null
@@ -69,11 +100,11 @@ export interface AttentionStore {
         state: "accepted" | "declined",
         nowMs: number,
     ): void
-    closeRecruitmentForRoom(hostViewerId: number, roomNumber: string): void
+    closeRecruitmentForRoom(hostViewerId: number, roomNumber: string, nowMs?: number): void
     /** keep-open 行寿命接管：NPC 进场后把 open 招募过期时间外推（服务端接管，客户端停铃不再依赖） */
     refreshRecruitmentForRoom(hostViewerId: number, roomNumber: string, nowMs: number, lifetimeMs: number): void
     /** 热切换清扫：publishBell on→off 时全量关闭 open 招募（共享库下跨节点生效） */
-    closeAllOpenRecruitments(): void
+    closeAllOpenRecruitments(nowMs?: number): void
     expireStaleRecruitments(nowMs: number): void
     pruneExpiredRecruitments(nowMs: number, retentionMs?: number): void
 }
@@ -205,11 +236,45 @@ export function createSqliteAttentionStore(db: Database): AttentionStore {
             return rows.map(mapRecruitmentRow)
         },
 
+        listOpenRecruitmentsForViewer(viewerId, nowMs, limit) {
+            const rows = db.prepare(`
+                SELECT r.* FROM attention_recruitments r
+                LEFT JOIN attention_deliveries d
+                    ON d.recruitment_id = r.id AND d.viewer_id = ?
+                WHERE r.status = 'open' AND r.expires_at_ms > ?
+                    AND r.host_viewer_id != ?
+                    AND (d.state IS NULL OR d.state = 'delivered')
+                ORDER BY r.posted_at_ms DESC
+                LIMIT ?
+            `).all(viewerId, nowMs, viewerId, limit) as Array<Record<string, unknown>>
+            return rows.map(mapRecruitmentRow)
+        },
+
+        markRecruitmentsDelivered(recruitmentIds, viewerId) {
+            if (recruitmentIds.length === 0) return
+            const insertDelivery = db.prepare(`
+                INSERT OR IGNORE INTO attention_deliveries (recruitment_id, viewer_id, state)
+                VALUES (?, ?, 'delivered')
+            `)
+            const markAll = db.transaction(() => {
+                for (const recruitmentId of recruitmentIds) insertDelivery.run(recruitmentId, viewerId)
+            })
+            markAll()
+        },
+
         /** quest/start（multi）携带 attention_key 时的招募解析；过期/关闭返回 null */
         findOpenRecruitmentByKey(attentionKey, nowMs) {
             const row = db.prepare(`
                 SELECT * FROM attention_recruitments
                 WHERE attention_key = ? AND status = 'open' AND expires_at_ms > ?
+            `).get(attentionKey, nowMs) as Record<string, unknown> | undefined
+            return row !== undefined ? mapRecruitmentRow(row) : null
+        },
+
+        findStoppedRecruitmentByKey(attentionKey, nowMs) {
+            const row = db.prepare(`
+                SELECT * FROM attention_recruitments
+                WHERE attention_key = ? AND status = 'closed' AND expires_at_ms > ?
             `).get(attentionKey, nowMs) as Record<string, unknown> | undefined
             return row !== undefined ? mapRecruitmentRow(row) : null
         },
@@ -248,12 +313,20 @@ export function createSqliteAttentionStore(db: Database): AttentionStore {
             `).run(state, nowMs, recruitmentId, viewerId)
         },
 
-        /** 解散房间时关闭该房间仍 open 的招募（开战/满员依赖过期收敛，不在此处理） */
-        closeRecruitmentForRoom(hostViewerId, roomNumber) {
+        /**
+         * 解散/停止招募时关闭该房间仍 open 的招募（开战/满员依赖过期收敛，不在此处理）。
+         * 关闭同时把行寿命延长到宽限窗（只增不减）：已收到铃铛的 guest 在窗口内
+         * 仍能凭 key 进房，窗口外由 expires_at_ms 自然淘汰。
+         */
+        closeRecruitmentForRoom(hostViewerId, roomNumber, nowMs) {
+            // 时间锚必须与库内其它时间戳同域（虚拟钟，见本文件在线寿命常量）；
+            // 用真实钟会让宽限窗在时钟偏移部署下变成"永不过期"。
+            const anchorMs = Number.isFinite(nowMs) ? nowMs as number : getServerTime() * 1000
             db.prepare(`
-                UPDATE attention_recruitments SET status = 'closed'
+                UPDATE attention_recruitments
+                SET status = 'closed', expires_at_ms = MAX(expires_at_ms, ?)
                 WHERE host_viewer_id = ? AND room_number = ? AND status = 'open'
-            `).run(hostViewerId, roomNumber)
+            `).run(anchorMs + STOPPED_NOTICE_GRACE_MS, hostViewerId, roomNumber)
         },
 
         /** keep-open 行寿命接管：仅 open 行生效；过期/关闭行不复活 */
@@ -265,12 +338,15 @@ export function createSqliteAttentionStore(db: Database): AttentionStore {
             `).run(nowMs + lifetimeMs, hostViewerId, roomNumber, nowMs)
         },
 
-        /** 热切换清扫：publishBell on→off 时全量关闭 open 招募（共享库下跨节点生效） */
-        closeAllOpenRecruitments() {
+        /** 热切换清扫：publishBell on→off 时全量关闭 open 招募（共享库下跨节点生效）；
+         * 同样保留宽限窗（已下发的铃铛不因开关翻转而立刻失效） */
+        closeAllOpenRecruitments(nowMs) {
+            const anchorMs = Number.isFinite(nowMs) ? nowMs as number : getServerTime() * 1000
             db.prepare(`
-                UPDATE attention_recruitments SET status = 'closed'
+                UPDATE attention_recruitments
+                SET status = 'closed', expires_at_ms = MAX(expires_at_ms, ?)
                 WHERE status = 'open'
-            `).run()
+            `).run(anchorMs + STOPPED_NOTICE_GRACE_MS)
         },
 
         /** 卫生兜底：把过期招募标记为 expired（读路径本就按 expires_at_ms 过滤，可选调用） */
@@ -337,6 +413,18 @@ export function deliverOpenRecruitmentsToViewer(viewerId: number, nowMs: number,
 
 export function findOpenRecruitmentByKey(attentionKey: string, nowMs: number) {
     return getAttentionStore().findOpenRecruitmentByKey(attentionKey, nowMs)
+}
+
+export function findStoppedRecruitmentByKey(attentionKey: string, nowMs: number) {
+    return getAttentionStore().findStoppedRecruitmentByKey(attentionKey, nowMs)
+}
+
+export function listOpenRecruitmentsForViewer(viewerId: number, nowMs: number, limit: number) {
+    return getAttentionStore().listOpenRecruitmentsForViewer(viewerId, nowMs, limit)
+}
+
+export function markRecruitmentsDelivered(recruitmentIds: readonly number[], viewerId: number) {
+    getAttentionStore().markRecruitmentsDelivered(recruitmentIds, viewerId)
 }
 
 export function findOpenRecruitmentForRoom(

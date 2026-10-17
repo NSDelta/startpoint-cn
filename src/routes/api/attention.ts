@@ -3,13 +3,15 @@ import { getPlayerSync } from "../../data/domains/player"
 import { getSession } from "../../data/domains/session"
 import { resolvePlayerIdSync } from "../../data/activeAccount";
 import {
-    deliverOpenRecruitmentsToViewer,
+    listOpenRecruitmentsForViewer,
+    markRecruitmentsDelivered,
     parseEstablisherSnapshot,
 } from "../../data/domains/attention"
 import { getLocalFollowRelationSync } from "../../data/domains/follow"
 import { touchPresence } from "../../multi/presence"
 import { isBellDeliveryEligible } from "../../multi/bell-gate"
 import { generateDataHeaders, getServerTime } from "../../utils";
+import { getRealNowMs } from "../../runtime/time/game-time";
 
 // 与下方 config.return_attention_max_num 保持一致：单次 check 最多携带的铃铛数
 const RETURN_ATTENTION_MAX_NUM = 3
@@ -68,16 +70,37 @@ const routes = async (fastify: FastifyInstance) => {
             console.warn("[ATTENTION] presence touch failed (degraded)", error)
         }
 
+        // 剩余名额 = 客户端本轮请求数 − 它手里已持有的铃铛数（对齐参考实现
+        // Ku1o/startpoint-cn-kulo 的 availableSlots = max(0, min(3, request) − holding)）：
+        // holding_number 就是"我已经有 N 个铃铛了，别再塞满我"。
+        // 缺字段/非法值时按"没请求上限"与"手里没有"处理——少发一张铃铛对玩家不可见，
+        // 而误判成"手里已满"会让整条随机招募对所有人静默失效。
+        const requestedRaw = Number.isFinite(body.request_number) ? body.request_number : RETURN_ATTENTION_MAX_NUM
+        const holdingRaw = Number.isFinite(body.holding_number) ? body.holding_number : 0
+        const availableSlots = Math.max(
+            0,
+            Math.min(RETURN_ATTENTION_MAX_NUM, requestedRaw) - Math.max(0, holdingRaw),
+        )
+
         // 读时惰性投递：guest 轮询时才写入投递行（对齐官方"房主 15s 重发 × guest 轮询"）
         const nowMs = getServerTime() * 1000
-        let bells: ReturnType<typeof deliverOpenRecruitmentsToViewer> = []
+        // 资格门只能读真实钟域（presence/共享注册行都是真实毫秒），与投递谓词的虚拟钟区分开
+        const realNowMs = getRealNowMs()
+        let bells: ReturnType<typeof listOpenRecruitmentsForViewer> = []
         try {
-            // T1 投递谓词（设计 §5）：本节点房间过房间态门（未开战/房主在线/真人未满员），
-            // 异节点房间放行；先过滤后下发，被滤房间的投递行已建（幂等无害）
-            // 取数放大 3 倍再过滤补满：T1 被滤房间不得挤占 return_attention_max_num 名额
-            bells = deliverOpenRecruitmentsToViewer(viewerId, nowMs, RETURN_ATTENTION_MAX_NUM * 3)
-                .filter(recruitment => isBellDeliveryEligible(recruitment.roomNumber))
-                .slice(0, RETURN_ATTENTION_MAX_NUM)
+            // T1 投递谓词（设计 §5）：**先只读候选 → 过资格门 → 再写投递行**。
+            // 被滤房间不留投递行、也不占 return_attention_max_num 名额（参考实现
+            // 的"不为不存在的房主业务记录消耗投递配额"）；取数放大 3 倍补满。
+            if (availableSlots > 0) {
+                bells = listOpenRecruitmentsForViewer(viewerId, nowMs, availableSlots * 3)
+                    .filter(recruitment => isBellDeliveryEligible({
+                        roomNumber: recruitment.roomNumber,
+                        hostPid: recruitment.hostPid,
+                        hostViewerId: recruitment.hostViewerId,
+                    }, realNowMs))
+                    .slice(0, availableSlots)
+                markRecruitmentsDelivered(bells.map(recruitment => recruitment.id), viewerId)
+            }
         } catch (error) {
             console.warn("[ATTENTION] delivery failed (empty multi)", error)
         }

@@ -272,14 +272,16 @@ test("释放点：resetNpcReleaseState 后可重新挂点", async () => {
     roomManager.disbandRoom(room.room_number)
 })
 
-// ---- T1 投递资格门 ----
+// ---- T1 投递资格门（候选在写投递行之前逐个判定，被滤掉的不占名额）----
 test("T1：开战拒绝、host 掉线拒绝、真人满员拒绝、异节点放行", async t => {
     const { room, host } = setupHostRoom(t)
+    // 本节点房间只看房间态，候选里的 hostPid/hostViewerId 不参与判定
+    const facts = { roomNumber: room.room_number, hostPid: 0, hostViewerId: HOST_VIEWER }
 
-    assert.equal(isBellDeliveryEligible(room.room_number), true, "正常 lobby：合格")
+    assert.equal(isBellDeliveryEligible(facts, getServerTime() * 1000), true, "正常 lobby：合格")
 
     assert.equal(updateRoomStateIfPossible(room.room_number), true, "前置：转 Battle")
-    assert.equal(isBellDeliveryEligible(room.room_number), false, "战斗中：拒绝")
+    assert.equal(isBellDeliveryEligible(facts, getServerTime() * 1000), false, "战斗中：拒绝")
 
     t.after(() => roomManager.disbandRoom(room.room_number))
 })
@@ -294,12 +296,30 @@ test("T1：房主掉线（hostClient 缺席）拒绝", () => {
         0, 1, false, { nodeSessionId: "embedded", viewerId: HOST_VIEWER + 300 },
     )
     // 不注册任何 session client → hostClient 缺席
-    assert.equal(isBellDeliveryEligible(room.room_number), false, "房主不在线：拒绝")
+    assert.equal(
+        isBellDeliveryEligible({ roomNumber: room.room_number, hostPid: 0, hostViewerId: HOST_VIEWER + 300 }, getServerTime() * 1000),
+        false, "房主不在线：拒绝",
+    )
     roomManager.disbandRoom(room.room_number)
 })
 
-test("T1：异节点房间（本节点不可见）放行", () => {
-    assert.equal(isBellDeliveryEligible("000000"), true, "查无房间 = 其他节点持有：放行")
+test("T1：异节点房间——房主业务行存在才放行（不再无条件放行）", () => {
+    const { insertAccountSync } = require("../src/data/domains/account")
+    const { insertDefaultPlayerSync } = require("../src/data/domains/player")
+    const account = insertAccountSync({
+        appId: "wf_cn", idpAlias: "", idpCode: "test", idpId: `npc-release-${Date.now()}`, status: "normal",
+    })
+    const player = insertDefaultPlayerSync(account.id)
+    const now = getServerTime() * 1000
+
+    assert.equal(
+        isBellDeliveryEligible({ roomNumber: "000000", hostPid: player.id, hostViewerId: HOST_VIEWER }, now),
+        true, "跨节点房间：房主业务行在（且本节点无大厅注册行）→ 放行",
+    )
+    assert.equal(
+        isBellDeliveryEligible({ roomNumber: "000000", hostPid: player.id + 900000, hostViewerId: HOST_VIEWER }, now),
+        false, "房主业务记录缺失 → 拒绝（不为缺行的房主消耗投递配额）",
+    )
 })
 
 // ---- 重新开启招募时重算配额（用户定案语义：补全发生在开启招募，而非离开瞬间）----

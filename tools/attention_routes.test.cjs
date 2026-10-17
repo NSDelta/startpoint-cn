@@ -46,6 +46,7 @@ const {
     getOrCreateRecruitmentForRoom,
 } = require("../src/data/domains/attention")
 const { isPresenceOnline } = require("../src/multi/presence")
+const { upsertRoomShareRowSync } = require("../src/data/domains/social-room-shares")
 const { getServerTime } = require("../src/utils")
 const { createRoom } = require("../src/multi/room/manager")
 const { createEmbeddedMultiHttpContext } = require("../src/multi/http/context")
@@ -191,7 +192,7 @@ async function main() {
         followedAtMs: Date.now(),
     })
     const mutual = unpack(Buffer.from((await post(fastify, "/api/index.php/attention/check", {
-        viewer_id: guest.viewerId, holding_number: 3, retry_count: 0, request_number: 3,
+        viewer_id: guest.viewerId, holding_number: 1, retry_count: 0, request_number: 3,
     })).body, "base64")).data
     assert.equal(mutual.multi[0].quest_info.establisher_follow, 1, "互关投影 establisher_follow=1")
 
@@ -206,6 +207,85 @@ async function main() {
         "SELECT COUNT(*) AS n FROM attention_deliveries WHERE viewer_id = ?"
     ).get(guest.viewerId)
     assert.equal(deliveries.n, 1, "重复轮询不得产生重复投递行")
+
+    // ---- 投递名额 = request_number − holding_number（对齐参考实现 availableSlots）----
+    const saturated = unpack(Buffer.from((await post(fastify, "/api/index.php/attention/check", {
+        viewer_id: guest.viewerId, holding_number: 3, retry_count: 0, request_number: 3,
+    })).body, "base64")).data
+    assert.equal(saturated.multi.length, 0, "手里已拿满请求数（holding=request）时不得再下发")
+    assert.equal(
+        db.prepare("SELECT COUNT(*) AS n FROM attention_deliveries WHERE viewer_id = ?").get(guest.viewerId).n,
+        1, "名额为 0 时不得写投递行",
+    )
+    const partiallyHeld = unpack(Buffer.from((await post(fastify, "/api/index.php/attention/check", {
+        viewer_id: guest.viewerId, holding_number: 1, retry_count: 0, request_number: 2,
+    })).body, "base64")).data
+    assert.equal(partiallyHeld.multi.length, 1, "request=2、holding=1 时仍可补 1 张")
+
+    // ---- T1 资格门：异节点房间只看跨节点可见且"缺失即未知"的事实 ----
+    const closedRoom = "345679"
+    getOrCreateRecruitmentForRoom({
+        hostPid: host.playerId,
+        hostViewerId: host.viewerId,
+        category: 1,
+        questId: 1001001,
+        roomNumber: closedRoom,
+        isNewbieHost: true,
+        establisherJson: buildEstablisherSnapshot({ character: 341005, rankLevel: 42, hostEntryTime: 1700 }),
+        nowMs: getServerTime() * 1000,
+    })
+    upsertRoomShareRowSync({
+        roomNumber: closedRoom,
+        hostViewerId: host.viewerId,
+        categoryId: 1,
+        questId: 1001001,
+        shareBits: 3,
+        raisingState: 4,
+        mates: 1,
+        establisherJson: "{}",
+        nowMs: getServerTime() * 1000,
+    })
+    const fullRoom = "345680"
+    getOrCreateRecruitmentForRoom({
+        hostPid: host.playerId,
+        hostViewerId: host.viewerId,
+        category: 1,
+        questId: 1001001,
+        roomNumber: fullRoom,
+        isNewbieHost: true,
+        establisherJson: buildEstablisherSnapshot({ character: 341005, rankLevel: 42, hostEntryTime: 1700 }),
+        nowMs: getServerTime() * 1000,
+    })
+    upsertRoomShareRowSync({
+        roomNumber: fullRoom,
+        hostViewerId: host.viewerId,
+        categoryId: 1,
+        questId: 1001001,
+        shareBits: 3,
+        raisingState: 2,
+        mates: 3,
+        establisherJson: "{}",
+        nowMs: getServerTime() * 1000,
+    })
+    const orphanedRoom = "345681"
+    getOrCreateRecruitmentForRoom({
+        hostPid: 999999,
+        hostViewerId: 999999,
+        category: 1,
+        questId: 1001001,
+        roomNumber: orphanedRoom,
+        isNewbieHost: true,
+        establisherJson: "{}",
+        nowMs: getServerTime() * 1000,
+    })
+    const gated = unpack(Buffer.from((await post(fastify, "/api/index.php/attention/check", {
+        viewer_id: guest.viewerId, holding_number: 0, retry_count: 0, request_number: 3,
+    })).body, "base64")).data
+    const roomNumbers = gated.multi.map(bell => bell.quest_info.room_number)
+    assert.equal(roomNumbers.includes(closedRoom), false, "已解散（注册行 raising_state=4）的房间不得下发")
+    assert.equal(roomNumbers.includes(fullRoom), false, "满员（注册行 mates>=3）的房间不得下发")
+    assert.equal(roomNumbers.includes(orphanedRoom), false, "房主业务行已消失的招募不得下发")
+    assert.equal(roomNumbers.includes("345678"), true, "正常的异节点招募不受资格门影响")
 
     // ---- /attention/action：参加优先度评分（客户端强校验两个 Float） ----
     const action = await post(fastify, "/api/index.php/attention/action", {

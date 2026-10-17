@@ -57,6 +57,7 @@ import { resolveLocalRescueFragmentEligibility } from "../rescue-fragment-reward
 import { isNewbieHostSync } from "../../lib/newbie-host";
 import {
     findOpenRecruitmentByKey,
+    findStoppedRecruitmentByKey,
     hasActiveDelivery,
     recordResponse,
     type AttentionRecruitment,
@@ -96,10 +97,17 @@ export function resolveBellRecruitmentForStart(
     roomNumber: string,
     hostViewerId: number,
     viewerId: number,
+    resolveNowMs: number = getServerTime() * 1000,
 ): AttentionRecruitment | null {
     if (attentionKey === null) return null;
     try {
-        const recruitment = findOpenRecruitmentByKey(attentionKey, getServerTime() * 1000);
+        const nowMs = resolveNowMs;
+        // 停止招募后的宽限窗（对齐参考实现 Ku1o/startpoint-cn-kulo 的 stopped-notice，
+        // src/multi/recruitment.ts）：房主停铃与 guest 点击之间存在真实竞态，窗口内
+        // 已收到铃铛的 guest 仍可凭 key 进房，窗口外才彻底失效。两条路径都要求
+        // key/房间/房主一致且持有有效投递行（T2 门票），其余一律 fail-open 为 null。
+        const recruitment = findOpenRecruitmentByKey(attentionKey, nowMs)
+            ?? findStoppedRecruitmentByKey(attentionKey, nowMs);
         if (recruitment === null) return null;
         if (recruitment.roomNumber !== roomNumber || recruitment.hostViewerId !== hostViewerId) {
             return null;

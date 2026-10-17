@@ -41,6 +41,11 @@ const ADD_FAILURE_RESULT_CODE: Record<string, number> = {
     target_limit: 1452,
 }
 
+// bulk_edit 的规模闸门（参考实现 Ku1o/startpoint-cn-kulo 的教训）：先把工作量与
+// 取值钉住，再开始逐条 await 解析目标 / 打开写事务。上限与 content 的关注数上限
+// （max_follows_count = 100）同量级——一次批量修改不可能合法地超过它。
+const BULK_FOLLOW_ID_LIMIT = 100
+
 function ok(viewerId: number, reply: FastifyReply) {
     reply.header("content-type", "application/x-msgpack")
     return reply.status(200).send({
@@ -130,6 +135,16 @@ export function registerFollowWriteRoutes(fastify: FastifyInstance): void {
         const deleteList = body?.delete_follow_id_list
         if (!Array.isArray(addList) || !Array.isArray(deleteList)) return badRequest(reply)
         if (addList.length + deleteList.length === 0) return bulkOk(viewer.viewerId, reply)
+        // 规模与取值先于任何 await/事务判定：没有上界时，一个超长列表就是一次
+        // 免费的写放大（逐条解析 + 一次事务），而客户端 UI 只会发很短的列表。
+        if (addList.length > BULK_FOLLOW_ID_LIMIT
+            || deleteList.length > BULK_FOLLOW_ID_LIMIT
+            || addList.length + deleteList.length > BULK_FOLLOW_ID_LIMIT) {
+            return badRequest(reply, "Too many follow ids in one request.")
+        }
+        for (const followId of [...addList, ...deleteList]) {
+            if (!Number.isSafeInteger(followId) || (followId as number) <= 0) return badRequest(reply)
+        }
 
         const addTargetPlayerIds: number[] = []
         for (const followId of addList) {

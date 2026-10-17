@@ -257,6 +257,47 @@ test("delete_followed removes the incoming edge and bulk_edit is atomic", async 
     )
 })
 
+test("bulk_edit bounds the work before resolving every id", async () => {
+    const g = await createViewer("bulk-g")
+    const target = await createViewer("bulk-h")
+
+    // 超过规模闸门（100）在任何解析/事务之前就被拒绝
+    const tooMany = await app.inject({
+        method: "POST",
+        url: "/api/index.php/follow/bulk_edit",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: pack({
+            viewer_id: g.viewerId,
+            add_follow_id_list: Array.from({ length: 101 }, () => target.viewerId),
+            delete_follow_id_list: [],
+        }).toString("base64"),
+    })
+    assert.equal(tooMany.statusCode, 400, "超长批量列表按非法请求拒绝")
+    const afterReject = decode(await postFollow("lists", { viewer_id: g.viewerId }))
+    assert.equal(afterReject.data.follow_info.length, 0, "被拒的批量请求不得写入任何边")
+
+    // 非法取值同样在第一遍（无 await）被拒
+    const badValue = await app.inject({
+        method: "POST",
+        url: "/api/index.php/follow/bulk_edit",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: pack({
+            viewer_id: g.viewerId,
+            add_follow_id_list: [target.viewerId, -1],
+            delete_follow_id_list: [],
+        }).toString("base64"),
+    })
+    assert.equal(badValue.statusCode, 400, "混入非法值即整请求拒绝")
+
+    // 正常规模不受影响
+    const accepted = decode(await postFollow("bulk_edit", {
+        viewer_id: g.viewerId,
+        add_follow_id_list: [target.viewerId],
+        delete_follow_id_list: [],
+    }))
+    assert.equal(accepted.data_headers.result_code, 1)
+})
+
 test("self add, missing target and invalid viewer keep existing failure semantics", async () => {
     const selfResponse = await postFollow("add", { viewer_id: viewerA, follow_id: viewerA })
     assert.equal(selfResponse.statusCode, 200)

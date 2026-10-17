@@ -1,10 +1,11 @@
 "use strict"
 
 // multi /start（quest/start multi）铃铛进房解析语义回归：
-// resolveBellRecruitmentForStart 只接受 open 且 (room_number, 房主) 与当前战斗
-// 完全一致、且该 viewer 持有效投递行（T2 门票，批次一：delivered/accepted 持票、
-// declined/缺失无票——attention_key 只经 check 下发，无票即伪造）；
-// 防伪 key / 跨房间 key / 过期 / 关闭一律 fail-open 为 null
+// resolveBellRecruitmentForStart 接受 open 招募，或**停止招募后仍在宽限窗内**的
+// 关闭行（对齐参考实现 Ku1o/startpoint-cn-kulo 的 stopped-notice），两者都要求
+// (room_number, 房主) 与当前战斗完全一致、且该 viewer 持有效投递行（T2 门票，
+// 批次一：delivered/accepted 持票、declined/缺失无票——attention_key 只经 check
+// 下发，无票即伪造）；防伪 key / 跨房间 key / 过期 / 宽限窗外一律 fail-open 为 null
 // （退回实时 isNewbieHostSync 判定，不影响正常开战）。
 
 require("ts-node/register/transpile-only")
@@ -32,6 +33,7 @@ initializeDatabase()
 db = getDb()
 
 const {
+    STOPPED_NOTICE_GRACE_MS,
     buildEstablisherSnapshot,
     closeRecruitmentForRoom,
     deliverOpenRecruitmentsToViewer,
@@ -102,9 +104,33 @@ assert.ok(
     "持 B 房投递行的 guest 正常进房",
 )
 
-// 关闭 → null
-closeRecruitmentForRoom(HOST_VIEWER, ROOM)
+// 宽限窗不等于免票：ROOM 的 guest 此前已 declined，关闭后仍是 null
+closeRecruitmentForRoom(HOST_VIEWER, ROOM, nowMs)
 assert.equal(resolveBellRecruitmentForStart(recruitment.attentionKey, ROOM, HOST_VIEWER, GUEST_VIEWER), null,
-    "已关闭招募不得作为铃铛进房依据")
+    "declined 过的 viewer 不因宽限窗获得门票")
+
+// 停止招募 → 宽限窗内仍可进房（对齐参考实现 Ku1o/startpoint-cn-kulo 的
+// stopped-notice：房主停铃与 guest 点击之间存在真实竞态，立即失效会让
+// "点了却进不去"的玩家看到通用失败），窗口外彻底失效。
+closeRecruitmentForRoom(9502, "445566", nowMs)
+const withinGrace = resolveBellRecruitmentForStart(otherHost.attentionKey, "445566", 9502, otherGuest)
+assert.ok(withinGrace !== null, "停止招募后宽限窗内，已投递 guest 仍可凭 key 进房")
+assert.equal(withinGrace.status, "closed", "宽限票来自已关闭的招募行")
+assert.equal(
+    resolveBellRecruitmentForStart(
+        otherHost.attentionKey, "445566", 9502, otherGuest,
+        nowMs + STOPPED_NOTICE_GRACE_MS + 1,
+    ),
+    null,
+    "宽限窗结束后该 key 必须失效",
+)
+
+// 停止招募后不再新投递（宽限只服务"已经收到铃铛的人"）
+const lateGuest = 9504
+assert.equal(
+    deliverOpenRecruitmentsToViewer(lateGuest, nowMs + 5, 3).some(bell => bell.id === otherHost.id),
+    false,
+    "已关闭的招募不得再次投递给新的 guest",
+)
 
 console.log("attention bell start: all assertions passed")

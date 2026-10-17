@@ -21,6 +21,10 @@ Follow 关系只存在于同一个 `starpoint-cn` 实例和同一套 SQLite 内�
   `FOLLOW_LIST_DISPLAY_LIMIT = 100`：一次 `follow/lists` 最多返回 100 条关系，
   按“最近登录优先、同刻 viewer_id 升序”截断（被关注数 `followed_count` 不受影响）。
   三个页签共用同一份列表，所以不单独截断粉丝页签——否则截断会按页签清空。
+- 写入侧另有一道**请求规模闸门**：`src/routes/api/follow/write-routes.ts` 的
+  `BULK_FOLLOW_ID_LIMIT = 100`。`follow/bulk_edit` 的两个列表各自与合计都不得超过 100，
+  且取值必须在**任何 `await` / 事务之前**校验完（超限或混入非法 id ⇒ 400，不写任何边）——
+  否则一次请求可以驱动上千次逐条解析。
 
 ## 状态派生
 

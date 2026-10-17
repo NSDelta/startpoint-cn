@@ -105,14 +105,21 @@ CN 1.8.1 反编译源码已经包含完整的客户端招募链路：
 | `multi_battle_quest/summon` | 仍返回固定 NPC | 未改；客户端只在招募计时器启动后经过 `summon_com_seconds` 才调用它，且客户端自己保证房间未满 |
 | TCP lobby | `EnterComs` 后直接绑定 NPC roster | 保留作为客户端 NPC 回退的最终接入点 |
 
-`/attention/check` 的可见性判据（全部在每次轮询时重新向协调器取实时房间状态，而不是读登记表快照）：
+`/attention/check` 的可见性判据分两步：**先取候选（只读，不写投递行），再逐条判活性，最后才写投递行**——名额与活性必须在消耗投递配额之前判定，否则一次无效候选会占掉 guest 三格中的一格。
 
 - category、quest ID、房主 viewer ID 必须与登记时一致，否则丢弃；
-- 房间当前真人数 `< 3`，或请求者本人已在成员列表里（已进房的人保留铃铛）；
 - 请求者不是房主本人（自己的房间不出现在自己的列表）；
-- 不额外校验房主在线状态与 `raising_state`——guest 走 `Enter` 进房的路径本身没有这两道门槛，加上去会与既有可加入语义不一致。
+- 房主的业务行必须存在（`players` 里查不到房主 pid ⇒ 不下发）；
+- 房间当前真人数 `< 3`，或请求者本人已在成员列表里（已进房的人保留铃铛）；
+- 本节点房间：已开战（`raising_state = 4`）不下发；异节点房间读 `social_room_shares` 快照做同样判定（未过期行的 `raising_state` / `mates`），**不再无条件放行**；
+- **刻意不用 presence 作判据**：presence 行会被惰性清扫，「查不到」不等于「离线」，等待中的房主也未必在轮询；异节点房主的滞后由 45 秒授权寿命 + 15 秒重发收敛。
 
-登记表的可见窗口由“最后一次 share 时间”决定：`RECRUITMENT_VISIBLE_WINDOW_MS = 30_000`（覆盖 15 秒重投递间隔加一次丢包），并对客户端时钟早于服务器的情况容忍 `5_000ms`。累计 share 次数达到 `RECRUITMENT_REDELIVER_LIMIT = 20` 时视为客户端已按 `attention_recruitment_redeliver_limit` 停止重发，服务端主动撤下铃铛，不假装房间还在招募。
+### 名额饱和与停止招募宽限
+
+- `holding_number` / `request_number`：单次下发名额 = `max(0, min(3, request_number ?? 3) - max(0, holding_number ?? 0))`。`holding_number` 已满 3 时本次 `data.multi` 为空，其余响应形状不变。
+- 停止招募（`share_type_list` 去掉 3、房间解散、发布门关闭）后，已收到过铃铛的 guest 仍可在 `STOPPED_NOTICE_GRACE_MS = max(30_000, 招募寿命 45_000)` 内凭原 `attention_key` 进房（`findStoppedRecruitmentByKey` 认 `status='closed'` 且 `expires_at_ms > now` 的行），窗口外失效——这是「房主停招募」与「guest 点铃铛」之间的竞态兜底。
+
+> 下面这段描述的是 2026-10 已退役的进程内登记表（`src/multi/recruitment/*`），保留作历史参考：登记表的可见窗口由“最后一次 share 时间”决定：`RECRUITMENT_VISIBLE_WINDOW_MS = 30_000`（覆盖 15 秒重投递间隔加一次丢包），并对客户端时钟早于服务器的情况容忍 `5_000ms`。累计 share 次数达到 `RECRUITMENT_REDELIVER_LIMIT = 20` 时视为客户端已按 `attention_recruitment_redeliver_limit` 停止重发，服务端主动撤下铃铛，不假装房间还在招募。
 
 `attention_key` 由服务端生成（`wfcn-<base36 序号>-<base36 时间戳>-<8 位 hex>`）。客户端只断言它是 String、并用精确相等匹配，不校验格式，因此格式不与官方一致不影响功能。同一房间重复 share 时 key 保持不变——客户端进房后会凭这个 key 把该条通知标记为“参加中”，换 key 会让玩家手里的铃铛失效。房间关闭后重新招募才生成新 key。
 
@@ -201,7 +208,7 @@ Recruiting / NPC fallback
 - NPC 回退与真人加入三种竞争顺序（真人先加入、NPC 先补位、同时到达）；
 - `summon` 只补足剩余空位（当前仍是原实现）；
 - 后台设置即时生效（`npc_mode_enabled` 未实施）；
-- Hub 房间走 attention 的行为（本功能只在同节点内生效，Hub 房间的 `data.multi` 恒为空）。
+- Hub / 异节点房间走 attention：投递门现在会读 `social_room_shares` 快照与房主业务行做同样判定（不再无条件放行），但仍无跨节点实时复核，靠 45 秒寿命 + 15 秒重发收敛；Hub 房间的 `data.multi` 实测仍为空（本功能只在同节点内生效）。
 
 客户端人工验收仍需要确认：
 
