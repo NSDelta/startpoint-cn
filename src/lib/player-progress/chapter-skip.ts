@@ -13,6 +13,7 @@ import { getMainQuestIdsForChapter, getMainQuestSync } from "../quest-content"
 import { RewardType } from "../types/rewards"
 import type { Reward } from "../types/rewards"
 import { recordPlayerHistoryMilestoneSync } from "../../data/domains/player-history-facts"
+import type { PlayerQuestProgress } from "../../data/types"
 
 /**
  * Bot `/skip chapter N` progression shortcut (contract 3.4 control plane).
@@ -58,6 +59,24 @@ const EARLY_CHAPTER_MAX = 6
 /** Main quest ids are `chapter * 1_000_000 + index`, so an id carries its chapter. */
 const CHAPTER_ID_DIVISOR = 1_000_000
 
+/**
+ * The clear record a skipped quest carries.
+ *
+ * A real clear always writes all three numbers (`battle-quest-progress-plan.ts`:
+ * `clearRank: input.clearRank ?? 5`, `bestElapsedTimeMs: input.clearTime`,
+ * `highScore: input.score`), and the client parses `clear_rank` /
+ * `best_elapsed_time_ms` straight out of the save. The 2026-06-13 C3212 incident
+ * was exactly a `clear_rank: null` reaching a client that had classified the quest
+ * as a battle quest, so a row that claims `finished` while those two are null reads
+ * as "cleared but never played" and the client refuses it.
+ *
+ * 5 is SS — the same default the finish path applies when a battle reports no rank
+ * (pure story nodes) — so a skipped node shows a normal crown instead of a gap.
+ */
+export const SKIPPED_QUEST_CLEAR_RANK = 5
+export const SKIPPED_QUEST_CLEAR_TIME_MS = 0
+export const SKIPPED_QUEST_HIGH_SCORE = 0
+
 /** Make-up mails outlive a normal session, so a skipped reward is not lost to a TTL. */
 const FIRST_CLEAR_MAKEUP_TTL_DAYS = 90
 
@@ -100,6 +119,12 @@ export interface ChapterSkipResult {
      * was written: the shortcut never moves a save backwards.
      */
     readonly alreadyAhead: boolean
+    /**
+     * Rows inside the skipped range whose clear record this call completed. A skip
+     * that changes no progress still repairs fabricated clears written before the
+     * clear-record fix (null rank/time), because the client rejects those (C3212).
+     */
+    readonly repaired: number
     readonly mailedRewards: ChapterSkipMailSummary
 }
 
@@ -266,6 +291,38 @@ function mailFirstClearRewardsSync(
 }
 
 /**
+ * Completes the clear record of quests an earlier skip wrote without one.
+ *
+ * A real clear can never leave `clear_rank` / `best_elapsed_time_ms` null — every
+ * finish writes both — so a `finished` row missing them was fabricated by this
+ * module before the clear-record fix, and the client rejects it (C3212). Only rows
+ * that are already `finished` inside the skipped range are touched: progress, the
+ * current-quest pointer and the make-up mails are all left exactly as they were.
+ */
+function repairSkippedQuestRecordsSync(
+    playerId: number,
+    existingProgress: readonly PlayerQuestProgress[],
+    skippedQuestIds: ReadonlySet<number>,
+): number {
+    let repaired = 0
+    for (const entry of existingProgress) {
+        if (!entry.finished || !skippedQuestIds.has(entry.questId)) continue
+        const clearRank = entry.clearRank
+        const bestElapsedTimeMs = entry.bestElapsedTimeMs
+        const highScore = entry.highScore
+        if (clearRank != null && bestElapsedTimeMs != null && highScore != null) continue
+        updatePlayerQuestProgressSync(playerId, MAIN_QUEST_SECTION, {
+            questId: entry.questId,
+            ...(clearRank == null ? { clearRank: SKIPPED_QUEST_CLEAR_RANK } : {}),
+            ...(bestElapsedTimeMs == null ? { bestElapsedTimeMs: SKIPPED_QUEST_CLEAR_TIME_MS } : {}),
+            ...(highScore == null ? { highScore: SKIPPED_QUEST_HIGH_SCORE } : {}),
+        })
+        repaired += 1
+    }
+    return repaired
+}
+
+/**
  * Marks chapters 1..chapter-1 finished so the player starts at `chapter`, and
  * mails the first-clear rewards of the quests it finished.
  *
@@ -298,7 +355,25 @@ export function skipPlayerToChapterSync(
 
     const currentQuestId = getPlayerLastMainQuestIdSync(playerId)
     const targetQuestId = getChapterStartQuestId(chapter)
+    const completedChapters = chapter - 1
+    // Chapter 1 has nothing to skip: the player is already standing on it, so the
+    // set is empty and the call degenerates into a repair of older fabricated rows.
+    const questIds = chapter === 1
+        ? []
+        : [...new Set(getMainQuestIdsForChapters(
+            Array.from({ length: completedChapters }, (_unused, index) => index + 1),
+        ))]
+    const skippedQuestIds = new Set(questIds)
+    const readExistingProgress = () => getPlayerQuestProgressSync(playerId, [MAIN_QUEST_SECTION])[
+        String(MAIN_QUEST_SECTION)
+    ] ?? []
+
     if (targetQuestId !== null && currentQuestId !== null && targetQuestId <= currentQuestId) {
+        const repaired = getDb().transaction(() => repairSkippedQuestRecordsSync(
+            playerId,
+            readExistingProgress(),
+            skippedQuestIds,
+        ))()
         return {
             chapter,
             questTotal: 0,
@@ -306,36 +381,38 @@ export function skipPlayerToChapterSync(
             recordedChapters: 0,
             lastMainQuestId: currentQuestId,
             alreadyAhead: true,
+            repaired,
             mailedRewards: NO_MAIL,
         }
     }
 
-    const completedChapters = chapter - 1
-    const progressionQuests = getMainQuestIdsForChapters(
-        Array.from({ length: completedChapters }, (_unused, index) => index + 1),
-    )
-    // Chapter 1 has nothing to skip: the player is already standing on it.
-    const questIds = chapter === 1
-        ? []
-        : [...new Set(progressionQuests)]
-
     return getDb().transaction((): ChapterSkipResult => {
-        const existingProgress = getPlayerQuestProgressSync(playerId, [MAIN_QUEST_SECTION])[
-            String(MAIN_QUEST_SECTION)
-        ] ?? []
+        const existingProgress = readExistingProgress()
         const finished = new Set(
             existingProgress.filter(entry => entry.finished).map(entry => entry.questId),
         )
         const known = new Set(existingProgress.map(entry => entry.questId))
+        const byQuestId = new Map(existingProgress.map(entry => [entry.questId, entry]))
 
         const newlyFinishedQuestIds: number[] = []
+        let repaired = 0
         for (const questId of questIds) {
             const wasFinished = finished.has(questId)
             if (known.has(questId)) {
+                const previous = byQuestId.get(questId)
+                const previousClearRank = previous?.clearRank
+                const previousClearTime = previous?.bestElapsedTimeMs
+                const previousHighScore = previous?.highScore
+                if (previousClearRank == null || previousClearTime == null || previousHighScore == null) {
+                    repaired += 1
+                }
                 updatePlayerQuestProgressSync(playerId, MAIN_QUEST_SECTION, {
                     questId,
                     finished: true,
                     unlocked: true,
+                    ...(previousClearRank == null ? { clearRank: SKIPPED_QUEST_CLEAR_RANK } : {}),
+                    ...(previousClearTime == null ? { bestElapsedTimeMs: SKIPPED_QUEST_CLEAR_TIME_MS } : {}),
+                    ...(previousHighScore == null ? { highScore: SKIPPED_QUEST_HIGH_SCORE } : {}),
                 })
             } else {
                 insertPlayerQuestProgressSync(playerId, MAIN_QUEST_SECTION, {
@@ -343,6 +420,9 @@ export function skipPlayerToChapterSync(
                     finished: true,
                     unlocked: true,
                     hostFinished: true,
+                    clearRank: SKIPPED_QUEST_CLEAR_RANK,
+                    bestElapsedTimeMs: SKIPPED_QUEST_CLEAR_TIME_MS,
+                    highScore: SKIPPED_QUEST_HIGH_SCORE,
                 })
             }
             if (!wasFinished) newlyFinishedQuestIds.push(questId)
@@ -373,6 +453,7 @@ export function skipPlayerToChapterSync(
             recordedChapters,
             lastMainQuestId,
             alreadyAhead: false,
+            repaired,
             mailedRewards: mailFirstClearRewardsSync(playerId, newlyFinishedQuestIds),
         }
     })()

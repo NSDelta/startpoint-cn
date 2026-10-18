@@ -295,6 +295,17 @@ used_at, created_at, updated_at, revision)`，随
   `src/lib/mail-reward-grant.ts` 的 `standardReward()` 互逆的映射，领取时走与普通邮件
   完全相同的发放路径；有效期 90 天。因为只补发「本次翻转」的 quest，
   重复调用不会重复补发（已 `finished` 的行不再翻转）。
+- **每行都要有可用的通关记录**：正常通关时 `clear_rank` 与 `best_elapsed_time_ms` 必然非空
+  （`src/lib/quest/finish/battle-quest-progress-plan.ts` 的 insert/update 路径都写），
+  而 `src/data/utils/serialize-player.ts` 把 `clear_rank: null` **原样**发给客户端 ——
+  客户端拿到「已通关但没有评级」的关卡会报 **C3212**（与 2026-06-13 那次同源：
+  finish 响应曾经发 `clear_rank: null`，覆盖了库里正确的值）。所以跳过时写入
+  `clearRank=5`、`bestElapsedTimeMs=0`、`highScore=0`（`SKIPPED_QUEST_*`）：
+  这是「已通关」的合法形态，且不参与任何排行（分数/竞速各有自己的表）。
+- **旧存档就地修复**：更早版本跳过的行只有 `finished/unlocked`，正是上面那种不可用形态。
+  再次调用 `/skip N`（含被 `already_ahead` 拒绝的那条路径）会**只补缺失字段**，
+  不改进度、不动指针、不补发邮件，条数回在 `repaired_quests` 里；已经写过的真实
+  时间/评级不会被覆盖。指向存档真值，因此 N 取存档当前章或更后面都能把整个已跳过区间修好。
 - 顺带按 `recordCompletedMainChapterMilestoneSync` 的公式记章节里程碑
   （target 2 / slot 1-6 给第 1-6 章，target 3 / slot 1-6 给第 7-12 章，`INSERT OR IGNORE` 幂等）。
 - 把 `players.last_main_quest_id` 指向**目标章的第一个 quest**（schema 新增列，
@@ -307,9 +318,10 @@ used_at, created_at, updated_at, revision)`，随
   `BAD_REQUEST`，`> 12` ⇒ 400 `INVALID_CHAPTER`（`src/routes/web_api/bot.ts:481`）。
 
 响应 `{ok:true,data:{account_id, viewer_id, username, chapter, last_main_quest_id,
-current_quest, finished_quests, recorded_chapters, already_ahead,
+current_quest, finished_quests, recorded_chapters, already_ahead, repaired_quests,
 mailed_rewards:{mails, quests, unsupported}}}`。`already_ahead` 为真时其余计数均为 `0`
-（`mailed_rewards` 全零），指针返回存档真实值。
+（`mailed_rewards` 全零），指针返回存档真实值；唯一的例外是 `repaired_quests`——
+被拒绝的那次调用仍然会把旧版本留下的残缺通关记录补好。
 
 `quest_prerequisites.json` **不是**本功能的判定依据：它含 `1_3001001 -> 3001001`
 这类章内自指条目，字面解读会把第 3 章判成不可达。真正把关的是跨章依赖——每章首节点的

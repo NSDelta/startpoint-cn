@@ -503,6 +503,12 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
                     last_main_quest_id: result.lastMainQuestId,
                     current_quest: getChapterStartQuestId(result.chapter),
                     finished_quests: result.newlyFinished,
+                    // Rows whose fabricated clear record was completed in place: a
+                    // save skipped by a build without the clear-record fix holds
+                    // finished quests with a null rank and time, which the client
+                    // rejects (C3212), so a repeat call repairs them even when it
+                    // changes no progress.
+                    repaired_quests: result.repaired,
                     recorded_chapters: result.recordedChapters,
                     // True when the save had already passed this chapter and
                     // nothing was written; the bot says so instead of claiming a

@@ -233,6 +233,12 @@ test("skipped quests are finished and unlocked, and the pointer is persisted", a
         assert.notEqual(progress, null, `quest ${questId} has no progress row`)
         assert.equal(progress.finished, true, `quest ${questId} is not finished`)
         assert.equal(progress.unlocked, true, `quest ${questId} is not unlocked`)
+        // A real clear always writes a rank and a time, and the client rejects a
+        // finished quest without them (C3212): the save projection hands
+        // `clear_rank: null` straight to the client.
+        assert.notEqual(progress.clearRank, null, `quest ${questId} has no clear rank`)
+        assert.notEqual(progress.bestElapsedTimeMs, null, `quest ${questId} has no clear time`)
+        assert.notEqual(progress.highScore, null, `quest ${questId} has no high score`)
     }
 
     // The current-quest pointer lives on the player row, not in quest progress.
@@ -243,6 +249,54 @@ test("skipped quests are finished and unlocked, and the pointer is persisted", a
         const progress = getPlayerSingleQuestProgressSync(viewer.playerId, MAIN_QUEST_SECTION, questId)
         assert.equal(progress?.finished === true, false, `quest ${questId} of chapter 4 was finished`)
     }
+})
+
+test("a clear record left by an older skip is repaired in place", async () => {
+    const viewer = createViewer("repair")
+    bindIdentity(viewer.accountId, "skip-repair-1")
+
+    const first = await skip({ platform: "qq", uid: "skip-repair-1", chapter: 3 })
+    assert.equal(first.body.data.repaired_quests, 0)
+
+    const expected = [1, 2].flatMap(chapter => getMainQuestIdsForChapter(chapter))
+    assert.equal(expected.length > 0, true)
+
+    // Reproduce a save skipped by a build without the clear-record fix: finished
+    // rows with a null rank and time, which the client refuses (C3212). One row
+    // keeps a real time so the repair can be shown to fill gaps only.
+    getDb().prepare(`
+        UPDATE players_quest_progress
+        SET clear_rank = NULL, best_elapsed_time_ms = NULL, high_score = NULL
+        WHERE player_id = ? AND section = ?
+    `).run(viewer.playerId, MAIN_QUEST_SECTION)
+    const keepsTimeQuestId = expected[0]
+    getDb().prepare(`
+        UPDATE players_quest_progress SET best_elapsed_time_ms = ?
+        WHERE player_id = ? AND section = ? AND quest_id = ?
+    `).run(12_345, viewer.playerId, MAIN_QUEST_SECTION, keepsTimeQuestId)
+    const mailsBefore = getPlayerMailCountSync(viewer.playerId)
+
+    // The save stands on the target chapter, so nothing may be re-skipped — the
+    // call still has to leave a usable save behind.
+    const repair = await skip({ platform: "qq", uid: "skip-repair-1", chapter: 3 })
+    assert.equal(repair.status, 200)
+    assert.equal(repair.body.data.already_ahead, true)
+    assert.equal(repair.body.data.finished_quests, 0)
+    assert.equal(repair.body.data.repaired_quests, expected.length)
+
+    for (const questId of expected) {
+        const progress = getPlayerSingleQuestProgressSync(viewer.playerId, MAIN_QUEST_SECTION, questId)
+        assert.equal(progress.finished, true)
+        assert.notEqual(progress.clearRank, null, `quest ${questId} still has no clear rank`)
+        assert.notEqual(progress.bestElapsedTimeMs, null, `quest ${questId} still has no clear time`)
+        assert.notEqual(progress.highScore, null, `quest ${questId} still has no high score`)
+    }
+    const kept = getPlayerSingleQuestProgressSync(viewer.playerId, MAIN_QUEST_SECTION, keepsTimeQuestId)
+    assert.equal(kept.bestElapsedTimeMs, 12_345)
+
+    // A repair is not new progress: no make-up mail, pointer untouched.
+    assert.equal(getPlayerMailCountSync(viewer.playerId), mailsBefore)
+    assert.equal(getPlayerLastMainQuestIdOf(viewer.playerId), firstQuestOf(3))
 })
 
 test("skipping to chapter 1 is a no-op that only moves the pointer", async () => {
