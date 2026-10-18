@@ -121,17 +121,21 @@ test("client-owned unknown assets do not block readiness", () => {
     })
 })
 
-test("health route remains ordinary JSON with the CN MsgPack hook installed", async t => {
+test("health route stays a plain liveness probe with the CN MsgPack hook installed", async t => {
     const app = Fastify({ logger: false })
     registerCnMsgpackOnSend(app)
     registerRuntimeHealthRoute(app, () => createRuntimeHealthSnapshot(state()))
     await app.ready()
     t.after(() => app.close())
 
+    // 2026-10-18 加固：`/healthz` 只回状态码与一个词。以前它把 contractVersion、bundleId、
+    // node 版本、schema 号、HTTP/TCP 状态、**后台是否需要口令**全抖给任何未认证调用方，
+    // 等于免费测绘；要看细节请走需要凭据的运维入口。这里只钉住「探活语义 + 没被
+    // MsgPack 钩子接管（不是 application/x-msgpack、也不是 JSON）」。
     const response = await app.inject({ method: "GET", url: "/healthz" })
     assert.equal(response.statusCode, 200)
-    assert.match(response.headers["content-type"], /^application\/json/)
-    assert.equal(response.json().contractVersion, 1)
+    assert.match(response.headers["content-type"], /^text\/plain/)
+    assert.equal(response.body, "ok")
 })
 
 test("runtime-not-started multiplayer status keeps the diagnostic endpoint shape stable", () => {

@@ -185,26 +185,34 @@ test("password mode stores a bcrypt hash and never the plaintext", () => {
     assert.equal(config.passwordHash.includes(PASSWORD), false)
 })
 
-test("trust proxy is off unless explicitly enabled", () => {
+test("trust proxy only counts for a loopback peer, and reads the last hop", () => {
     const auth = loadAdminAuth()
     // 真实请求里 `request.ip` 来自 TCP 对端；测试直接用最小替身喂给它。
-    const request = { headers: { "x-forwarded-for": "203.0.113.9" }, ip: "10.0.0.5" }
+    const proxied = { headers: { "x-forwarded-for": "203.0.113.9" }, ip: "10.0.0.5" }
     const plain = { headers: {}, ip: "10.0.0.5" }
+    const loopback = { headers: { "x-forwarded-for": "203.0.113.9" }, ip: "127.0.0.1" }
 
-    assert.equal(auth.requestClientAddress(request, { trustProxy: false }), "10.0.0.5")
-    assert.equal(auth.requestClientAddress(request, { trustProxy: true }), "203.0.113.9")
+    // 2026-10-18 加固：对端不是回环 ⇒ `X-Forwarded-For` 一律不认。以前无条件取最左段，
+    // 于是任何人加一个 `X-Forwarded-For: 127.0.0.1` 就能变成「本机」，把 loopback-only
+    // 的后台整个让出去，失败锁定也会按伪造地址分桶。
+    assert.equal(auth.requestClientAddress(proxied, { trustProxy: false }), "10.0.0.5")
+    assert.equal(auth.requestClientAddress(proxied, { trustProxy: true }), "10.0.0.5")
     assert.equal(auth.requestClientAddress(plain, { trustProxy: true }), "10.0.0.5")
+    // 对端是同机反代（回环）时才认，并取**最后一段** —— 反代把对端地址接在末尾，
+    // 最左段是调用方自己写的。
+    assert.equal(auth.requestClientAddress(loopback, { trustProxy: true }), "203.0.113.9")
+    assert.equal(auth.requestClientAddress(loopback, { trustProxy: false }), "127.0.0.1")
     // 带空白或全空的 X-Forwarded-For 不能改变判定结果。
     for (const forwarded of ["   ", ",", ""]) {
         assert.equal(
-            auth.requestClientAddress({ headers: { "x-forwarded-for": forwarded }, ip: "10.0.0.5" }, { trustProxy: true }),
-            "10.0.0.5",
+            auth.requestClientAddress({ headers: { "x-forwarded-for": forwarded }, ip: "127.0.0.1" }, { trustProxy: true }),
+            "127.0.0.1",
         )
     }
-    // 多级代理只取最左段（最靠近客户端的那个地址）。
+    // 多级代理取最后一段（离服务器最近的那一跳）。
     assert.equal(
-        auth.requestClientAddress({ headers: { "x-forwarded-for": "203.0.113.9, 10.0.0.7" }, ip: "10.0.0.5" }, { trustProxy: true }),
-        "203.0.113.9",
+        auth.requestClientAddress({ headers: { "x-forwarded-for": "203.0.113.9, 10.0.0.7" }, ip: "127.0.0.1" }, { trustProxy: true }),
+        "10.0.0.7",
     )
 })
 

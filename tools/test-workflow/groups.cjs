@@ -61,6 +61,8 @@ const TEST_GROUPS = Object.freeze({
             "tools/cn_tool_capabilities.test.cjs",
             "tools/runtime_admin.test.cjs",
             "tools/admin_auth.test.cjs",
+            "tools/game_auth_token.test.cjs",
+            "tools/takeover_hardening.test.cjs",
             "tools/cn_form_body.test.cjs",
             "tools/admin_multi_status.test.cjs",
             "tools/runtime_health.test.cjs",

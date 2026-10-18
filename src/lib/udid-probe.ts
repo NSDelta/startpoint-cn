@@ -11,10 +11,8 @@ import fs from "node:fs"
  * - **只观察，不改行为**：不读写 reply、不碰 request.body/headers，不注册路由、不改错误码；
  * - 默认关闭：仅当 `SP_PROBE_UDID=1` 时注册钩子；关闭时不产生任何日志与副作用；
  * - `SP_PROBE_LOG=<file>` 追加写文件，否则写 stdout；
- * - 每请求**恰好**一行 JSON：`{ts, method, url, ip, udid, short_udid, user_agent, has_session, body_keys, body_values}`
- *   （`body_keys` 只列键名；`body_values` 只取**白名单**里的两个值——
- *   `device_id` / `storage_directory_path`，用于「并号」排查：门与游戏各用哪把设备号、
- *   游戏报的容器路径长什么样。其余体内容一律不落；`udid`/`short_udid` 缺失写 `null`；
+ * - 每请求**恰好**一行 JSON：`{ts, method, url, ip, udid, short_udid, user_agent, has_session, body_keys}`
+ *   （`body_keys` 只列键名，不落体内容；`udid`/`short_udid` 缺失写 `null`；
  *   `short_udid` 同时探测 `short-udid` 与 `short_udid` 两种拼写）。
  * - 正常请求由 `preHandler` 写（body 已解析 ⇒ 有 `body_keys`）；被 body 解析阶段拒掉的请求
  *   （415/400）到不了 `preHandler`，由 `onResponse` 兜底写一行 `body_keys: null`——
@@ -56,25 +54,6 @@ function bodyKeysOf(body: unknown): string[] | null {
     return Object.keys(body as Record<string, unknown>).sort()
 }
 
-/** 允许落值的键（白名单，见文件头注释）。 */
-export const PROBE_BODY_VALUE_KEYS = ["device_id", "storage_directory_path"] as const
-
-function bodyValuesOf(body: unknown): Record<string, unknown> | null {
-    if (body === null || body === undefined) return null
-    if (Buffer.isBuffer(body)) return null
-    if (typeof body !== "object" || Array.isArray(body)) return null
-    const source = body as Record<string, unknown>
-    const picked: Record<string, unknown> = {}
-    for (const key of PROBE_BODY_VALUE_KEYS) {
-        const value = source[key]
-        if (typeof value === "number" || typeof value === "boolean") picked[key] = value
-        else if (typeof value === "string") {
-            picked[key] = value.length > 240 ? `${value.slice(0, 240)}…` : value
-        }
-    }
-    return Object.keys(picked).length > 0 ? picked : null
-}
-
 /**
  * 请求快照。`url` 用 `originalUrl`（含 query），便于区分同路径不同参数的首启请求。
  */
@@ -90,7 +69,6 @@ export function buildUdidProbeRecord(request: FastifyRequest, now: Date = new Da
         user_agent: headerValue(headers["user-agent"]),
         has_session: headerValue(headers.cookie) !== null,
         body_keys: bodyKeysOf(request.body),
-        body_values: bodyValuesOf(request.body),
     }
 }
 
