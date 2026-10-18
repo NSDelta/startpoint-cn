@@ -213,6 +213,21 @@ function isContainerKey(key: string): boolean {
     return /^[0-9a-z-]{16,}$/.test(key)
 }
 
+/**
+ * 门登录能不能另外用**来源 IP** 去认设备。
+ *
+ * 能：登录记录没带容器标识 —— 这时 IP 是唯一线索，并号正是靠它工作的（iOS、老客户端）。
+ *
+ * 不能：登录记录带了容器标识 —— 我们已经知道它来自哪个容器，那么「IP 相同、容器对不上」
+ *      的报到属于同一台机器上的**另一个容器**（桌面多开的一个实例），不是同一份存档。
+ *      继续按 IP 认会把两个实例的账号对调（A 实例的门登录认领 B 实例的设备号，
+ *      B 实例的报到又跟去 A 账号），所以带键的登录一律只认容器。
+ *      见 `docs/` 里桌面启动器的多开说明。
+ */
+function ipFallbackAllowed(loginKey: string): boolean {
+    return !isContainerKey(loginKey)
+}
+
 /** 来源是否一致：容器标识能对上（最硬）或 IP 相同。返回**怎么对上的**： */
 interface OriginLike {
     ip: string
@@ -289,7 +304,10 @@ export function followAccountForSignup(input: {
         if (now - login.at > ttl) break
         const match = matchOrigin(login, origin)
         if (match === null) continue
-        if (match === "ip" && now - login.at > ipTtl) continue
+        if (match === "ip") {
+            if (!ipFallbackAllowed(normalizeKey(login.key))) continue
+            if (now - login.at > ipTtl) continue
+        }
         const account = getAccountSync(login.accountId)
         if (account === null || account === undefined) continue
         return login.accountId
@@ -320,7 +338,10 @@ export function claimReportedDevices(input: {
         if (now - report.at > ttl) continue
         const match = matchOrigin(origin, report)
         if (match === null) continue
-        if (match === "ip" && now - report.at > ipTtl) continue
+        if (match === "ip") {
+            if (!ipFallbackAllowed(origin.key)) continue
+            if (now - report.at > ipTtl) continue
+        }
         if (seen.has(report.deviceId)) continue
         seen.add(report.deviceId)
         const binding = getDeviceBindingSync(report.deviceId)

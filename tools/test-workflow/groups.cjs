@@ -766,6 +766,7 @@ const TEST_GROUPS = Object.freeze({
     admin: {
         execution: "parallel",
         tests: [
+            "tests/device-follow-multi-instance.test.js",
             "tests/admin-account-save-ui.test.js",
             "tests/admin-bindings-ui-source.test.js",
             "tests/admin-cdn-status-source.test.js",
