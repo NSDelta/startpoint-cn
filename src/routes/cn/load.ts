@@ -72,6 +72,7 @@ import {
     projectPendingGachaConversionsSync,
     settleExpiredGachaPointsOnLoadSync,
 } from "../../lib/gacha-owner";
+import { followDeviceOnGameRequest } from "../../lib/sp-auth/device-follow";
 
 interface CnLoadBody {
     device_id: number;
@@ -223,7 +224,21 @@ const routes = async (fastify: FastifyInstance, options: CnLoadRouteOptions) => 
         if (session === null || session.type !== SessionType.VIEWER) {
             return reply.status(400).send({ error: "Bad Request", message: "Invalid viewer id." });
         }
-        const accountId = session.accountId;
+        let accountId = session.accountId;
+        // 「并号」（2026-10-18，修业主「登录其他账号后 uid 不变、仍进旧号」）：同一台机器上
+        // **门里最后一次成功登录**决定这台设备属于谁。客户端缓存里的 viewer 会话可能是上一次
+        // 那个账号的，所以设备当前的绑定归属压过会话 —— 与 `/tool/signup`（本来就按 device_id
+        // 认账号）保持同一套语义。见 lib/sp-auth/device-follow.ts。
+        const deviceAccountId = followDeviceOnGameRequest({
+            deviceId: typeof body.device_id === "number" ? body.device_id : Number(body.device_id),
+            ip: request.ip,
+            path: typeof body.storage_directory_path === "string" ? body.storage_directory_path : "",
+            sessionAccountId: session.accountId,
+            label: "load",
+        });
+        if (deviceAccountId !== null && deviceAccountId !== accountId) {
+            accountId = deviceAccountId as unknown as typeof accountId;
+        }
         const playerId = resolvePlayerIdSync(accountId);
         if (!playerId) {
             return reply.status(400).send({ error: "Bad Request", message: "No player found" });

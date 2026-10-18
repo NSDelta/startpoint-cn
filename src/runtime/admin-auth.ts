@@ -177,32 +177,48 @@ function prefersHtml(request: FastifyRequest): boolean {
 }
 
 /**
- * 请求来源地址。`ADMIN_TRUST_PROXY=1` 时取 `X-Forwarded-For` 最左段，
- * 否则一律用 TCP 对端地址（伪造请求头不影响判定）。
+ * 请求来源地址。
+ *
+ * 2026-10-18 加固：`ADMIN_TRUST_PROXY=1` 时**只在直连对端本身就是回环地址**才认
+ * `X-Forwarded-For`（本部署的反代与服务器同机），并且取**最后一段** —— 反代会把
+ * 对端地址接在末尾，最左段是调用方自己写的。以前无条件取最左段，于是任何人加一个
+ * `X-Forwarded-For: 127.0.0.1` 就能变成「本机」，把 loopback-only 的后台整个让出去，
+ * 同时也让失败锁定按伪造地址分桶、形同虚设。
  */
 export function requestClientAddress(request: FastifyRequest, config: AdminAuthConfig): string {
-    if (config.trustProxy) {
+    const peer = request.ip ?? ""
+    if (config.trustProxy && isLoopbackAddress(peer)) {
         const forwarded = request.headers["x-forwarded-for"]
         const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded
         if (typeof raw === "string" && raw.trim() !== "") {
-            const first = raw.split(",")[0]?.trim()
-            if (first !== undefined && first !== "") return first
+            const parts = raw.split(",").map(part => part.trim()).filter(part => part !== "")
+            const last = parts[parts.length - 1]
+            if (last !== undefined) return last
         }
     }
-    return request.ip ?? ""
+    return peer
 }
 
-const LOOPBACK_V4_PATTERN = /^127\./
+const LOOPBACK_V4_PATTERN = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const IPV4_MAPPED_PREFIX = "::ffff:"
 
-/** 是否回环地址（本机模式据此放行）。 */
+/**
+ * 是否回环地址（本机模式据此放行）。
+ *
+ * `localhost` 字面量**不再**算回环（2026-10-18 加固）：它来自请求头，
+ * `X-Forwarded-For: localhost` 因此能冒充本机。IPv4 回环也收紧成四段数字。
+ */
 export function isLoopbackAddress(address: string): boolean {
     let candidate = address.trim().toLowerCase()
     if (candidate === "") return false
     if (candidate.startsWith("[") && candidate.endsWith("]")) candidate = candidate.slice(1, -1)
     if (candidate.startsWith(IPV4_MAPPED_PREFIX)) candidate = candidate.slice(IPV4_MAPPED_PREFIX.length)
-    if (candidate === "::1" || candidate === "localhost") return true
-    return LOOPBACK_V4_PATTERN.test(candidate)
+    if (candidate === "::1") return true
+    if (!LOOPBACK_V4_PATTERN.test(candidate)) return false
+    return candidate.split(".").every(part => {
+        const octet = Number(part)
+        return Number.isInteger(octet) && octet >= 0 && octet <= 255
+    })
 }
 
 function parseCookies(header: string | undefined): Map<string, string> {

@@ -12,6 +12,7 @@ import { getRankDegree } from "../../lib/stamina"
 import { getRequestUdid } from "../../lib/takeover-access"
 import { generateDataHeaders } from "../../utils"
 import { getRealNow } from "../../runtime/time/game-time"
+import { readLoginTokenHeader, verifyLoginTokenSync } from "../../lib/game-auth"
 
 const TAKEOVER_INPUT_ID_ERROR = 3203
 const TAKEOVER_INPUT_ID_OR_PASSWORD_ERROR = 3204
@@ -207,11 +208,51 @@ function transferAccount(
 }
 
 const routes = async (fastify: FastifyInstance) => {
+    /**
+     * 加固（2026-10-18，harden/server-security）：这三个「看/改别人的转移密码」的接口
+     * 原本只凭 `viewer_id` 就能调用 —— 而 viewer_id 是私服里公开可见的数字句柄
+     * （好友列表、房间列表、attention 广播都会带出去），于是任何人都能把别人的账号
+     * 锁在自己设备上（`takeover_udid` ⇒ 此后真主人自己全被 516 拒），
+     * 再走 `take_over_by_take_over_data` 把账号搬走。
+     *
+     * 所有权证明 = 客户端每次启动都会拿到的 `login_token`（`tool/signup` 下发，
+     * 见 `src/lib/game-auth.ts`）。这条链路本来就是「玩家手持设备、刚进游戏」的场景，
+     * 正常玩家必然有令牌；拿不到令牌就说明调用者不是这台设备上的账号主人。
+     */
+    const hasAccountOwnershipProof = (token: string | null, accountId: number): boolean =>
+        token !== null && verifyLoginTokenSync(accountId, token) === "match"
+
+    const TAKEOVER_RATE_WINDOW_MS = 60_000
+    const TAKEOVER_RATE_LIMIT = 30
+    const takeoverRateHits = new Map<string, number[]>()
+    const takeoverRateLimited = (clientIp: string): boolean => {
+        const now = Date.now()
+        const hits = (takeoverRateHits.get(clientIp) ?? []).filter(at => now - at < TAKEOVER_RATE_WINDOW_MS)
+        hits.push(now)
+        takeoverRateHits.set(clientIp, hits)
+        if (takeoverRateHits.size > 4096) {
+            for (const [candidate, stamps] of takeoverRateHits) {
+                if (stamps.every(at => now - at >= TAKEOVER_RATE_WINDOW_MS)) {
+                    takeoverRateHits.delete(candidate)
+                }
+            }
+        }
+        return hits.length > TAKEOVER_RATE_LIMIT
+    }
+
     fastify.post("/take_over_register/get_take_over_setting", async (request, reply) => {
+        if (takeoverRateLimited(request.ip ?? "unknown")) {
+            request.log.warn({ ip: request.ip }, "takeover endpoint rate limited")
+            return send(reply, {}, 0, TAKEOVER_INPUT_ID_OR_PASSWORD_ERROR)
+        }
         const body = (request.body ?? {}) as ViewerBody
         const viewerId = parseViewerId(body.viewer_id)
         const account = viewerId ? accountByViewerId(viewerId) : null
         if (!viewerId || !account) return send(reply, {}, 0, TAKEOVER_INPUT_ID_ERROR)
+        if (!hasAccountOwnershipProof(readLoginTokenHeader(request.headers), account.account_id)) {
+            request.log.warn({ viewerId }, "takeover setting probe rejected: no account ownership proof")
+            return send(reply, {}, 0, TAKEOVER_INPUT_ID_ERROR)
+        }
         return send(reply, {
             exists_user_take_over_data: Boolean(account.takeover_password_hash),
             social_account: {
@@ -223,12 +264,20 @@ const routes = async (fastify: FastifyInstance) => {
     })
 
     fastify.post("/take_over_register/register_take_over_data", async (request, reply) => {
+        if (takeoverRateLimited(request.ip ?? "unknown")) {
+            request.log.warn({ ip: request.ip }, "takeover endpoint rate limited")
+            return send(reply, {}, 0, TAKEOVER_INPUT_ID_OR_PASSWORD_ERROR)
+        }
         const body = (request.body ?? {}) as PasswordBody
         const viewerId = parseViewerId(body.viewer_id)
         const password = body.input_password
         const udid = getRequestUdid(request)
         const account = viewerId ? accountByViewerId(viewerId) : null
         if (!viewerId || !account || !udid) return send(reply, {}, 0, TAKEOVER_INPUT_ID_ERROR)
+        if (!hasAccountOwnershipProof(readLoginTokenHeader(request.headers), account.account_id)) {
+            request.log.warn({ viewerId, udid }, "takeover registration rejected: no account ownership proof")
+            return send(reply, {}, 0, TAKEOVER_INPUT_ID_ERROR)
+        }
         if (!isValidPassword(password)) {
             return send(reply, {}, Number(viewerId), TAKEOVER_INPUT_ID_OR_PASSWORD_ERROR)
         }
@@ -240,6 +289,10 @@ const routes = async (fastify: FastifyInstance) => {
     })
 
     fastify.post("/take_over/get_user_data_by_take_over_data", async (request, reply) => {
+        if (takeoverRateLimited(request.ip ?? "unknown")) {
+            request.log.warn({ ip: request.ip }, "takeover endpoint rate limited")
+            return send(reply, {}, 0, TAKEOVER_INPUT_ID_OR_PASSWORD_ERROR)
+        }
         const body = (request.body ?? {}) as LookupBody
         const inputViewerId = parseViewerId(body.input_viewer_id)
         const target = inputViewerId ? accountByViewerId(inputViewerId) : null

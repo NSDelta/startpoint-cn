@@ -27,6 +27,7 @@ import {
     spProfile,
     spResend,
 } from "../../lib/sp-auth/token-ops"
+import { createIpRateLimiter } from "../../lib/ip-rate-limit"
 
 type Body = Record<string, unknown>
 
@@ -69,14 +70,36 @@ function readBody(request: FastifyRequest): Body {
 }
 
 const routes = async (fastify: FastifyInstance): Promise<void> => {
+    /**
+     * 2026-10-18 加固：`/sp-auth/register|login` 以前**完全没有限流**，而两者都要
+     * 做 bcrypt（`compareSync`，cost=10，**同步阻塞事件循环**），失败还会写一行
+     * `bind_audit`。于是未认证的暴力破解 = CPU 打满 + 全站请求被卡 + 审计表膨胀。
+     * 这里按对端 IP 上滑动窗口（与 `reset.ts` 的 per-IP 窗口同一量级），
+     * 成功与失败共用一个桶，避免「只对失败计数」被绕过。
+     */
+    const credentialLimiter = createIpRateLimiter({ limit: 20, windowMs: 60_000 })
+    const credentialLimited = (
+        request: FastifyRequest,
+        reply: FastifyReply,
+        label: string,
+    ): FastifyReply | null => {
+        if (credentialLimiter.check(request.ip ?? "unknown")) return null
+        console.warn(`[sp-auth] ${label} rate limited ip=${request.ip ?? "-"}`)
+        return sendResult(reply, fail("RATE_LIMITED"))
+    }
+
     fastify.post("/register", async (request, reply) => {
+        const limited = credentialLimited(request, reply, "register")
+        if (limited !== null) return limited
         const body = readBody(request)
-        return guard(reply, "register", () => spRegister(body))
+        return guard(reply, "register", () => spRegister(body, process.env, { ip: request.ip }))
     })
 
     fastify.post("/login", async (request, reply) => {
+        const limited = credentialLimited(request, reply, "login")
+        if (limited !== null) return limited
         const body = readBody(request)
-        return guard(reply, "login", () => spLogin(body))
+        return guard(reply, "login", () => spLogin(body, process.env, { ip: request.ip }))
     })
 
     fastify.post("/bind-status", async (request, reply) => {
@@ -118,21 +141,32 @@ const routes = async (fastify: FastifyInstance): Promise<void> => {
      *   GET /sp-auth/diag?i=<批次序号>&l=<urlencode(若干行日志)>
      * 落盘路径取 `SP_DIAG_FILE`，缺省 `<os.tmpdir()>/sp-diag.log`。
      * 客户端拿不拿得到 200 都无所谓：就算这个路由不存在，pino 也会把整条 URL 记进运行日志。
+     *
+     * 2026-10-18 加固：这条路由本身是**未认证的磁盘写入原语** —— 任何人都能往
+     * `SP_DIAG_FILE` 追加任意内容（含换行 ⇒ 可伪造日志行），无限刷就能把磁盘写满。
+     * 现在默认**不注册**，只有显式 `SP_DIAG_ENABLED=1` 才打开；打开后单次文本截断到
+     * 1KB、并按对端 IP 限流。
      */
-    fastify.get("/diag", async (request, reply) => {
-        const query = request.query as Record<string, unknown>
-        const seq = typeof query.i === "string" ? query.i : "?"
-        const text = typeof query.l === "string" ? query.l : ""
-        const file = process.env.SP_DIAG_FILE ?? join(tmpdir(), "sp-diag.log")
-        try {
-            await appendFile(file, `--- i=${seq} ---\n${text}\n`, "utf8")
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            console.error(`[sp-auth] diag append failed: ${message}`)
-        }
-        reply.header("content-type", "text/plain; charset=utf-8")
-        return reply.status(200).send("ok")
-    })
+    if ((process.env.SP_DIAG_ENABLED ?? "").trim() === "1") {
+        const diagLimiter = createIpRateLimiter({ limit: 60, windowMs: 60_000 })
+        fastify.get("/diag", async (request, reply) => {
+            if (!diagLimiter.check(request.ip ?? "unknown")) {
+                return reply.status(429).type("text/plain; charset=utf-8").send("Too Many Requests")
+            }
+            const query = request.query as Record<string, unknown>
+            const seq = typeof query.i === "string" ? query.i.slice(0, 32) : "?"
+            const text = typeof query.l === "string" ? query.l.slice(0, 1024) : ""
+            const file = process.env.SP_DIAG_FILE ?? join(tmpdir(), "sp-diag.log")
+            try {
+                await appendFile(file, `--- i=${seq} ---\n${text}\n`, "utf8")
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                console.error(`[sp-auth] diag append failed: ${message}`)
+            }
+            reply.header("content-type", "text/plain; charset=utf-8")
+            return reply.status(200).send("ok")
+        })
+    }
 }
 
 export default routes

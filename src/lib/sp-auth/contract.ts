@@ -96,11 +96,26 @@ export interface SpAuthCodeView {
     code_expires_at: string
 }
 
+/**
+ * Per-request context the **route layer** owns (source IP, …). Never part of the
+ * C1 body: it exists so `login`/`register` can join the gate's own device with the
+ * device the game reports at `/tool/signup` (see `device-follow.ts`).
+ */
+export interface SpAuthRequestContext {
+    ip?: string
+}
+
 /** `POST /sp-auth/register` → data */
 export interface SpAuthRegisterData extends SpAuthCodeView {
     token: string
     viewer_id: number
     username: string
+    /**
+     * Client v5.25+: the device id the **game** uses on this machine, when the
+     * server managed to recognise it (device-follow). The gate adopts it so both
+     * halves end up on one id. Absent for older clients / when nothing matched.
+     */
+    game_device_id?: number
 }
 
 /** `POST /sp-auth/login` → data */
@@ -109,6 +124,8 @@ export interface SpAuthLoginData {
     viewer_id: number
     username: string
     bound: true
+    /** See {@link SpAuthRegisterData.game_device_id}. */
+    game_device_id?: number
 }
 
 /** `POST /sp-auth/bind-status` → data */

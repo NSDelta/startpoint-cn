@@ -10,6 +10,12 @@ import { getAccountIdentityProvider } from "../../lib/account-identity-provider"
 import { isGiftCodeEnabledSync } from "../../lib/gift-code/capability";
 import { getRealNow, getRealNowMs } from "../../runtime/time/game-time";
 import { buildBindGateRejection, evaluateBindGate, recordBindGateRejection } from "../../lib/bind-gate";
+import { issueLoginTokenSync } from "../../lib/game-auth";
+import {
+    DEVICE_FOLLOW_NAME,
+    followAccountForSignup,
+    noteSignupDevice,
+} from "../../lib/sp-auth/device-follow";
 
 interface CnSignupBody {
     device_id: number;
@@ -23,15 +29,6 @@ interface CnSignupBody {
     storage_directory_path?: string;
     first_viewer_id?: number;
     advertise_id?: string;
-}
-
-function generateLoginToken(): string {
-    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-    let token = "";
-    for (let i = 0; i < 32; i++) {
-        token += chars[Math.floor(Math.random() * chars.length)];
-    }
-    return token;
 }
 
 const viewerIdToAccountId = new Map<number, number>();
@@ -75,7 +72,6 @@ const routes = async (fastify: FastifyInstance) => {
         const shortUdid = 0;
         const deviceId = body.device_id
 
-        const loginToken = generateLoginToken();
         let accountId: number;
         let newAccount = true;
         let viewerId: number | undefined;   // set when reusing existing session
@@ -84,8 +80,43 @@ const routes = async (fastify: FastifyInstance) => {
             return reply.status(400).send({ error: "Missing device_id" })
         }
 
-        // Device binding: each device gets its own account
-        const binding = getDeviceBindingSync(deviceId)
+        const clientIp = request.ip
+        const storagePath = typeof body.storage_directory_path === "string"
+            ? body.storage_directory_path
+            : ""
+
+        // 「并号」（2026-10-18，修业主「门里换号后游戏仍进旧号」）：同一台机器上的门刚成功
+        // 登录过哪个账号，这台设备就归谁。**必须卡在绑定闸门之前** —— 否则闸门会先按旧映射
+        // （或 unmapped ⇒ 517）把这次报到拒掉，改绑永远轮不到。见 lib/sp-auth/device-follow.ts。
+        let binding = getDeviceBindingSync(deviceId)
+        const followAccountId = followAccountForSignup({ deviceId, ip: clientIp, path: storagePath })
+        const followAccount = followAccountId === null ? null : getAccountSync(followAccountId)
+        if (
+            followAccount !== null
+            && followAccount !== undefined
+            && (binding === null || binding.account_id !== followAccount.id)
+        ) {
+            insertDeviceBindingSync(deviceId, followAccount.id, DEVICE_FOLLOW_NAME)
+            appendBindAuditSync({
+                action: "login",
+                accountId: followAccount.id,
+                detail: {
+                    reason: "device_rebind",
+                    source: "device-follow",
+                    via: "signup",
+                    device_id: deviceId,
+                    previous_account_id: binding === null ? null : binding.account_id,
+                },
+                actor: "sp-auth",
+                createdAt: getRealNow().toISOString(),
+            })
+            binding = { device_id: deviceId, account_id: followAccount.id, name: DEVICE_FOLLOW_NAME }
+            console.log(
+                `[SIGNUP] device-follow 改绑 device_id=${deviceId} -> account_id=${followAccount.id}`,
+            )
+        }
+        // 记一笔报到，供门下次登录时反向认领（claimReportedDevices）。
+        noteSignupDevice({ deviceId, ip: clientIp, path: storagePath })
 
         // P4 绑定闸门（契约 C3）：必须卡在下面「已知设备 → 复用 binding 账号」分支之前，
         // 否则 pending（已发码未绑定）账号会被它直接放行。开关缺省关 ⇒ 此处零开销旁路。
@@ -176,7 +207,7 @@ const routes = async (fastify: FastifyInstance) => {
                 udid: udid,
             }),
             data: {
-                login_token: loginToken,
+                login_token: issueLoginTokenSync(accountId),
                 newAccount: newAccount ? 1 : 0,
                 roleName: `Player${accountId}`,
                 accountName: `Player${accountId}`,

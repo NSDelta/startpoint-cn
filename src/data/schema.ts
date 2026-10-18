@@ -163,6 +163,18 @@ const schemaColumns = {
         column: "takeover_udid",
         definition: "TEXT DEFAULT NULL",
     },
+    // 游戏 API 的登录令牌（客户端 `LOGIN_TOKEN` 头）：服务端随机值、按明文存，
+    // 见 src/lib/game-auth.ts 与 src/data/domains/account.ts
+    "accounts.login_token": {
+        table: "accounts",
+        column: "login_token",
+        definition: "TEXT DEFAULT NULL",
+    },
+    "accounts.login_token_issued_at": {
+        table: "accounts",
+        column: "login_token_issued_at",
+        definition: "TEXT DEFAULT NULL",
+    },
     "accounts.bind_state": {
         table: "accounts",
         column: "bind_state",

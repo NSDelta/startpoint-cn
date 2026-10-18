@@ -55,7 +55,9 @@ import {
 import type {
     SpAuthDeviceTakenData,
     SpAuthRegisterData,
+    SpAuthRequestContext,
 } from "./contract"
+import { claimReportedDevices, noteGateLogin } from "./device-follow"
 import { hashPassword } from "./password"
 import { fail, ok } from "./result"
 import type { SpAuthResult } from "./result"
@@ -93,6 +95,8 @@ export interface SpAuthRegisterInput {
     password?: unknown
     device_id?: unknown
     version?: unknown
+    /** Client v5.25+: the container this gate runs in (see `login.ts`). */
+    client_key?: unknown
 }
 
 /** Account shape created by this API: no IdP, credentials live in `accounts`. */
@@ -115,6 +119,7 @@ function createPendingAccount(deviceId: number, username: string, passwordHash: 
 export async function spRegister(
     input: SpAuthRegisterInput,
     env: NodeJS.ProcessEnv = process.env,
+    ctx: SpAuthRequestContext = {},
 ): Promise<SpAuthResult<SpAuthRegisterData, SpAuthDeviceTakenData>> {
     const username = typeof input.username === "string" ? input.username.trim() : ""
     const password = typeof input.password === "string" ? input.password : ""
@@ -232,6 +237,18 @@ export async function spRegister(
     insertDeviceBindingSync(deviceId, accountId)
     const viewerId = await ensureViewerSession(accountId)
 
+    // 「并号」：这台机器上游戏用的那把设备号（`/tool/signup` 报到过）跟着这次注册走，
+    // 并把号码回给客户端（v5.25 起客户端直接采用）。见 `device-follow.ts`。
+    const clientKey = typeof input.client_key === "string" ? input.client_key : null
+    noteGateLogin({ accountId, ip: ctx.ip, key: clientKey })
+    const followed = claimReportedDevices({
+        accountId,
+        ip: ctx.ip,
+        key: clientKey,
+        loginName: username,
+        env,
+    })
+
     appendBindAuditSync({
         action: "register",
         accountId,
@@ -243,6 +260,7 @@ export async function spRegister(
             rebound_from_username: reboundFrom?.username ?? null,
             code_id: issued.code.id,
             version,
+            followed_device_ids: followed,
         },
         actor: SP_AUTH_AUDIT_ACTOR,
         createdAt: getRealNow().toISOString(),
@@ -254,6 +272,7 @@ export async function spRegister(
         code_expires_at: issued.view.code_expires_at,
         viewer_id: viewerId,
         username,
+        ...(followed.length > 0 ? { game_device_id: followed[0] } : {}),
     })
 }
 

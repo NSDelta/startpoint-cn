@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac } from "node:c
 import fs from "node:fs"
 import path from "node:path"
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify"
+import { createIpRateLimiter } from "../../lib/ip-rate-limit"
 
 // --- iOS Leiting SDK 登录 mock ---
 // 移植自 dennis96292/startpoint-cn-launcher：
@@ -572,8 +573,16 @@ export function createIosNoticeHandler(options: IosNoticeOptions = {}) {
     const provideCode = options.provideCode
     const ttlMinutes = options.ttlMinutes ?? 30
     const shotgun = options.shotgun ?? true
+    // 2026-10-18 加固：这个端点未认证，带 uid/device_id（16 位十六进制，可枚举）就能
+    // 让服务端**新发一枚绑定码**，以前没有任何频率限制。正常客户端只在启动时拉一次，
+    // 因此按对端 IP 上闸即可。
+    const noticeLimiter = createIpRateLimiter({ limit: 60, windowMs: 60_000 })
 
     return async (request: FastifyRequest, reply: FastifyReply) => {
+        if (!noticeLimiter.check(request.ip ?? "unknown")) {
+            console.warn(`[iOS-NOTICE] rate limited ip=${request.ip ?? "-"} url=${request.url}`)
+            return reply.status(429).type("application/json").send({ code: 429, msg: "Too Many Requests" })
+        }
         const ids = resolveIosNoticeIdentity(request)
         let code: string | null = null
         if (provideCode) {
@@ -584,7 +593,11 @@ export function createIosNoticeHandler(options: IosNoticeOptions = {}) {
             }
         }
         const content = buildIosNoticeContent(code, ttlMinutes)
-        console.log(`[iOS-NOTICE] ${request.method} ${request.originalUrl ?? request.url} uid=${ids.uid ?? "-"} deviceId=${ids.deviceId ?? "-"} code=${code ?? "(兜底文案)"}`)
+        // 2026-10-18 加固：绑定码**不写进日志** —— 以前这里把码明文打进 stdout，
+        // 而这个端点任何未认证的人都能用 uid/device_id 调（拿到码就能把攻击者的 QQ
+        // 绑到受害者账号上），日志一旦外流等于把凭据副本一起送出去。排障只需要知道
+        // 「这次给了码还是没有」。
+        console.log(`[iOS-NOTICE] ${request.method} ${request.originalUrl ?? request.url} uid=${ids.uid ?? "-"} deviceId=${ids.deviceId ?? "-"} code=${code === null ? "(兜底文案)" : "<redacted>"}`)
         return reply.type("application/json").send(buildIosNoticePayload(content, shotgun))
     }
 }

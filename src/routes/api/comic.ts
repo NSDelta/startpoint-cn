@@ -134,8 +134,10 @@ const routes = async (fastify: FastifyInstance, options: ComicRouteOptions) => {
         const start = pageIndex * perPage
         const items = comics.slice(start, start + perPage)
 
+        // 2026-10-18 加固：不再把请求头里的 Host 拼进返回的图片 URL —— 任何人都能把它
+        // 设成自己的域名（缓存投毒 / 把客户端引到外部主机）。一律用配置里的公开地址。
         const base = buildComicBaseUrl(
-            request.headers.host,
+            undefined,
             options.httpDisplayHost,
             options.httpPort,
         )

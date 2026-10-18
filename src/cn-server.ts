@@ -95,8 +95,10 @@ import characterElectionApiPlugin from "./routes/api/characterElection";
 import giftApiPlugin from "./routes/api/gift";
 import bonusApiPlugin from "./routes/api/bonus";
 import { installTakeoverUdidGuard } from "./lib/takeover-access";
+import { installGameAuthGuard } from "./lib/game-auth";
 import { installUdidProbeFromEnv } from "./lib/udid-probe";
 import { reportBindGateMode } from "./lib/bind-gate";
+import { reportDeviceFollowMode } from "./lib/sp-auth/device-follow";
 import { createIosNoticeCodeProvider } from "./lib/ios-notice-code";
 import { AccountCleanupService } from "./lib/account-cleanup";
 import {
@@ -138,37 +140,77 @@ const receiveHistoryRetentionService = new ReceiveHistoryRetentionService(
     { getNow: () => getRealNow() },
 );
 
-// Simple in-memory rate limiter for /crash endpoint only.
-// /debug is excluded — game client sends heavy beacon traffic during normal startup.
+// 调试/崩溃上报端点的每-IP 限流（2026-10-18 加固）。
+// 以前只拦 `/crash`，而 `/debug` 是任何人可打的日志写入口（`loc` 原样进日志 ⇒
+// 可注入换行伪造日志行、可无限刷把日志与磁盘撑满）；限流键还取过
+// `X-Forwarded-For` 的第一个值 —— 那是调用方自带的字段，换一个值就换一个桶，
+// 限流形同虚设、Map 还会被伪造键撑爆。现在：两个端点共用一张表，
+// 键只用 TCP 对端地址（本部署不挂反向代理），并给 Map 加了清理。
+const RATE_LIMITED_PATHS = new Set(["/crash", "/debug"]);
 const rateLimitMap = new Map<string, { count: number; reset: number }>();
-const RATE_LIMIT_MAX = 30;
+const RATE_LIMIT_MAX = 60;
 const RATE_LIMIT_WINDOW = 60000;
+const RATE_LIMIT_MAP_LIMIT = 4096;
 fastify.addHook("onRequest", async (request, reply) => {
-    if (request.url === "/crash") {
-        const ip = (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
-            || request.ip;
-        const now = getRealNowMs();
-        const entry = rateLimitMap.get(ip) || { count: 0, reset: now + RATE_LIMIT_WINDOW };
-        if (now > entry.reset) { entry.count = 0; entry.reset = now + RATE_LIMIT_WINDOW; }
-        if (++entry.count > RATE_LIMIT_MAX) {
-            return reply.status(429).send("Too Many Requests");
-        }
-        rateLimitMap.set(ip, entry);
+    if (!RATE_LIMITED_PATHS.has(request.url.split("?")[0])) return;
+    const ip = request.ip;
+    const now = getRealNowMs();
+    const entry = rateLimitMap.get(ip) || { count: 0, reset: now + RATE_LIMIT_WINDOW };
+    if (now > entry.reset) { entry.count = 0; entry.reset = now + RATE_LIMIT_WINDOW; }
+    if (++entry.count > RATE_LIMIT_MAX) {
+        return reply.status(429).send("Too Many Requests");
     }
+    if (rateLimitMap.size >= RATE_LIMIT_MAP_LIMIT) {
+        for (const [key, value] of rateLimitMap) {
+            if (now > value.reset) rateLimitMap.delete(key);
+        }
+    }
+    rateLimitMap.set(ip, entry);
 });
 
 registerCnMsgpackOnSend(fastify);
+
+// 统一错误出口（2026-10-18 加固）：Fastify 缺省会把未捕获异常的 message 原样回给
+// 调用方 —— SQLite 的报错里带表名/列名/SQL 片段、ENOENT 里带绝对路径，等于让任何人
+// 免费测绘服务端内部结构。5xx 一律压成固定文案（细节仍进服务端日志），4xx 保留原文。
+fastify.setErrorHandler((error, request, reply) => {
+    const statusCode = typeof error.statusCode === "number" && error.statusCode >= 400
+        ? error.statusCode
+        : 500;
+    if (statusCode >= 500) {
+        request.log.error({ err: error }, "unhandled request failure");
+        return reply.status(statusCode).send({
+            statusCode,
+            error: "Internal Server Error",
+            message: "Internal Server Error",
+        });
+    }
+    return reply.status(statusCode).send({
+        statusCode,
+        code: (error as { code?: string }).code,
+        error: error.name || "Bad Request",
+        message: error.message,
+    });
+});
 registerRuntimeHealthRoute(fastify, () => runtimeCoordinator.getHealthSnapshot());
 installTakeoverUdidGuard(fastify);
 // B0 身份取证探针（默认关，SP_PROBE_UDID=1 才注册）：只记日志，不改行为。
 installUdidProbeFromEnv(fastify);
 // 绑定闸门（契约 C3，卡 A5）：启动时打一行开/关横幅，服主一眼可见。
 reportBindGateMode();
+// 「并号」（2026-10-18）：门里换账号后游戏仍进旧账号的修法，同样在启动时打一行横幅。
+reportDeviceFollowMode();
 
 // 请求正文解析器（JSON + 表单/base64 msgpack）住在 `src/runtime/cn-body-parsers.ts`：
 // 那里能被契约测试直接喂真实实现（本文件 import 即启动整台服务器，测不了）。
 // 后台登录表单的解析顺序 bug（对正确口令也 401）就栽在那段逻辑上，见该文件头部注释。
 installCnBodyParsers(fastify);
+
+// 游戏 API 的请求认证（2026-10-18 加固）：校验客户端 `LOGIN_TOKEN` 头与请求体
+// `viewer_id` 是否属于同一账号。**默认 enforce**（拦下没有令牌或不匹配的请求），
+// 逃生门是 GAME_AUTH_MODE=audit（只记录不拦）。
+// 必须在这里装 —— signup 发出令牌，而它签发的 accountId 要从 body 里读。
+installGameAuthGuard(fastify);
 
 fastify.register(leitingAuthPlugin, { prefix: "/api/index.php" });
 fastify.register(cnTakeOverPlugin, { prefix: "/api/index.php" });
@@ -224,8 +266,14 @@ fastify.post(`${apiPrefix}/episode_trial_reading/finish`, async (_request, reply
     stubMsgpackReply(reply, {});
 });
 
+/** 进日志前把外部字符串压成单行并限长：换行可以伪造日志行，不限长可以撑爆磁盘。 */
+function sanitizeLogText(value: unknown, maxLength = 2000): string {
+    const text = typeof value === "string" ? value : String(value ?? "");
+    return text.replace(/[\r\n\t]+/g, " ").slice(0, maxLength);
+}
+
 fastify.get("/debug", async (request, reply) => {
-    const loc = (request.query as any)?.loc || "unknown";
+    const loc = sanitizeLogText((request.query as any)?.loc ?? "unknown", 2048);
     parseC3032Beacon(loc, "debug-get");
     reply.status(200).send("OK");
 });
@@ -250,7 +298,7 @@ function parseC3032Beacon(loc: string, source: string): void {
 
 fastify.post("/debug", async (request, reply) => {
     const ts = getRealNow().toISOString();
-    const loc = (request.body as any)?.loc || "unknown";
+    const loc = sanitizeLogText((request.body as any)?.loc ?? "unknown", 2048);
     console.log(`[BEACON ${ts}] ${loc}`);
 
     parseC3032Beacon(loc, "debug-post");
@@ -259,9 +307,9 @@ fastify.post("/debug", async (request, reply) => {
 });
 
 fastify.post("/crash", async (request, reply) => {
-    // Log crash (truncated to avoid log explosion)
-    const bodyStr = JSON.stringify(request.body);
-    console.log(`[CRASH] ${bodyStr.substring(0, 2000)}`);
+    // Log crash (sanitized + truncated to avoid log injection / explosion)
+    const bodyStr = sanitizeLogText(JSON.stringify(request.body ?? {}), 2000);
+    console.log(`[CRASH] ${bodyStr}`);
 
     parseC3032Beacon(bodyStr, "crash");
 

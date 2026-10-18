@@ -102,12 +102,21 @@ export function createRuntimeHealthSnapshot(state: RuntimeHealthState): RuntimeH
     })
 }
 
+/**
+ * `/healthz`：**只回一个状态码**（2026-10-18 加固）。
+ *
+ * 以前这里把 contractVersion、bundleId、node 版本、数据库 schema 号、HTTP/TCP 服务
+ * 状态、**后台是否需要口令**、资源模式与多人状态全抖给任何未认证的调用方 —— 等于
+ * 免费测绘。探活只需要 200/503；要看细节请走需要凭据的运维入口。
+ */
 export function registerRuntimeHealthRoute(
     fastify: FastifyInstance,
     getSnapshot: () => RuntimeHealthSnapshot,
 ): void {
     fastify.get("/healthz", (_request, reply) => {
         const snapshot = getSnapshot()
-        reply.type("application/json").status(snapshot.statusCode).send(snapshot.body)
+        reply.type("text/plain; charset=utf-8")
+            .status(snapshot.statusCode)
+            .send(snapshot.statusCode === 200 ? "ok" : "unavailable")
     })
 }

@@ -42,6 +42,30 @@ const accountColumns = `
 `
 
 /**
+ * 游戏 API 登录令牌的存取（`src/lib/game-auth.ts` 那层加固）。
+ *
+ * 令牌是服务端生成的 32 字节随机数，**按明文存**——它和密码不同：不是用户选的、
+ * 不会被复用，能读到库的人本来就已经能直接改存档；而明文换来两件要紧事：
+ * ① signup 能把**同一个**令牌反复发回客户端（密钥轮换会让启动期的请求带着旧令牌
+ * 撞上闸门，把玩家自己锁在门外）；② 运维能一眼比对客户端手里的令牌。
+ * NULL 表示这个账号还没领过令牌（本次加固前建的号），校验方据此放行。
+ */
+export function getAccountLoginTokenSync(accountId: number): string | null {
+    const row = getDb().prepare(`
+        SELECT login_token FROM accounts WHERE id = ?
+    `).get(accountId) as { login_token: string | null } | undefined
+    const value = row?.login_token
+    return typeof value === "string" && value.length > 0 ? value : null
+}
+
+/** 写入令牌与签发时间。调用方见 `issueLoginTokenSync` / `rotateLoginTokenSync`。 */
+export function setAccountLoginTokenSync(accountId: number, token: string, issuedAt: string): void {
+    getDb().prepare(`
+        UPDATE accounts SET login_token = ?, login_token_issued_at = ? WHERE id = ?
+    `).run(token, issuedAt, accountId)
+}
+
+/**
  * Asynchronously gets an Account from their id.
  * 
  * @param accountId The ID of the Account to get.

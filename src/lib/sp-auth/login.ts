@@ -30,6 +30,7 @@ import {
     toCodeView,
 } from "../../lib/signup-code"
 import { getRealNow } from "../../runtime/time/game-time"
+import { claimReportedDevices, noteGateLogin } from "./device-follow"
 import { parseDeviceId } from "./contract"
 import type { SpAuthCodeView, SpAuthLoginData } from "./contract"
 import { verifyPasswordHash } from "./password"
@@ -48,11 +49,24 @@ export interface SpAuthLoginInput {
      * "this device is mine" proof when the device is already claimed.
      */
     token?: unknown
+    /**
+     * Also outside C1 (client v5.25+): the **container** the gate runs in —
+     * iOS `NSHomeDirectory()`'s last path segment, Android the app data dir.
+     * The game reports the same segment inside its own `storage_directory_path`
+     * at `/tool/signup`, which is how the two halves of one machine are joined
+     * (see `device-follow.ts`). Older clients simply omit it and the join falls
+     * back to the source IP.
+     */
+    client_key?: unknown
 }
+
+/** Per-request context the route layer owns (never part of the body). */
+export type SpAuthRequestContext = import("./contract").SpAuthRequestContext
 
 export async function spLogin(
     input: SpAuthLoginInput,
     env: NodeJS.ProcessEnv = process.env,
+    ctx: SpAuthRequestContext = {},
 ): Promise<SpAuthResult<SpAuthLoginData, SpAuthCodeView>> {
     const loginName = typeof input.login_name === "string" ? input.login_name.trim() : ""
     const password = typeof input.password === "string" ? input.password : ""
@@ -141,10 +155,27 @@ export async function spLogin(
     insertDeviceBindingSync(deviceId, account.id)
     const viewerId = await ensureViewerSession(account.id)
 
+    // 「并号」：这台机器上游戏用的那把设备号（`/tool/signup` 报到过），跟着这次登录改绑过来，
+    // 并把号码回给客户端（v5.25 起客户端会直接采用它）。见 `device-follow.ts`。
+    const clientKey = typeof input.client_key === "string" ? input.client_key : null
+    noteGateLogin({ accountId: account.id, ip: ctx.ip, key: clientKey })
+    const claimed = claimReportedDevices({
+        accountId: account.id,
+        ip: ctx.ip,
+        key: clientKey,
+        loginName,
+        env,
+    })
+
     appendBindAuditSync({
         action: "login",
         accountId: account.id,
-        detail: { device_id: deviceId, result: "ok", login_name: loginName },
+        detail: {
+            device_id: deviceId,
+            result: "ok",
+            login_name: loginName,
+            followed_device_ids: claimed,
+        },
         actor: SP_AUTH_AUDIT_ACTOR,
         createdAt: getRealNow().toISOString(),
     })
@@ -154,6 +185,7 @@ export async function spLogin(
         viewer_id: viewerId,
         username: account.username ?? loginName,
         bound: true,
+        ...(claimed.length > 0 ? { game_device_id: claimed[0] } : {}),
     })
 }
 

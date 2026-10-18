@@ -95,7 +95,9 @@ export default function init(
         cleanup_due_at DATE DEFAULT NULL,
         cleanup_state TEXT NOT NULL DEFAULT 'active',
         takeover_password_hash TEXT DEFAULT NULL,
-        takeover_udid TEXT DEFAULT NULL
+        takeover_udid TEXT DEFAULT NULL,
+        login_token TEXT DEFAULT NULL,
+        login_token_issued_at TEXT DEFAULT NULL
     )`).run()
 
     ensureSchemaColumn(database, "accounts.admin_note")
@@ -104,6 +106,8 @@ export default function init(
     ensureSchemaColumn(database, "accounts.cleanup_state")
     ensureSchemaColumn(database, "accounts.takeover_password_hash")
     ensureSchemaColumn(database, "accounts.takeover_udid")
+    ensureSchemaColumn(database, "accounts.login_token")
+    ensureSchemaColumn(database, "accounts.login_token_issued_at")
     ensureSchemaColumn(database, "accounts.bind_state")
     ensureSchemaColumn(database, "accounts.bind_platform")
     ensureSchemaColumn(database, "accounts.bind_uid")
