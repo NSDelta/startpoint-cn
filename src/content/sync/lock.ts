@@ -376,15 +376,22 @@ export async function acquireContentSyncLock(
             } catch (takeoverError) {
                 throw new ContentSyncLockError(
                     "CONTENT_SYNC_LOCK_TIMEOUT",
-                    `等待同步锁超时，且 stale 接管失败：${takeoverError instanceof Error ? takeoverError.message : String(takeoverError)}`,
+                    `等待同步锁超时，且 stale 接管失败：${takeoverError instanceof Error ? takeoverError.message : String(takeoverError)}`
+                    + `（锁文件：${lockPath}）`,
                 )
             }
         }
         if (expired && legacyError !== null) throw legacyError
         if (now() - startedAt >= timeoutMs + staleThresholdMs) {
+            const holderPid = existing?.kind === "record" ? existing.record.pid : null
+            const holder = holderPid === null
+                ? ""
+                : `（pid ${holderPid}${isProcessAlive(holderPid) ? "，该进程仍在运行" : "，该进程已不存在"}）`
             throw new ContentSyncLockError(
                 "CONTENT_SYNC_LOCK_TIMEOUT",
-                `等待同步锁超时${existing?.kind === "record" ? `（pid ${existing.record.pid}）` : ""}；若该进程已退出，请确认后人工删除 sync.lock`,
+                `等待同步锁超时${holder}；锁文件：${lockPath}。`
+                + "若该进程仍在运行，说明已经有一个实例在运行或同步，请先关闭它再启动；"
+                + "确认该进程已退出后，删除上面这个文件即可（两个实例同时运行时不要删）。",
             )
         }
         await sleep(Math.min(pollIntervalMs, Math.max(1, timeoutMs + staleThresholdMs - (now() - startedAt))))

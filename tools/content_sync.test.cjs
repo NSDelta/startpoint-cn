@@ -1406,7 +1406,8 @@ test("lock waits, times out clearly, releases by token and identity, and leaves 
         }),
         error => error instanceof ContentSyncLockError
             && error.code === "CONTENT_SYNC_LOCK_TIMEOUT"
-            && /remove.*manually|人工删除/i.test(error.message),
+            && error.message.includes(path.join(paths.contentStateDir, "sync.lock"))
+            && /删除/.test(error.message),
     )
     await first.release()
     assert.equal(fs.existsSync(path.join(paths.contentStateDir, "sync.lock")), false)
