@@ -285,18 +285,31 @@ used_at, created_at, updated_at, revision)`，随
   客户端 `MainStageNodeLogic.isCleared` 与服务端 `singleBattleQuest/start`
   （`src/routes/api/singleBattleQuest.ts:257-273` 读 `quest_prerequisites.json`）
   都要求前置 quest 已 `finished`。
+- **只能向前**：`players.last_main_quest_id` 单调递增（客户端开始某关时写入该关），
+  因此「目标章首任务 ≤ 指针」意味着存档已经走过这里，接口直接返回
+  `already_ahead: true` 并且**不写任何行**——把进度往回退是不可恢复的，所以是拒绝而不是照做。
+- **首通奖励不丢**：正常通关时 `clearReward` 由结算路径直接发放，而被跳过的 quest
+  永远不会被打，所以这一次**真正翻转**的 quest 的 `clearReward` 会以邮件补发：
+  按「章 × 奖励种类」汇总成一封（跳到第 12 章约有一百来个 quest，逐关发信会淹没邮箱），
+  同一种的数量相加，总额与逐关通关完全一致。邮件用的是与
+  `src/lib/mail-reward-grant.ts` 的 `standardReward()` 互逆的映射，领取时走与普通邮件
+  完全相同的发放路径；有效期 90 天。因为只补发「本次翻转」的 quest，
+  重复调用不会重复补发（已 `finished` 的行不再翻转）。
 - 顺带按 `recordCompletedMainChapterMilestoneSync` 的公式记章节里程碑
   （target 2 / slot 1-6 给第 1-6 章，target 3 / slot 1-6 给第 7-12 章，`INSERT OR IGNORE` 幂等）。
 - 把 `players.last_main_quest_id` 指向**目标章的第一个 quest**（schema 新增列，
   `src/data/schema.ts` 的 `players.last_main_quest_id` + `ensureSchemaColumn` 迁移）。
   这与正常推进一致：客户端在开始某关时把该关写成当前任务
   （`src/routes/api/singleBattleQuest.ts:400`）。
-- `chapter = 1` 是合法 no-op：不写任何 quest 行，只清空指针（该列默认 `NULL`）。
+- `chapter = 1` 是合法 no-op：不写任何 quest 行，**也不动指针**——从没离开第 1 章的存档
+  保持 `NULL`，不会被塞一个合成值。
 - `chapter` 取值 `1..12`（`MAX_MAIN_CHAPTER`，按 content 实有章节）；`0`/负数/非整数 ⇒ 400
-  `BAD_REQUEST`，`> 12` ⇒ 400 `INVALID_CHAPTER`。
+  `BAD_REQUEST`，`> 12` ⇒ 400 `INVALID_CHAPTER`（`src/routes/web_api/bot.ts:481`）。
 
 响应 `{ok:true,data:{account_id, viewer_id, username, chapter, last_main_quest_id,
-current_quest, finished_quests, recorded_chapters}}`。
+current_quest, finished_quests, recorded_chapters, already_ahead,
+mailed_rewards:{mails, quests, unsupported}}}`。`already_ahead` 为真时其余计数均为 `0`
+（`mailed_rewards` 全零），指针返回存档真实值。
 
 `quest_prerequisites.json` **不是**本功能的判定依据：它含 `1_3001001 -> 3001001`
 这类章内自指条目，字面解读会把第 3 章判成不可达。真正把关的是跨章依赖——每章首节点的
@@ -331,11 +344,11 @@ need_stage_node 指向上一章**最后**一个节点（第 3 章首节点依赖
 | 入参缺字段（如 platform） | 400 | `{ok:false,code:"BAD_REQUEST"}` | `:299` |
 | `bind` 缺 code / 码格式非法 | 400 | `{ok:false,code:"CODE_INVALID"}` | `:333` |
 | `status` 无绑定 | **200** | `{ok:true,data:{bindings:[]}}` | `:392` |
-| 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:337`（bind）、`:409`（unbind）、`:478`（skip_chapter） |
+| 触发限流 | 200 | `{ok:false,code:"RATE_LIMITED"}` | `:337`（bind）、`:409`（unbind）、`:484`（skip_chapter） |
 | 业务失败（码过期/已用/锁定/已绑定） | 200 | `{ok:false,code:<C4 码>}` | `:357`、`:414` |
 | 解绑目标不存在 / 是主绑定 | 200 | `{ok:false,code:"BINDING_NOT_FOUND"｜"PRIMARY_BINDING"}` | `:422`、`:423` |
-| `skip_chapter` 的 chapter > 12 | 400 | `{ok:false,code:"INVALID_CHAPTER"}` | `src/routes/web_api/bot.ts:476` |
-| `skip_chapter` 无绑定 / 绑定歧义 / 无存档 | 200 | `{ok:false,code:"NO_BINDING"｜"NO_PLAYER"}` | `:483`、`:485` |
+| `skip_chapter` 的 chapter > 12 | 400 | `{ok:false,code:"INVALID_CHAPTER"}` | `src/routes/web_api/bot.ts:481` |
+| `skip_chapter` 无绑定 / 绑定歧义 / 无存档 | 200 | `{ok:false,code:"NO_BINDING"｜"NO_PLAYER"}` | `:488`、`:490` |
 | `reset` 缺 `qq`/`code` | 400 | `{ok:false,code:"CODE_NOT_FOUND",message}` | `:524` |
 | `reset` 码不存在/过期/QQ 不符/账号没绑 QQ | 200 | `{ok:false,code:<C7 码>,message}` | `:536`、`:539`、`:542`、`:543`、`:547` |
 

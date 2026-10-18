@@ -457,9 +457,14 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
      * and both the client (`MainStageNodeLogic.isCleared`) and
      * `singleBattleQuest/start` require the whole prerequisite stage node to be
      * cleared before a later chapter is playable, so unlocking alone would not
-     * let the player in. `N = 1` is a valid no-op, and `N = MAX_MAIN_CHAPTER + 1`
-     * means "everything in content". The action targets the caller's own bound
-     * save and needs no confirmation code: it can only move that save forward.
+     * let the player in. `N = 1` is a valid no-op and `MAX_MAIN_CHAPTER` is the
+     * last chapter content has, so larger values are refused.
+     *
+     * The action targets the caller's own bound save and needs no confirmation
+     * code, because it can not undo anything: a save that already reached `N`
+     * (or beyond) is reported as `already_ahead` instead of being moved, and the
+     * first-clear rewards of the quests it does finish are mailed rather than
+     * silently dropped — see `src/lib/player-progress/chapter-skip.ts`.
      */
     fastify.post("/skip_chapter", async (request, reply) => {
         if (!isDatabaseReady()) return reply.status(503).send({ ok: false, code: "SERVICE_UNAVAILABLE" })
@@ -499,6 +504,17 @@ const routes = async (fastify: FastifyInstance, options: BotApiRoutesOptions = {
                     current_quest: getChapterStartQuestId(result.chapter),
                     finished_quests: result.newlyFinished,
                     recorded_chapters: result.recordedChapters,
+                    // True when the save had already passed this chapter and
+                    // nothing was written; the bot says so instead of claiming a
+                    // fast-forward that did not happen.
+                    already_ahead: result.alreadyAhead,
+                    // First-clear rewards of the finished quests, mailed in bulk:
+                    // one mail per chapter and reward kind.
+                    mailed_rewards: {
+                        mails: result.mailedRewards.mailCount,
+                        quests: result.mailedRewards.quests,
+                        unsupported: result.mailedRewards.unsupportedRewards,
+                    },
                 },
             })
         } catch (error) {

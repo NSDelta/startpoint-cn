@@ -37,8 +37,14 @@ const {
 const { getPlayerHistoryMilestonesSync } = require("../src/data/domains/player-history-facts")
 const { BOT_TOKEN_HEADER } = require("../src/routes/web_api/bot")
 const botRoutes = require("../src/routes/web_api/bot").default
-const { getMainQuestIdsForChapter } = require("../src/lib/quest-content")
+const { getMainQuestIdsForChapter, getMainQuestSync } = require("../src/lib/quest-content")
 const { getQuestPrerequisites } = require("../src/lib/quest-entry-content")
+const {
+    getPlayerMailCountSync,
+    getPlayerMailsSync,
+    MailType,
+} = require("../src/data/domains/mail")
+const { RewardType } = require("../src/lib/types/rewards")
 const { MAIN_QUEST_SECTION, MAX_MAIN_CHAPTER } = require("../src/lib/player-progress/chapter-skip")
 const { installBundledGameplaySnapshot } = require("./helpers/install-bundled-gameplay-snapshot.cjs")
 
@@ -436,4 +442,110 @@ test("the bot token still gates the endpoint", async () => {
     assert.deepEqual(wrong.body, { ok: false, code: "FORBIDDEN" })
 
     assert.equal(getPlayerLastMainQuestIdOf(viewer.playerId), null)
+})
+
+/** The reward kind a mail carries, so mails can be compared against content. */
+function mailRewardKind(mail) {
+    switch (mail.type) {
+        case MailType.ITEM: return RewardType.ITEM
+        case MailType.EQUIPMENT: return RewardType.EQUIPMENT
+        case MailType.CHARACTER: return RewardType.CHARACTER
+        case MailType.FREE_VMONEY: return RewardType.BEADS
+        case MailType.FREE_MANA: return RewardType.MANA
+        case MailType.EXP_POOL: return RewardType.EXP
+        default: return -1
+    }
+}
+
+test("a save that already reached the chapter is never moved backwards", async () => {
+    const viewer = createViewer("forward-only")
+    bindIdentity(viewer.accountId, "skip-forward-1")
+    // A save that really played up to chapter 5 has a pointer but no fabricated
+    // progress rows, which is exactly the shape the guard has to recognise.
+    getDb().prepare("UPDATE players SET last_main_quest_id = ? WHERE id = ?")
+        .run(firstQuestOf(5), viewer.playerId)
+
+    const backwards = await skip({ platform: "qq", uid: "skip-forward-1", chapter: 2 })
+    assert.equal(backwards.status, 200)
+    assert.equal(backwards.body.data.already_ahead, true)
+    assert.equal(backwards.body.data.finished_quests, 0)
+    assert.equal(backwards.body.data.recorded_chapters, 0)
+    assert.equal(backwards.body.data.last_main_quest_id, firstQuestOf(5))
+    assert.equal(backwards.body.data.mailed_rewards.mails, 0)
+
+    // Nothing was written: not the progress rows of the chapters the caller asked
+    // to "skip", not the pointer, not a mail.
+    assert.equal(getPlayerLastMainQuestIdOf(viewer.playerId), firstQuestOf(5))
+    const rows = getPlayerQuestProgressSync(viewer.playerId, [MAIN_QUEST_SECTION])[
+        String(MAIN_QUEST_SECTION)
+    ] ?? []
+    assert.deepEqual(rows, [])
+    assert.equal(getPlayerMailCountSync(viewer.playerId), 0)
+
+    // Standing exactly on the target is a no-op as well, and moving on still works.
+    const sameChapter = await skip({ platform: "qq", uid: "skip-forward-1", chapter: 5 })
+    assert.equal(sameChapter.body.data.already_ahead, true)
+    assert.equal(sameChapter.body.data.last_main_quest_id, firstQuestOf(5))
+
+    const forwards = await skip({ platform: "qq", uid: "skip-forward-1", chapter: 6 })
+    assert.equal(forwards.body.data.already_ahead, false)
+    assert.equal(forwards.body.data.finished_quests > 0, true)
+    assert.equal(getPlayerLastMainQuestIdOf(viewer.playerId), firstQuestOf(6))
+})
+
+test("the first-clear rewards of skipped quests are mailed instead of lost", async () => {
+    const viewer = createViewer("mailed-rewards")
+    bindIdentity(viewer.accountId, "skip-mail-1")
+
+    const response = await skip({ platform: "qq", uid: "skip-mail-1", chapter: 3 })
+    assert.equal(response.body.ok, true)
+    assert.equal(response.body.data.finished_quests > 0, true)
+    // No clear reward in content is a kind the mailbox can not carry.
+    assert.equal(response.body.data.mailed_rewards.unsupported, 0)
+    assert.equal(response.body.data.mailed_rewards.quests > 0, true)
+
+    const mails = getPlayerMailsSync(viewer.playerId, 1, 500)
+    assert.equal(mails.length, response.body.data.mailed_rewards.mails)
+    // One mail per chapter and reward kind: a two-chapter skip must not produce
+    // one mail per quest, or the mailbox would be unusable.
+    assert.equal(mails.length < response.body.data.finished_quests, true)
+    for (const mail of mails) {
+        assert.equal(mail.receive_time, "0000-00-00 00:00:00")
+        assert.equal(mail.reward_period_limited, 1)
+        assert.notEqual(mail.reward_limit_time, null)
+        assert.match(mail.subject, /^第 [12] 章首通奖励补发$/)
+        assert.equal(mail.number > 0, true)
+    }
+
+    // Summed up, the mailbox pays exactly what the skipped quests' first clears
+    // would have paid — nothing is dropped and nothing is invented.
+    const expected = new Map()
+    for (const chapter of [1, 2]) {
+        for (const questId of getMainQuestIdsForChapter(chapter)) {
+            const reward = getMainQuestSync(questId)?.clearReward
+            if (reward === undefined) continue
+            const key = `${reward.type}:${reward.id ?? 0}`
+            const count = typeof reward.count === "number" ? reward.count : 1
+            expected.set(key, (expected.get(key) ?? 0) + count)
+        }
+    }
+    const mailed = new Map()
+    for (const mail of mails) {
+        const key = `${mailRewardKind(mail)}:${mail.type_id ?? 0}`
+        mailed.set(key, (mailed.get(key) ?? 0) + mail.number)
+    }
+    assert.deepEqual(
+        [...mailed.entries()].sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+        [...expected.entries()].sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+    )
+
+    // Skipping on only mails what it newly finished: chapter 3, once.
+    const seenIds = new Set(mails.map(mail => mail.id))
+    const more = await skip({ platform: "qq", uid: "skip-mail-1", chapter: 4 })
+    assert.equal(more.body.data.mailed_rewards.mails > 0, true)
+    const added = getPlayerMailsSync(viewer.playerId, 1, 500).filter(mail => !seenIds.has(mail.id))
+    assert.equal(added.length, more.body.data.mailed_rewards.mails)
+    for (const mail of added) {
+        assert.match(mail.subject, /^第 3 章首通奖励补发$/)
+    }
 })
