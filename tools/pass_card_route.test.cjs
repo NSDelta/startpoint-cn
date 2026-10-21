@@ -231,7 +231,17 @@ async function main() {
         )
         Object.assign(passCardRewards, originalRewardRows)
 
+        // 宽限期：客户端按 master 的 force_time（end_time + 1 个月）仍展示可领，
+        // 服务端在 [start_time, force_time] 内都必须放行（原来只看 end_time，玩家报「修行之道 C7101/损坏」）。
         setServerTimeOffset(Date.parse("2024-09-01T04:00:00.000Z") - Date.now())
+        const graceResponse = await fastify.inject({
+            method: "POST",
+            url: "/get_pass_card",
+            payload: { viewer_id: viewerId, pass_card_id: 3 },
+        })
+        assert.equal(graceResponse.statusCode, 200, graceResponse.body)
+        // 过了 force_time 才真正判死。
+        setServerTimeOffset(Date.parse("2024-10-02T04:00:00.000Z") - Date.now())
         const expiredResponse = await fastify.inject({
             method: "POST",
             url: "/get_pass_card",

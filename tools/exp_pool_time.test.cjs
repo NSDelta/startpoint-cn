@@ -27,7 +27,8 @@ function dateAt(offsetMs) {
 // 若按 1/秒，客户端会直接顶到自己的上限、请求量级为上限值而不是 126860。
 // 上限必须大于客户端能渲染出的值（实测 126860 > 旧上限 100000）。
 assert.equal(EXP_POOL_GAIN_INTERVAL_MS, MINUTE, "pool gains 1 exp per minute (client model)")
-assert.equal(EXP_POOL_MAX, 999999, "pool cap must exceed the client-rendered 126860")
+// 上限：业主 2026-10-20 明确要求 999999999（原 999999 会把攒超的池在下次 /load 时夹掉并写回库）。
+assert.equal(EXP_POOL_MAX, 999_999_999, "pool cap is the owner-requested 999999999")
 
 assert.deepEqual(
     calculatePooledExpAtRealTime(10, dateAt(-10 * MINUTE), dateAt(0), 365 * 24 * 60 * MINUTE),
@@ -94,7 +95,7 @@ assert.deepEqual(
 )
 
 assert.deepEqual(
-    calculatePooledExpAtRealTime(1_050_000, dateAt(0), dateAt(0), 0),
+    calculatePooledExpAtRealTime(EXP_POOL_MAX + 50_000, dateAt(0), dateAt(0), 0),
     {
         expPool: EXP_POOL_MAX,
         expPooledTime: dateAt(0),
@@ -109,9 +110,9 @@ assert.equal(caughtUp.expPool, 105000 + 15 * 24 * 60, "15 days of accrual is 216
 assert.equal(caughtUp.earned, 15 * 24 * 60, "the reported gain is the real pool growth")
 assert.equal(caughtUp.repaired, false, "a normal catch-up is not a repair")
 
-const saturated = calculatePooledExpAtRealTime(105000, dateAt(-700 * DAY), dateAt(0), 0)
+const saturated = calculatePooledExpAtRealTime(EXP_POOL_MAX - 1_000, dateAt(-700 * DAY), dateAt(0), 0)
 assert.equal(saturated.expPool, EXP_POOL_MAX, "a long catch-up saturates at the cap")
-assert.equal(saturated.earned, EXP_POOL_MAX - 105000, "the gain stops at the cap")
+assert.equal(saturated.earned, 1_000, "the gain stops at the cap")
 assert.equal(saturated.repaired, false, "a saturating catch-up is still not a repair")
 
 // 2026-10-17 线上事故：服务端模拟时钟被设在 2025-08-01（offset≈-442 天），库里池被写到

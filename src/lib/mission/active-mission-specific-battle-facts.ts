@@ -177,8 +177,11 @@ export function collectActiveMissionSpecificBattleFacts(
                 matched.push({ missionId: definition.missionId })
             } else if (pattern === SKILL_EFFECT_PATTERN
                 && matchesSkillEffects(
-                    parseEffectList(definition.row[69]),
-                    definition.row[70],
+                    // pattern 90 的载荷在 row[71]（效果列表）/ row[72]（除外角色），不是 89 用的 69/70。
+                    // 读 69/70 时拿到的是 "(None)" ⇒ parseEffectList 返回 null ⇒ 进度恒 0
+                    // （内容指南 20015「属性抗性降低」/ 20016「回复技能」永远完不成的真凶）。
+                    parseEffectList(definition.row[71]) ?? parseEffectList(definition.row[69]),
+                    definition.row[72] ?? definition.row[70],
                     partyCharacterIds,
                     unisonCharacterIds,
                     context.skillEffects,

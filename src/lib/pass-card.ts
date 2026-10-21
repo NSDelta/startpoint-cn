@@ -97,14 +97,24 @@ export function getActivePassCardEventDefinitionAt(
         .filter((eventId): eventId is number => eventId !== undefined)
         .sort((left, right) => left - right)
         .map(eventId => getPassCardEventDefinition(eventId, calendar))
-        .find((event): event is PassCardEventDefinition =>
+        .filter((event): event is PassCardEventDefinition =>
             event !== undefined && isPassCardEventActiveAt(event, at),
         )
+        // 宽限期会让上一期与新一期同时「有效」，必须取**开始得最晚**的那期（否则永远命中第 1 期）。
+        .sort((left, right) => right.startTime - left.startTime)[0]
 }
 
+/**
+ * 通行证期是否仍在服务窗口内。
+ *
+ * 真机症状（玩家报「修行之道 C7101 / 损坏」）：客户端按 master 的 `force_time`（= end_time + 1 个月）
+ * 仍显示可领，而服务端只看 `[start_time, end_time]` ⇒ 过了 end_time 立刻回 400 `Unknown pass card.`。
+ * 这里把窗口放到 `force_time`，与客户端展示口径对齐。
+ */
 export function isPassCardEventActiveAt(event: PassCardEventDefinition, at: Date): boolean {
     const time = at.getTime()
-    return Number.isFinite(time) && event.startTime <= time && time <= event.endTime
+    const until = Math.max(event.endTime, event.forceTime)
+    return Number.isFinite(time) && event.startTime <= time && time <= until
 }
 
 export function getPassCardRewardDefinition(rewardId: number): PassCardRewardDefinition | undefined {
