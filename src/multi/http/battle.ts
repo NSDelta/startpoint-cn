@@ -376,8 +376,13 @@ export function registerBattleRoutes(fastify: FastifyInstance, context: MultiHtt
 
         const ctx = await context.resolvePlayerContext(viewerId);
         if (!ctx || !ctx.player) {
-            return reply.status(400).send({
-                "error": "Bad Request", "message": "Invalid viewer id."
+            // 会话失效（换设备/改绑后旧 viewer_id）不再回 400 让客户端弹错：
+            // 2053 = 客户端视图过期，它会自己重新 load，而不是报错退出。
+            console.log(`[MULTI] finish 会话失效 viewerId=${viewerId} ⇒ 200/2053（客户端按视图过期处理）`);
+            reply.header("content-type", "application/x-msgpack");
+            return reply.status(200).send({
+                "data_headers": generateDataHeaders({ viewer_id: viewerId, result_code: 2053 }),
+                "data": {},
             });
         }
 

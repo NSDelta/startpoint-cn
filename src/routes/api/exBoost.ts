@@ -197,25 +197,67 @@ const drawExpBoost = async (request: FastifyRequest, reply: FastifyReply, autoAc
 
     const pendingDraw = getPendingExBoostDrawSync(playerId)
     if (pendingDraw !== null) {
-        if (autoAccept || pendingDraw.characterId !== characterId) return reply.status(400).send({
-            "error": "Bad Request", "message": "An EX boost draw is already pending."
-        })
-        const currentCostItemAmount = getPlayerItemSync(playerId, costItemId) ?? 0
-        reply.header("content-type", "application/x-msgpack")
-        return reply.status(200).send({
-            data_headers: generateDataHeaders({ viewer_id: viewerId }),
-            data: {
-                character_id: characterId,
-                draw_result: {
-                    status_id: pendingDraw.statusId,
-                    ability_id_list: pendingDraw.abilityIdList,
+        if (!autoAccept && pendingDraw.characterId === characterId) {
+            // 同一个角色又抽了一次：把上一次的结果回给客户端（原有语义）
+            const currentCostItemAmount = getPlayerItemSync(playerId, costItemId) ?? 0
+            reply.header("content-type", "application/x-msgpack")
+            return reply.status(200).send({
+                data_headers: generateDataHeaders({ viewer_id: viewerId }),
+                data: {
+                    character_id: characterId,
+                    draw_result: {
+                        status_id: pendingDraw.statusId,
+                        ability_id_list: pendingDraw.abilityIdList,
+                    },
+                    ...mergeCommonResponseFragments([{
+                        item_list: { [String(costItemId)]: currentCostItemAmount },
+                        mail_arrived: getMailArrivedSync(playerId),
+                    }]),
                 },
-                ...mergeCommonResponseFragments([{
-                    item_list: { [String(costItemId)]: currentCostItemAmount },
-                    mail_arrived: getMailArrivedSync(playerId),
-                }]),
-            },
-        })
+            })
+        }
+        // 自愈（2026-10-20，真机「EX强化炸了 / No.H400」）：一次没被确认的抽取会永久挡住
+        // 之后所有抽取（/first_draw 一律 400 ⇒ 客户端只能弹「发生意想不到的错误」）。
+        // 材料在抽的那一次就已经扣掉了，所以这里直接把悬挂结果落地，绝不丢玩家东西。
+        const pendingCharacter = getPlayerCharacterSync(playerId, pendingDraw.characterId)
+        if (pendingCharacter === null) {
+            deletePendingExBoostDrawSync(playerId)
+        } else {
+            const applied = getDb().transaction(() => {
+                const write = setCharacterExBoostWithinTransactionSync({
+                    playerId,
+                    characterId: pendingDraw.characterId,
+                    statusId: pendingDraw.statusId,
+                    abilityIdList: pendingDraw.abilityIdList,
+                })
+                deletePendingExBoostDrawSync(playerId)
+                return write
+            })()
+            console.log("[EX_BOOST] 自愈：悬挂抽取已落地 player=" + playerId
+                + " character=" + pendingDraw.characterId
+                + " status=" + pendingDraw.statusId
+                + " abilities=" + pendingDraw.abilityIdList.join(","))
+            if (autoAccept && pendingDraw.characterId === characterId) {
+                const currentCostItemAmount = getPlayerItemSync(playerId, costItemId) ?? 0
+                reply.header("content-type", "application/x-msgpack")
+                return reply.status(200).send({
+                    data_headers: generateDataHeaders({ viewer_id: viewerId }),
+                    data: {
+                        ...mergeCommonResponseFragments([{
+                            character_list: [projectCharacterPatch(projectExBoostCharacter(
+                                viewerId,
+                                characterId,
+                                pendingCharacter,
+                                { statusId: pendingDraw.statusId, abilityIdList: pendingDraw.abilityIdList },
+                                applied.updateTime,
+                            ))],
+                            item_list: { [String(costItemId)]: currentCostItemAmount },
+                            mail_arrived: getMailArrivedSync(playerId),
+                        }]),
+                    },
+                })
+            }
+        }
     }
 
     if (autoAccept && characterData.exBoost !== undefined) {

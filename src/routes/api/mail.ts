@@ -156,17 +156,27 @@ const routes = async (fastify: FastifyInstance) => {
             })
         }
 
+        // 会话失效（换设备/改绑后旧 viewer_id）不再回 400 让客户端弹错：
+        // 客户端把 2001（ReceiveErrorNoPresent）当「这封邮件收不到」静默处理。
         const session = await getSession(viewerId.toString())
-        if (!session) return reply.status(400).send({
-            error: "Bad Request",
-            message: "Invalid viewer_id"
-        })
+        if (!session) {
+            console.log(`[MAIL:receive] 会话失效 viewerId=${viewerId} mailId=${mailId} ⇒ 200/2001（客户端 graceful）`)
+            reply.header("content-type", "application/x-msgpack")
+            return reply.status(200).send({
+                data_headers: generateDataHeaders({ viewer_id: viewerId, result_code: 2001 }),
+                data: {},
+            })
+        }
 
         const playerId = resolvePlayerIdSync(session.accountId)!
-        if (playerId === null) return reply.status(400).send({
-            error: "Bad Request",
-            message: "No player bound to account"
-        })
+        if (playerId === null) {
+            console.log(`[MAIL:receive] 账号无角色 accountId=${session.accountId} ⇒ 200/2001（客户端 graceful）`)
+            reply.header("content-type", "application/x-msgpack")
+            return reply.status(200).send({
+                data_headers: generateDataHeaders({ viewer_id: viewerId, result_code: 2001 }),
+                data: {},
+            })
+        }
 
         let settlement: ReturnType<typeof settleMailRewardsInTransactionOwnerSync> & {
             reconciledCharacterList: Record<string, unknown>[]

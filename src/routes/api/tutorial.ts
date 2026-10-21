@@ -157,15 +157,42 @@ function buildTutorialPresentReplayData(
     }
 }
 
+/**
+ * 教程收尾响应。
+ *
+ * 2026-10-20 真机事故：玩家「继续教程」后闪退、重进又回到同一处（设备 2191721912002 /
+ * 账号 41）。崩溃载荷是 G3000（reproduce 校验失败），而库里 `players_tutorial_step_receipts`
+ * 存下的正是这份响应 —— 四个列表字段全是 `null`。客户端把教程收尾数据并回本地存档时，
+ * 这几个字段是当数组遍历的（`/api/index.php/load` 那条路一直给 `[]`），`null` 直接把它打崩，
+ * 于是「崩 → 重进 → 再走同一步 → 再崩」。
+ *
+ * 因此这里与 load 对齐：列表字段一律给空数组，标量保持 null。
+ */
 function buildTutorialEndData() {
     return {
-        "bonus_index_list": null,
-        "premium_bonus_index_list": null,
-        "premium_bonus_mailed_item_list": null,
+        "bonus_index_list": [],
+        "premium_bonus_index_list": [],
+        "premium_bonus_mailed_item_list": [],
         "login_bonus_received_at": null,
-        "start_dash_exchange_campaign_list": null,
+        "start_dash_exchange_campaign_list": [],
         "start_time": getServerTime(),
     }
+}
+
+/** 旧收尾响应里的 `null` 列表字段就地纠正（已经落库的 receipt 也会被修好，无需清库）。 */
+const TUTORIAL_LIST_FIELDS = [
+    "bonus_index_list",
+    "premium_bonus_index_list",
+    "premium_bonus_mailed_item_list",
+    "start_dash_exchange_campaign_list",
+] as const
+
+function normalizeTutorialListFields(data: Record<string, unknown>): Record<string, unknown> {
+    const result: Record<string, unknown> = { ...data }
+    for (const field of TUTORIAL_LIST_FIELDS) {
+        if (result[field] === null) result[field] = []
+    }
+    return result
 }
 
 const routes = async (fastify: FastifyInstance) => {
@@ -278,7 +305,10 @@ const routes = async (fastify: FastifyInstance) => {
                     )
                 )
             ) {
-                return { ok: true, data: receipt.responseData } as const
+                return {
+                    ok: true,
+                    data: normalizeTutorialListFields(receipt.responseData),
+                } as const
             }
 
             if (effectiveNextStep === TUTORIAL_GACHA_EFFECTIVE_STEP
@@ -295,7 +325,38 @@ const routes = async (fastify: FastifyInstance) => {
                 if (effectiveNextStep === TUTORIAL_END_EFFECTIVE_STEP) {
                     return { ok: true, data: buildTutorialEndData() } as const
                 }
-                return { ok: false, message: "Tutorial already completed." } as const
+                // 2026-10-20 真机事故（设备 2191721912002 / 账号 41「clown」）：教程**已经完成**
+                // 的玩家重走一遍时，这里原来直接回「Tutorial already completed.」⇒ 客户端收到
+                // 400，卡在「继续教程」里闪退、重进再走同一处。已完成就一律按「回放」应答，
+                // 形状与下面 isReplay 的三种分支对齐，绝不回错误。
+                if (effectiveNextStep === TUTORIAL_GACHA_EFFECTIVE_STEP
+                    && gachaId !== null
+                    && gachaData !== null
+                    && tutorialGachaCost !== null) {
+                    return {
+                        ok: true,
+                        data: buildTutorialGachaReplayData(
+                            playerId,
+                            viewerId,
+                            gachaId,
+                            effectiveNextStep,
+                        ),
+                    } as const
+                }
+                if (effectiveNextStep === TUTORIAL_PRESENT_EFFECTIVE_STEP) {
+                    return {
+                        ok: true,
+                        data: buildTutorialPresentReplayData(playerId, effectiveNextStep),
+                    } as const
+                }
+                return {
+                    ok: true,
+                    data: {
+                        "step": effectiveNextStep,
+                        "mail_arrived": getMailArrivedSync(playerId),
+                        "start_time": getServerTime(),
+                    },
+                } as const
             }
 
             const isReplay = currentPlayer.tutorialStep === storedNextStep

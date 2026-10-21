@@ -13,13 +13,23 @@ import { getTimeOffset, realDateFromServerTime, realToVirtual } from "../utils"
 // 上限值而不是 126860。注意 <DATA_DIR>/content/store/objects/*.json 里那份带
 // pool_exp_gain_seconds=1 的 CN 配置副本自注为「已知参考值」（其 hash 未命中 entity
 // list），实测行为与它不一致，不可作 oracle。
-// 上限 max_pool_exp=999999（同一份配置副本；客户端实测渲染值 126860 > 旧上限 100000，
-// 证明旧上限偏小），池只受它约束，调大不影响玩法平衡。
+// 上限 max_pool_exp：2026-10-20 按业主口径从 999999 提到 **999999999**（原值偏小：
+// 客户端实测渲染 126860 时我们还在按 999999 夹，池子一过 999999 下一次 load 就被退回
+// 999999，玩家看到的就是「经验值涨到 999999 就停住」）。这是**服务端**的夹取点，
+// 客户端还有一份自己的 max_pool_exp（master 配置）——两边都得够大才不会互相打回。
 export const EXP_POOL_GAIN_INTERVAL_MS = 60_000
-export const EXP_POOL_MAX = 999999
+export const EXP_POOL_MAX = 999_999_999
 
+/**
+ * 锚点修复用的「最大可回溯跨度」：**故意钉在旧上限 999999 的量级**（≈ 694 天）。
+ *
+ * 它只参与「这个时间锚点像不像模拟时钟」的判定（见 normalizeImportedExpPoolAnchor），
+ * 与池上限无关。跟着 EXP_POOL_MAX 一起放大 1000 倍会把「锚点 15 天没推进」
+ * 「客户端偏移 −442 天」这类判据一起废掉（2026-10-17 真机踩过的坑）。
+ */
+const EXP_POOL_CATCH_UP_REFERENCE_EXP = 999_999
+const MAX_CATCH_UP_MS = EXP_POOL_CATCH_UP_REFERENCE_EXP * EXP_POOL_GAIN_INTERVAL_MS
 const LEGACY_ANCHOR_TOLERANCE_MS = 5 * EXP_POOL_GAIN_INTERVAL_MS
-const MAX_CATCH_UP_MS = EXP_POOL_MAX * EXP_POOL_GAIN_INTERVAL_MS
 
 export interface PooledExpCalculation {
     readonly expPool: number

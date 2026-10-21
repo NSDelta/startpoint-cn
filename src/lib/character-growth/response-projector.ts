@@ -251,6 +251,14 @@ export function projectCharacterGrowthEntry(
         ...(options.viewerId === undefined ? {} : { viewer_id: options.viewerId }),
         ...(options.includeCharacterId === false ? {} : { character_id: characterId }),
     }
+    // 修 C2274（真机报 `243013のキャラクターの entry_count が存在しません`，报在
+    // PlayerLogic/applyCommonResponseCharacterList）：客户端对这种片段的处理是
+    // 「本地没有这个角色 ⇒ 按 entry_count 新建」，所以只要片段里没有 entry_count 就直接抛错。
+    // growth patch 原本只按调用方给的 fields 挑字段，可能整片都不带它 ⇒ 这里统一补上
+    // （值取自角色行本身，拥有的角色收到同一个数，不会覆盖错）。
+    if (options.character.entryCount !== undefined) {
+        entry.entry_count = nonNegativeSafeInteger(options.character.entryCount, "character.entry_count")
+    }
 
     for (const field of options.fields) {
         switch (field) {
