@@ -81,42 +81,52 @@ const routes = async (fastify: FastifyInstance, options: ShopRoutesOptions = {})
             "message": "No players bound to account."
         })
 
-        const toParseShopItems = selectShopSalesCatalogItems(getShopCatalog(), {
-            shopTypes,
-            eventList: eventList.map(event => ({
-                eventType: event.event_type,
-                eventIds: event.event_ids,
-            })),
-            bossCategoryIds: bossCoinShopCategoryIds,
-        }, resolveRushFinalOperationOverrideForRuntime())
+        // 列表构造任何一步抛错都回空列表，而不是 500（交易所打不开 H500）。
+        let salesList: Object[] = []
+        try {
+            const toParseShopItems = selectShopSalesCatalogItems(getShopCatalog(), {
+                shopTypes,
+                eventList: eventList.map(event => ({
+                    eventType: event.event_type,
+                    eventIds: event.event_ids,
+                })),
+                bossCategoryIds: bossCoinShopCategoryIds,
+            }, resolveRushFinalOperationOverrideForRuntime())
 
-        const gameTime = getGameTimeContext()
-        const nowMs = gameTime.virtualNowMs
-        const campaignLineups = getPlayerShopCampaignLineupsSync(playerId)
-        const equipmentSnapshot = shopTypes.includes(ShopType.TREASURE_EQUIPMENT)
-            ? getPlayerEquipmentListSync(playerId)
-            : null
-        const { salesList, filteredGeneralCount } = buildShopSalesListSync({
-            playerId,
-            itemsByType: toParseShopItems,
-            nowMs,
-            purchasePeriodNowMs: gameTime.realNowMs,
-            resetHour: dailyResetHour,
-            equipmentEnhancementCategoryIds,
-            isItemVisible: (item, shopType) => (
-                isShopItemVisibleForCampaign(item, shopType, campaignLineups)
-            ),
-        }, {
-            getPurchaseCountsBulk: getPlayerShopPurchaseCountsByTypeBulkSync,
-            getEquipmentEnhancementLevel: (ownerId, equipmentId) => (
-                equipmentSnapshot === null
-                    ? -1
-                    : (equipmentSnapshot[String(equipmentId)]?.enhancementLevel ?? -1)
-            ),
-        })
+            const gameTime = getGameTimeContext()
+            const nowMs = gameTime.virtualNowMs
+            const campaignLineups = getPlayerShopCampaignLineupsSync(playerId)
+            const equipmentSnapshot = shopTypes.includes(ShopType.TREASURE_EQUIPMENT)
+                ? getPlayerEquipmentListSync(playerId)
+                : null
+            const built = buildShopSalesListSync({
+                playerId,
+                itemsByType: toParseShopItems,
+                nowMs,
+                purchasePeriodNowMs: gameTime.realNowMs,
+                resetHour: dailyResetHour,
+                equipmentEnhancementCategoryIds,
+                isItemVisible: (item, shopType) => (
+                    isShopItemVisibleForCampaign(item, shopType, campaignLineups)
+                ),
+            }, {
+                getPurchaseCountsBulk: getPlayerShopPurchaseCountsByTypeBulkSync,
+                getEquipmentEnhancementLevel: (ownerId, equipmentId) => (
+                    equipmentSnapshot === null
+                        ? -1
+                        : (equipmentSnapshot[String(equipmentId)]?.enhancementLevel ?? -1)
+                ),
+            })
 
-        if (filteredGeneralCount > 0) {
-            console.log(`[shop] Filtered ${filteredGeneralCount} general shop items not in CDN master data`)
+            if (built.filteredGeneralCount > 0) {
+                console.log(`[shop] Filtered ${built.filteredGeneralCount} general shop items not in CDN master data`)
+            }
+            salesList = built.salesList
+        } catch (error) {
+            request.log.error(
+                { code: "SHOP_SALES_LIST_FAILED", err: error },
+                "Shop sales list failed; sending empty list",
+            )
         }
 
         reply.header("content-type", "application/x-msgpack")

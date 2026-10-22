@@ -97,3 +97,32 @@ test("equipment enhancement groups remain isolated across shop categories", () =
         "the same groupId in another category must not replace or merge a different equipment",
     )
 })
+
+test("shop sales list skips items whose period cannot be parsed instead of failing the list", () => {
+    const originalWarn = console.warn
+    console.warn = () => {}
+    try {
+        const result = buildShopSalesListSync({
+            playerId: 7,
+            nowMs: Date.parse("2024-08-14T00:00:00.000Z"),
+            itemsByType: {
+                [SHOP_TYPE]: {
+                    101: item(),
+                    102: item({ availableFrom: "not-a-date" }),
+                    103: item({ availableFrom: undefined }),
+                },
+            },
+            isItemVisible: () => true,
+        }, {
+            getPurchaseCountsBulk(_playerId, requests) {
+                return new Map(requests.map(request => [
+                    `${request.shopType}:${request.shopItemId}:${request.keys.daily}:${request.keys.monthly}`,
+                    { daily: 0, monthly: 0, total: 0 },
+                ]))
+            },
+        })
+        assert.deepEqual(result.salesList.map(sale => sale.shop_item_id), [101])
+    } finally {
+        console.warn = originalWarn
+    }
+})
