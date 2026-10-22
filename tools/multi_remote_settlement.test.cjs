@@ -1074,6 +1074,11 @@ test("production multi /finish publishes the Awake unlock immediately without cl
             { 1: 1 },
             "multi finish must publish the three-board unlock in the same response",
         )
+        // C2274：客户端遇到本地没有的角色片段会按 entry_count 新建，缺字段直接崩。
+        for (const entry of response.character_list) {
+            assert.ok(Number.isSafeInteger(entry.entry_count) && entry.entry_count >= 1,
+                `multi finish character ${entry.character_id} must carry entry_count (C2274)`)
+        }
         assert.deepEqual(getPlayerCharacterAwakeUnlocksSync(home.playerId).get("1"), { 1: 1 })
 
         const { settleAwakeMissionCandidates } = require("../src/lib/mission/awake-settlement")

@@ -69,6 +69,8 @@ test("increment projector publishes only authoritative after-state and keeps key
     assert.deepEqual(projection.character_list, [{
         viewer_id: 88,
         character_id: 1,
+        // C2274：entry_count 恒随片段下发，不受 fields 挑选影响。
+        entry_count: 1,
         exp: 900,
         stack: 3,
         protection: true,
@@ -102,7 +104,7 @@ test("increment projector reads board and Awake only from after-state and omits 
             fields: ["mana_board_index", "mana_board_awake"],
         },
     )
-    assert.deepEqual(projection.character_list, [{ character_id: 1, mana_board_index: 2 }])
+    assert.deepEqual(projection.character_list, [{ character_id: 1, entry_count: 1, mana_board_index: 2 }])
     assert.equal("mana_board_awake" in projection.character_list[0], false)
 })
 

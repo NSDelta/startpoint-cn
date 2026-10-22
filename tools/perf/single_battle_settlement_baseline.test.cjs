@@ -73,6 +73,19 @@ test("single battle baseline captures isolated real Fastify and SQLite scenarios
     // unclaimed so the battle response observes no awake reward entries.
     assert.deepEqual(first.observedRewards.awake, [])
 
+    // C2274：客户端遇到本地没有的角色片段会按 entry_count 新建，缺字段直接崩。
+    for (const [name, response] of [
+        ["finish_first_clear_s_plus", first.response],
+        ["finish_rank_up", report.scenarios.finish_rank_up.behavior.response],
+        ["finish_repeat_clear", report.scenarios.finish_repeat_clear.behavior.second.response],
+    ]) {
+        assert.ok(response.data.character_list.length > 0, name)
+        for (const entry of response.data.character_list) {
+            assert.ok(Number.isSafeInteger(entry.entry_count) && entry.entry_count >= 1,
+                `${name} character ${entry.character_id} must carry entry_count (C2274)`)
+        }
+    }
+
     const repeated = report.scenarios.finish_repeat_clear.behavior
     assert.deepEqual(repeated.second.observedRewards.firstClear, [])
     assert.deepEqual(repeated.second.observedRewards.sPlus, [])

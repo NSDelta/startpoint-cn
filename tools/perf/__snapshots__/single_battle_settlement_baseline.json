@@ -1014,6 +1014,7 @@
               {
                 "character_id": 341005,
                 "create_time": "fixture-character-time",
+                "entry_count": 1,
                 "exp": 37241,
                 "exp_total": 37241,
                 "join_time": "fixture-character-time",
@@ -1222,7 +1223,7 @@
           "statusCode": 200
         }
       },
-      "behaviorSha256": "1c188bda34b2b23bdd269dd10c99e16d8b66348cc2d82e893073f880d70cc1b4",
+      "behaviorSha256": "4a764b9d45f0fd677544ce7251d22574a96bbb6df4a97d813709e768b68c8b7e",
       "sql": {
         "statements": 110,
         "selectStatements": 63,
@@ -2094,6 +2095,7 @@
               {
                 "character_id": 1,
                 "create_time": "fixture-character-time",
+                "entry_count": 1,
                 "exp": 23,
                 "exp_total": 23,
                 "join_time": "fixture-character-time",
@@ -2240,7 +2242,7 @@
           "statusCode": 200
         }
       },
-      "behaviorSha256": "3a0abc02ac26bfde3340ab9f5afb2078d5ac6e1d321f89932e4bb0f6983153f7",
+      "behaviorSha256": "1b7af07abfe378912e713ed13add2cf74bc19301ca27d517b0dcf2c50f164dbc",
       "sql": {
         "statements": 102,
         "selectStatements": 62,
@@ -4207,6 +4209,7 @@
                 {
                   "character_id": 341005,
                   "create_time": "fixture-character-time",
+                  "entry_count": 1,
                   "exp": 37241,
                   "exp_total": 37241,
                   "join_time": "fixture-character-time",
@@ -4316,7 +4319,7 @@
           }
         }
       },
-      "behaviorSha256": "ecf4b90004f9f97572364c403ef24817a30dc70a90093633435ec70d197aac3e",
+      "behaviorSha256": "0e51ef5cd29b1f603aab939f5c28bdf8efb36ea34db8830064bcae47ae87602a",
       "sql": {
         "statements": 102,
         "selectStatements": 65,
