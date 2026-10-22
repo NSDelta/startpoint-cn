@@ -601,3 +601,27 @@ test("single finish projects Rush EXP from the committed player", async () => {
         },
     })
 })
+
+test("single finish degrades instead of 500 when the response projection throws", async () => {
+    const projector = require("../src/lib/quest/finish/single-response-projector")
+    const original = projector.buildSingleFinishResponse
+    projector.buildSingleFinishResponse = () => { throw new Error("forced projection failure") }
+    try {
+        await withSingleBattleHarness("final-projection-throws", async harness => {
+            const playId = "issue-7-projection-throws"
+            harness.insertActiveQuest(harness.createActiveQuest({ playId }))
+            const response = await harness.post("finish", harness.finishPayload({ playId }), {
+                normalize: false,
+            })
+            assert.equal(response.statusCode, 200, JSON.stringify(response))
+            assert.equal(response.data.clear_rank, 0)
+            const persisted = harness.getPlayer()
+            assert.ok(persisted)
+            // 结算本身已提交，降级响应只是不再投影奖励。
+            assertFinalUserInfo(response.data.user_info, persisted)
+            assert.equal(harness.snapshotState().questProgress.finished, true)
+        }, { tableOverrides: noIncidentalRewardOverrides() })
+    } finally {
+        projector.buildSingleFinishResponse = original
+    }
+})
