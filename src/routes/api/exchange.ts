@@ -64,6 +64,11 @@ const routes = async (fastify: FastifyInstance) => {
                 // defaultErrorHandler ⇒ 硬错误弹窗 + clearQueue，玩家看到「发生
                 // 意想不到的错误」并被踢回标题。这里不写任何存档，只把当前余额原样
                 // 回传，让客户端刷新后自行重试。
+                // 客户端只认 2053，拒绝原因只能记在日志里（余额不足/已持有/条目未知）。
+                request.log.warn(
+                    { code: "STAR_CRUMB_EXCHANGE_REFUSED", exchangeId, reason: result.message },
+                    "Star crumb exchange refused",
+                );
                 reply.header("content-type", "application/x-msgpack");
                 return reply.status(200).send(projectStarCrumbExchangeRefusalResponse({
                     dataHeaders: generateDataHeaders({
