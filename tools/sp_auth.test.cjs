@@ -19,6 +19,8 @@ const Fastify = require("fastify")
 const databaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "sp-auth-"))
 const previousDataDirectory = process.env.DATA_DIR
 process.env.DATA_DIR = databaseDirectory
+// 本文件会连发几十次注册/登录；关掉按 IP 的凭证限流（见 src/routes/sp-auth/index.ts）
+process.env.SP_AUTH_CREDENTIAL_RATE_LIMIT = "0"
 
 require("ts-node/register/transpile-only")
 

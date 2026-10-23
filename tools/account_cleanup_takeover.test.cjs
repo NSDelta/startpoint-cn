@@ -10,6 +10,11 @@ const bcrypt = require("bcryptjs")
 
 const databaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "account-cleanup-takeover-"))
 process.env.DATA_DIR = databaseDirectory
+// 本文件会连发几十次注册/登录；关掉按 IP 的凭证限流（见 src/routes/sp-auth/index.ts）
+process.env.SP_AUTH_CREDENTIAL_RATE_LIMIT = "0"
+// 本文件直接塞 viewer 会话、不带游戏登录令牌；关掉 2026-10-18 加固的令牌闸（
+// `GAME_AUTH_MODE` 的 off 是文档里的应急档，见 src/lib/game-auth.ts）。
+process.env.GAME_AUTH_MODE = "off"
 
 require("ts-node/register/transpile-only")
 
@@ -332,10 +337,19 @@ test("takeover re-registration stays owned by the takeover_udid device", async t
     ).get(owner.id)), credentialsBefore, "foreign device must not overwrite credentials")
 
     // The device holding the takeover udid may legitimately reset its password.
+    // 2026-10-18 加固后，重置口令还要求「账号归属证明」= 该账号的游戏登录令牌
+    // （`takeOver.ts` 的 hasAccountOwnershipProof，令牌存在 accounts.login_token）。
+    // 这里直接落库一枚，避开对 TS 模块的 require。
+    const ownerLoginToken = "0123456789abcdef".repeat(4)
+    getDb().prepare("UPDATE accounts SET login_token = ? WHERE id = ?").run(ownerLoginToken, owner.id)
     const ownerReset = await app.inject({
         method: "POST",
         url: "/api/index.php/take_over_register/register_take_over_data",
-        headers: { "content-type": "application/json", udid: "owner-udid" },
+        headers: {
+            "content-type": "application/json",
+            udid: "owner-udid",
+            login_token: ownerLoginToken,
+        },
         payload: { viewer_id: ownerViewer, input_password: "NewOwner88" },
     })
     assert.equal(ownerReset.statusCode, 200)

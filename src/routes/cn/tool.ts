@@ -89,7 +89,13 @@ const routes = async (fastify: FastifyInstance) => {
         // 登录过哪个账号，这台设备就归谁。**必须卡在绑定闸门之前** —— 否则闸门会先按旧映射
         // （或 unmapped ⇒ 517）把这次报到拒掉，改绑永远轮不到。见 lib/sp-auth/device-follow.ts。
         let binding = getDeviceBindingSync(deviceId)
-        const followAccountId = followAccountForSignup({ deviceId, ip: clientIp, path: storagePath })
+        // device_id 必须是正整数（`parseDeviceId` 同一口径）：非数字/负数直接判 400，
+        // 绝不把它带进并号改绑（否则会往 INTEGER 主键里写字符串 ⇒ SQLITE 抛错 ⇒ 500）。
+        const deviceIdIsValid = typeof deviceId === "number"
+            && Number.isSafeInteger(deviceId) && deviceId > 0
+        const followAccountId = !deviceIdIsValid
+            ? null
+            : followAccountForSignup({ deviceId, ip: clientIp, path: storagePath })
         const followAccount = followAccountId === null ? null : getAccountSync(followAccountId)
         if (
             followAccount !== null
@@ -116,7 +122,7 @@ const routes = async (fastify: FastifyInstance) => {
             )
         }
         // 记一笔报到，供门下次登录时反向认领（claimReportedDevices）。
-        noteSignupDevice({ deviceId, ip: clientIp, path: storagePath })
+        if (deviceIdIsValid) noteSignupDevice({ deviceId, ip: clientIp, path: storagePath })
 
         // P4 绑定闸门（契约 C3）：必须卡在下面「已知设备 → 复用 binding 账号」分支之前，
         // 否则 pending（已发码未绑定）账号会被它直接放行。开关缺省关 ⇒ 此处零开销旁路。

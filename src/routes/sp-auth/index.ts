@@ -77,12 +77,23 @@ const routes = async (fastify: FastifyInstance): Promise<void> => {
      * 这里按对端 IP 上滑动窗口（与 `reset.ts` 的 per-IP 窗口同一量级），
      * 成功与失败共用一个桶，避免「只对失败计数」被绕过。
      */
-    const credentialLimiter = createIpRateLimiter({ limit: 20, windowMs: 60_000 })
+    // 限流阈值可由环境变量覆盖（`0` = 关掉）：测试要在同一进程里连发几十次注册/登录，
+    // 生产默认值 20/分钟不变。见 `.env.example` 的 SP_AUTH_CREDENTIAL_RATE_LIMIT。
+    const credentialLimitFromEnv = Number.parseInt(
+        process.env.SP_AUTH_CREDENTIAL_RATE_LIMIT ?? "", 10,
+    )
+    const credentialLimit = Number.isFinite(credentialLimitFromEnv) && credentialLimitFromEnv >= 0
+        ? credentialLimitFromEnv
+        : 20
+    const credentialLimiter = credentialLimit === 0
+        ? null
+        : createIpRateLimiter({ limit: credentialLimit, windowMs: 60_000 })
     const credentialLimited = (
         request: FastifyRequest,
         reply: FastifyReply,
         label: string,
     ): FastifyReply | null => {
+        if (credentialLimiter === null) return null
         if (credentialLimiter.check(request.ip ?? "unknown")) return null
         console.warn(`[sp-auth] ${label} rate limited ip=${request.ip ?? "-"}`)
         return sendResult(reply, fail("RATE_LIMITED"))

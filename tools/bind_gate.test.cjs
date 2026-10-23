@@ -23,6 +23,11 @@ const { unpack } = require("msgpackr")
 const databaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "bind-gate-"))
 const previousDataDirectory = process.env.DATA_DIR
 process.env.DATA_DIR = databaseDirectory
+// 本文件会连发几十次注册/登录；关掉按 IP 的凭证限流（见 src/routes/sp-auth/index.ts）
+process.env.SP_AUTH_CREDENTIAL_RATE_LIMIT = "0"
+// 这些用例测的是「闸门」本身；关掉并号，避免同进程里前面用例留下的门登录
+// 把后续「全新设备」在共享 DATA_DIR 里提前认领成 pending 账号（见 src/lib/sp-auth/device-follow.ts）。
+process.env.SP_DEVICE_FOLLOW = "0"
 
 require("ts-node/register/transpile-only")
 
@@ -291,7 +296,7 @@ test("关闸（缺省）：/signup 响应逐字节等于 P4 之前的模板", as
         Object.keys(body.data),
         ["login_token", "newAccount", "roleName", "accountName", "sign", "createDate", "serverName", "serverId"],
     )
-    assert.match(body.data.login_token, /^[a-z0-9]{32}$/)
+    assert.match(body.data.login_token, /^[a-z0-9]{64}$/)
     assert.equal(body.data.createDate, BASE_NOW_ISO)
     // 已知设备分支照旧复用 register 建的那个 viewer_id（放行路径没被闸门改道）。
     assert.equal(body.data_headers.viewer_id, registerData.viewer_id)

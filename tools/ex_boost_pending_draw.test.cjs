@@ -90,9 +90,15 @@ async function main() {
         url: "/ex/first_draw",
         payload: { viewer_id: viewerId, character_id: 1, cost_item_id: 10002 },
     })
-    assert.equal(firstDrawWhilePending.statusCode, 400)
-    assert.deepEqual(getPendingExBoostDrawSync(playerId), pendingAfterFirstDraw)
+    // 2026-10-18（f4040a3c）起：悬挂抽取会在 /first_draw 里**自愈落地**（同一角色 ⇒ 直接
+    // 200 并把已落地的形态带回去），不再一律 400 把玩家卡死。材料绝不再扣 —— 那一次
+    // /draw 已经扣过，这里只能落地。见 src/routes/api/exBoost.ts 的自愈注释。
+    assert.equal(firstDrawWhilePending.statusCode, 200, firstDrawWhilePending.body)
+    assert.equal(getPendingExBoostDrawSync(playerId), null)
     assert.equal(getPlayerItemSync(playerId, 10002), itemAfterFirstDraw)
+    const healedBody = unpack(Buffer.from(firstDrawWhilePending.body, "base64")).data
+    assert.equal(Array.isArray(healedBody.character_list), true)
+    assert.equal(healedBody.character_list[0].character_id, 1)
 
     const invalidSelectResponse = await selectApp.inject({
         method: "POST",
@@ -100,14 +106,15 @@ async function main() {
         payload: { viewer_id: viewerId, is_confirm: 1 },
     })
     assert.equal(invalidSelectResponse.statusCode, 400)
-    assert.deepEqual(getPendingExBoostDrawSync(playerId), pendingAfterFirstDraw)
+    assert.equal(getPendingExBoostDrawSync(playerId), null)
 
+    // 自愈已经把上面那次抽取落地了 ⇒ 这里再 /select 已无待确认的抽取。
     const selectResponse = await selectApp.inject({
         method: "POST",
         url: "/ex/select",
         payload: { viewer_id: viewerId, is_confirm: true },
     })
-    assert.equal(selectResponse.statusCode, 200, selectResponse.body)
+    assert.equal(selectResponse.statusCode, 400, selectResponse.body)
     const selectedExBoost = getPlayerCharacterSync(playerId, 1).exBoost
     assert.notEqual(selectedExBoost, undefined)
 
