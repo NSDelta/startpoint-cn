@@ -168,7 +168,8 @@ function main() {
     createPatchArchive([fcResult, gachaResult]);
 
     console.log("\nDone. Next steps:");
-    console.log("  1. Set CN_RES_VERSION=1.4.56 in .env");
+    console.log("  1. Target version comes from BUNDLED_CDN_CATALOG_VERSION (src/runtime/release-contract.ts)");
+    console.log("     plus the patch chain in .cdn/patches; CN_RES_VERSION is not read by the server");
     console.log("  2. Compile + restart server");
     console.log("  3. Client will download diff archive on next asset update");
 }
