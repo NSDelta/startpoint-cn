@@ -196,23 +196,36 @@ const routes = async (fastify: FastifyInstance, options: SingleBattleQuestRouteO
             ...generatedDataHeaders,
             servertime: serverTime,
         }
-        const response = buildSingleFinishResponse({
-            result: finishResult,
-            dataHeaders,
-            player: {
-                freeMana: finishResult.finalPlayerProjection.freeMana,
-                expPool: finishResult.finalPlayerProjection.expPool,
-                expPooledTime: expPoolRealDateToClientTimestamp(finishResult.finalPlayerProjection.expPooledTime),
-                freeVmoney: finishResult.finalPlayerProjection.freeVmoney,
-                rankPoint: finishResult.finalPlayerProjection.rankPoint,
-                degreeId: finishResult.finalPlayerProjection.degreeId,
-                stamina: finishResult.finalPlayerProjection.stamina,
-                staminaHealTime: realToVirtual(finishResult.finalPlayerProjection.staminaHealTime),
-                boostPoint: finishResult.finalPlayerProjection.boostPoint,
-                bossBoostPoint: finishResult.finalPlayerProjection.bossBoostPoint,
-            },
-            mailArrived: getPlayerMailCountSync(playerId, true) > 0,
-        })
+        const player = {
+            freeMana: finishResult.finalPlayerProjection.freeMana,
+            expPool: finishResult.finalPlayerProjection.expPool,
+            expPooledTime: expPoolRealDateToClientTimestamp(finishResult.finalPlayerProjection.expPooledTime),
+            freeVmoney: finishResult.finalPlayerProjection.freeVmoney,
+            rankPoint: finishResult.finalPlayerProjection.rankPoint,
+            degreeId: finishResult.finalPlayerProjection.degreeId,
+            stamina: finishResult.finalPlayerProjection.stamina,
+            staminaHealTime: realToVirtual(finishResult.finalPlayerProjection.staminaHealTime),
+            boostPoint: finishResult.finalPlayerProjection.boostPoint,
+            bossBoostPoint: finishResult.finalPlayerProjection.bossBoostPoint,
+        }
+        const mailArrived = getPlayerMailCountSync(playerId, true) > 0
+        let response
+        try {
+            response = buildSingleFinishResponse({ result: finishResult, dataHeaders, player, mailArrived })
+        } catch (error) {
+            // 结算已经落库，投影抛错时不能回 500（主线 1-2 首通 H500）；
+            // 降级为零奖励终态响应，奖励在下次 /load 时同步给客户端。
+            request.log.error(
+                { code: "SINGLE_FINISH_PROJECTION_FAILED", err: error },
+                "Single finish response projection failed; sending degraded response",
+            )
+            response = buildStaleSingleFinishResponse({
+                body: { viewer_id: viewerId, category: body.category },
+                dataHeaders,
+                player,
+                mailArrived,
+            })
+        }
         reply.header("content-type", "application/x-msgpack")
         return reply.status(200).send(response)
 
