@@ -81,6 +81,19 @@ function serializeTutorialReplayCharacter(
     })
 }
 
+/**
+ * 教程「取名」的落库前清洗（issue #12）：空名 / 纯空白 / 超长 / 控制字符一律先收拾干净，
+ * 不让它们在 `updatePlayerSync` 里变成 500（那会让客户端闪退、重进重复教程流程）。
+ * 返回 `undefined` = 这次不改名（沿用玩家已有的名字）。
+ */
+export function sanitizeTutorialName(input: unknown): string | undefined {
+    if (typeof input !== "string") return undefined
+    // eslint-disable-next-line no-control-regex
+    const cleaned = input.replace(/[\u0000-\u001f\u007f]/g, "").trim()
+    if (cleaned.length === 0) return undefined
+    return cleaned.length > 32 ? cleaned.slice(0, 32) : cleaned
+}
+
 function buildTutorialGachaReplayData(
     playerId: number,
     viewerId: number,
@@ -89,8 +102,18 @@ function buildTutorialGachaReplayData(
 ) {
     const player = getPlayerSync(playerId)
     const characterId = player?.tutorialGachaCharacterId
+    // issue #12：首抽结果为空时不再抛错（抛出去就是 500 → 客户端闪退 → 重进重复教程）。
+    // 这里退化成「只带 user_info 的空回放」，客户端会照常推进下一步。
     if (player === null || characterId === null || characterId === undefined) {
-        throw new Error("Tutorial gacha step is missing its persisted draw result")
+        console.warn(`[TUTORIAL] 首抽结果为空 player=${playerId} step=${effectiveNextStep}，按空回放返回`)
+        return {
+            "step": effectiveNextStep,
+            ...mergeCommonResponseFragments([{
+                "user_info": { "free_vmoney": player?.freeVmoney ?? 0 },
+                "character_list": [],
+            }]),
+            "gacha_info_list": [],
+        }
     }
 
     const character = getPlayerCharacterSync(playerId, characterId)
@@ -196,6 +219,26 @@ function normalizeTutorialListFields(data: Record<string, unknown>): Record<stri
 }
 
 const routes = async (fastify: FastifyInstance) => {
+    /**
+     * 教程链路的 5xx 兜底（issue #12）。这两条路由任何一处抛错，客户端收到的都是 500
+     * ⇒ 直接闪退 ⇒ 重进游戏重复走同一步 ⇒ 再崩。教程是玩家的必经之路，宁可少做一步也
+     * 不能把整局打崩，所以这里统一降级成「200 + 空 data」，并把真实原因写进日志。
+     */
+    fastify.setErrorHandler((error, request, reply) => {
+        const viewerId = (request.body as { viewer_id?: unknown } | undefined)?.viewer_id
+        console.warn(
+            `[TUTORIAL] ${request.url} 兜底降级：${error instanceof Error ? error.message : String(error)}`
+            + ` viewer_id=${typeof viewerId === "number" ? viewerId : "-"}`,
+        )
+        reply.header("content-type", "application/x-msgpack")
+        return reply.status(200).send({
+            "data_headers": generateDataHeaders({
+                viewer_id: typeof viewerId === "number" ? viewerId : 0,
+            }),
+            "data": [],
+        })
+    })
+
     fastify.post("/finish_trigger", async (request: FastifyRequest, reply: FastifyReply) => {
         const body = request.body as FinishTriggerBody
 
@@ -433,7 +476,7 @@ const routes = async (fastify: FastifyInstance) => {
                     tutorialSkipFlag: skip,
                     tutorialGachaCharacterId: randomCharacterId,
                     freeVmoney: newFreeVmoney,
-                    name: body.name,
+                    name: sanitizeTutorialName(body.name),
                 })
 
                 const draw = rewardResult.draw[0] as GachaCharacterDraw
@@ -538,7 +581,7 @@ const routes = async (fastify: FastifyInstance) => {
                     tutorialStep: storedNextStep,
                     tutorialSkipFlag: skip,
                     freeVmoney: newVMoney,
-                    name: body.name,
+                    name: sanitizeTutorialName(body.name),
                 })
 
                 const characterList = existingCharacterList.length > 0
@@ -584,7 +627,7 @@ const routes = async (fastify: FastifyInstance) => {
                 id: playerId,
                 tutorialStep: isTutorialEnd ? null : storedNextStep,
                 tutorialSkipFlag: skip,
-                name: body.name,
+                name: sanitizeTutorialName(body.name),
             })
             if (isTutorialEnd) {
                 const data = buildTutorialEndData()
@@ -597,7 +640,9 @@ const routes = async (fastify: FastifyInstance) => {
             }
             const data = {
                 "step": effectiveNextStep,
-                ...(body.name === undefined ? {} : { "name": body.name }),
+                ...(sanitizeTutorialName(body.name) === undefined
+                    ? {}
+                    : { "name": sanitizeTutorialName(body.name) }),
                 "mail_arrived": getMailArrivedSync(playerId),
                 "start_time": getServerTime(),
             }

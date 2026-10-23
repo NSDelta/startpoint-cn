@@ -11,7 +11,7 @@ const { createRoom, disbandRoom } = require("../src/multi/room/manager")
 const { sessionManager } = require("../src/multi/state/SessionManager")
 const { EmbeddedMultiCoordinator } = require("../src/multi/coordinator/embedded")
 const { handleBattleMessage } = require("../src/multi/tcp/battle")
-const { handleHandshake } = require("../src/multi/tcp/handshake")
+const { handleHandshake, roomStateAdmitsRoomHandshake } = require("../src/multi/tcp/handshake")
 const { handleMessage: handleLobbyMessage } = require("../src/multi/tcp/lobby")
 const { NpcMateProvider } = require("../src/multi/npc/controller")
 
@@ -250,4 +250,21 @@ test("the official release reopens the lobby for the rematch", async t => {
     await flushPromises()
     assert.equal(room.is_npc_mode, true, "EnterComs must work again after release")
     assert.equal(room.raising_state, 1)
+})
+
+test("握手放行矩阵：开战锁只挡新面孔，记录内成员可回房（issue #8）", () => {
+    const at = raisingState => ({ raising_state: raisingState })
+    // 1/2 是正常的「可加入」态
+    assert.equal(roomStateAdmitsRoomHandshake(at(1), false), true)
+    assert.equal(roomStateAdmitsRoomHandshake(at(2), false), true)
+    // 开战锁：新面孔一律拒，记录内成员放行（结算后回房靠这条）
+    assert.equal(roomStateAdmitsRoomHandshake(at(4), false), false, "newcomer must stay locked out")
+    assert.equal(roomStateAdmitsRoomHandshake(at(4), true), true, "recorded member must get back in")
+    // 其它态（3/7/9 等）无论如何都不放行
+    for (const state of [3, 7, 9, 5]) {
+        assert.equal(roomStateAdmitsRoomHandshake(at(state), false), false, `state ${state} must deny`)
+        assert.equal(roomStateAdmitsRoomHandshake(at(state), true), false, `state ${state} must deny members too`)
+    }
+    // 房间不存在（已解散）
+    assert.equal(roomStateAdmitsRoomHandshake(null, true), false)
 })

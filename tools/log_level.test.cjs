@@ -147,10 +147,20 @@ test("installConsoleLogGate：warn 档把 console.log 改道落盘，warn 仍进
         gate.close()
         capture.restore()
     }
-    await delay(50)
+    // 落盘是异步流：固定等 50ms 在 CI 忙的时候会读到空文件（这条用例偶发红）。
+    // 改成小步轮询，最多等 2 秒 —— 只在真的没写出来时才算失败。
+    const waitForLine = async (pattern, deadlineMs = 2000) => {
+        const startedAt = Date.now()
+        let written = ""
+        while (Date.now() - startedAt < deadlineMs) {
+            written = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : ""
+            if (pattern.test(written)) return written
+            await delay(25)
+        }
+        return written
+    }
 
-    const written = fs.readFileSync(file, "utf8")
-    assert.match(written, /\[LOBBY\] should go to the file/)
+    const written = await waitForLine(/\[LOBBY\] should go to the file/)
     assert.match(written, /\[TCP\] connection accepted/)
     // 落盘行带 ISO 时间戳前缀
     assert.match(written, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/m)

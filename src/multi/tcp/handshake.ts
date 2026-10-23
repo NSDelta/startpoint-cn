@@ -52,6 +52,24 @@ function normalizeViewerId(value: unknown): number | null {
         : null
 }
 
+/**
+ * 房间 socket 的握手是否放行（issue #8）。
+ *
+ * 开战锁（raising_state=4）挡的是**新面孔**：战斗期间别人不该挤进来。但本房成员
+ * 必须放行 —— 战斗结束那一下 `releaseBattle()` 若被拒（房间状态机忙），房间就停在
+ * 4，而结算后的队友正要回房；旧的「非 1/2 一律拒」会把自己的队友关在门外，客户端
+ * 重试几次后弹「发生意想不到的错误 回到登录界面 (No.H404)」。HTTP 侧的
+ * `projectRoomRaisingState` 早已对成员投影 1，这里补上同一条语义。
+ */
+export function roomStateAdmitsRoomHandshake(
+    room: { readonly raising_state: number } | null | undefined,
+    existingMember: boolean,
+): boolean {
+    if (!room) return false
+    if (room.raising_state === 1 || room.raising_state === 2) return true
+    return existingMember && room.raising_state === 4
+}
+
 function deny(socket: net.Socket): void {
     sessionManager.sendJson(socket, [3, "HANDSHAKE_DENIED"])
     socket.end()
@@ -141,8 +159,15 @@ export async function handleHandshake(
         }
         const occupiedRealPlayerSlots = room?.member_participants.length ?? 0
         const existingMember = room ? isRoomViewerMember(room, normalizedViewerId) : false
+        // 开战锁（raising_state=4）挡的是**新面孔**：战斗期间别人不该挤进来。
+        // 但本房成员必须放行 —— 战斗结束那一下 `releaseBattle()` 若被拒（房间状态机
+        // 忙），房间就停在 4，而结算后的队友正要回房；旧的「非 1/2 一律拒」会把
+        // 自己的队友关在门外，客户端重试几次后弹「发生意想不到的错误 回到登录界面
+        // (No.H404)」。HTTP 侧的 `projectRoomRaisingState` 早已对成员投影 1，
+        // 这里补上同一条语义（issue #8）。
+        const stateAdmits = roomStateAdmitsRoomHandshake(room, existingMember)
         if (!room
-            || (room.raising_state !== 1 && room.raising_state !== 2)
+            || !stateAdmits
             || !categoryMatches
             || !questMatches
             || (!existingMember && occupiedRealPlayerSlots >= 3)) {

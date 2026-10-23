@@ -133,7 +133,10 @@ async function main() {
             BEGIN SELECT RAISE(ABORT, 'forced tutorial trigger failure'); END;
         `)
         const failedTrigger = await finishTrigger(fastify, triggerViewerId, [201, 202])
-        assert.equal(failedTrigger.statusCode, 500)
+        // issue #12：教程链路的 5xx 一律降级成「200 + 空 data」（客户端把 500 当闪退，
+        // 重进会重复走同一步）。库里的副作用仍然全部回滚。
+        assert.equal(failedTrigger.statusCode, 200, failedTrigger.body)
+        assert.deepEqual(decodeResponse(failedTrigger).data, [])
         assert.deepEqual(getPlayerTriggeredTutorialsSync(triggerPlayerId).sort((a, b) => a - b), [101, 102])
         db.exec("DROP TRIGGER fail_tutorial_trigger_batch")
 
@@ -149,7 +152,8 @@ async function main() {
             END
         `)
         const failedDraw = await updateStep(fastify, viewerId, { step: 14, gacha_id: 1 })
-        assert.equal(failedDraw.statusCode, 500)
+        assert.equal(failedDraw.statusCode, 200, failedDraw.body)
+        assert.deepEqual(decodeResponse(failedDraw).data, [])
         assert.equal(gachaLogs.length, 0)
         assert.equal(getPlayerSync(playerId).tutorialStep, 14)
         assert.equal(getPlayerSync(playerId).freeVmoney, 1000)
@@ -191,7 +195,8 @@ async function main() {
             END
         `)
         const failedPresent = await updateStep(fastify, viewerId, { step: 15 })
-        assert.equal(failedPresent.statusCode, 500)
+        assert.equal(failedPresent.statusCode, 200, failedPresent.body)
+        assert.deepEqual(decodeResponse(failedPresent).data, [])
         assert.equal(getPlayerSync(playerId).tutorialStep, 15)
         assert.equal(getPlayerSync(playerId).freeVmoney, 850)
         assert.equal(getPlayerMailCountSync(playerId), 0)
