@@ -199,7 +199,8 @@ test("replacing a same-room battle socket cancels the old lease", async () => {
 
     assert.equal(first.socket.destroyed, true)
     assert.equal(manager.getBattleClient("stable-cid"), second.client)
-    await new Promise(resolve => setTimeout(resolve, 100))
+    // 旧租约到期靠真实定时器；机器忙时固定等 100ms 会偶发还没到期（CI 上就红过）。
+    await waitFor(() => second.socket.destroyed === true, "replaced battle socket was not cancelled")
     assert.equal(second.socket.destroyed, true)
 })
 

@@ -292,6 +292,16 @@ test("change-party rebuilds a deeply frozen snapshot isolated from client input"
     assert.equal(snapshot.party.equipments[0][1].level, 4)
 })
 
+/** 等一个条件成立（默认 1 秒）。重连宽限期靠真实定时器触发，机器忙时固定等 40ms 会偶发跑不到。 */
+async function waitUntil(predicate, timeoutMs = 1000) {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+        if (predicate()) return true
+        await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    return predicate()
+}
+
 test("an explicit guest Bye releases the persistent room membership", t => {
     const { room, guests } = createLobbyRoom(t, 500, [600])
     const guest = guests[0]
@@ -352,7 +362,7 @@ test("network disconnect keeps a pre-battle guest member during the reconnect gr
     assert.equal(isRoomMember(room, guest.client.participant), true)
     assert.equal(sessionManager.getClientBySocket(guest.socket), undefined)
 
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, guest.client.participant))
     assert.equal(isRoomMember(room, guest.client.participant), false)
     assert.equal(getRoom(room.room_number), room)
     void host
@@ -850,7 +860,7 @@ test("rematch fills a seat after its authoritative reconnect lease expires", asy
     assert.equal(getRecruitCalls(), 1)
     assert.equal(host.client.mates.length, 2)
 
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, guest.client.participant))
     assert.equal(isRoomMember(room, guest.client.participant), false)
 
     const rematchTimers = timers.filter(timer => timer.delayMs === 500)
@@ -890,7 +900,7 @@ test("rematch NPC recruitment syncs the committed roster to every entered real c
     handleMessage(expiringGuest.socket, [0, [0, { party: { source: "expiring" } }]])
     assert.equal(handleSocketDisconnect(expiringGuest.socket), true)
 
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, expiringGuest.client.participant))
     assert.equal(isRoomMember(room, expiringGuest.client.participant), false)
 
     const rematchTimer = timers.find(timer => timer.delayMs === 500)
@@ -942,7 +952,7 @@ test("an expired guest lease waits for the host to enter before rematch recruitm
     room.npc_count = 2
 
     assert.equal(handleSocketDisconnect(guest.socket), true)
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, guest.client.participant))
     assert.equal(isRoomMember(room, guest.client.participant), false)
     assert.equal(timers.filter(timer => timer.delayMs === 500).length, 0)
 
@@ -972,7 +982,7 @@ test("a previous-round host Enter cannot authorize the next rematch generation",
 
     updateRoomState(room.room_number, 1)
     assert.equal(handleSocketDisconnect(guest.socket), true)
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, guest.client.participant))
     assert.equal(isRoomMember(room, guest.client.participant), false)
 
     const beforeRematchEnter = timers.filter(timer => timer.delayMs === 500)
@@ -1645,7 +1655,7 @@ test("expired guest lease cleanup is idempotent and connection-scoped", async t 
     host.client.mates = [host.client.yourself, guest.client.yourself]
 
     assert.equal(handleSocketDisconnect(guest.socket), true)
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await waitUntil(() => !isRoomMember(room, guest.client.participant))
 
     assert.equal(isRoomMember(room, guest.client.participant), false)
     assert.deepEqual(
