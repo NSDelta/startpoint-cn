@@ -115,7 +115,15 @@ export function buildShopSalesListSync(
                     || !input.equipmentEnhancementCategoryIds.includes(item.shopCategoryId))) {
                 continue
             }
-            if (!isShopItemAvailable(item, input.nowMs)) continue
+            let available: boolean
+            try {
+                available = isShopItemAvailable(item, input.nowMs)
+            } catch (error) {
+                // 档期字段缺失/非法时只跳过这一件，不让整张列表 500（交易所打不开）。
+                console.warn(`[shop] skipped shop item ${itemId} with invalid period: ${error instanceof Error ? error.message : String(error)}`)
+                continue
+            }
+            if (!available) continue
             if (!input.isItemVisible(item, shopType)) continue
 
             if (shopType === ShopType.TREASURE_EQUIPMENT) {

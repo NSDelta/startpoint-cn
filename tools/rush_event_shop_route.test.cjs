@@ -196,6 +196,7 @@ let globalNowSeconds = Date.parse("2023-12-01T00:00:00+08:00") / 1000
 let failRewardAfterWrite = false
 let shopRewardGrantCalls = 0
 let bulkPurchaseCountReads = 0
+let failCampaignLineupRead = false
 
 stubModule("../src/data/db", { getDb: () => db })
 stubModule("../src/data/domains/shopPurchase", {
@@ -322,6 +323,7 @@ stubModule("../src/data/domains/shop-campaign-lineup", {
         `).get(playerId, shopType, campaignId)?.lineup_id ?? null
     },
     getPlayerShopCampaignLineupsSync(playerId) {
+        if (failCampaignLineupRead) throw new Error("forced campaign lineup read failure")
         return Object.fromEntries(db.prepare(`
             SELECT shop_type, campaign_id, lineup_id FROM campaign_selection_state
             WHERE player_id = ? ORDER BY shop_type, campaign_id
@@ -559,6 +561,12 @@ async function main() {
             },
         })
         const specialSales = decode(specialSalesResponse).data.sales_list
+
+        // 交接文档 §8 ④（#10）：列表构造抛错时回 200 + 空列表，而不是 H500。
+        failCampaignLineupRead = true
+        const failedSales = await getRushSales(fastify, 16, 700001)
+        failCampaignLineupRead = false
+        assert.deepEqual(failedSales, [])
         assert.equal(specialSales.some(item => item.shop_item_id === 200001), true)
         assert.equal(specialSales.some(item => item.shop_item_id === 200002), true)
         const beforeNavigationBuy = snapshot()
